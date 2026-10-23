@@ -469,6 +469,14 @@ func servePeer(peer *Peer, remote *p2p.MsgPipeRW, headers map[uint64]*types.Head
 //
 // The refusal case is the control: it must still latch, otherwise an
 // implementation that never latches at all would satisfy the two cases above.
+//
+// BRITTLENESS: the observable here is peer.Head(), and it is honest only because
+// of two properties of this fixture, neither of which the test itself enforces:
+// the fake peer never runs the handshake (so nothing else writes Head), and
+// syncToHead contains exactly one SetHead. If a future change adds a second
+// SetHead inside syncToHead, this test degrades to silently passing rather than
+// failing -- it stops discriminating instead of going red. That is the worst
+// kind of test rot, so read this note before adding one.
 func TestSyncerInsertOutcomes(t *testing.T) {
 	emptyTxRoot := types.DeriveSha(types.Transactions{}, trie.NewStackTrie(nil))
 	emptyUncle := types.CalcUncleHash(nil)
