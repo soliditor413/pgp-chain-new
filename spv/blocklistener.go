@@ -45,6 +45,16 @@ func (l *BlockListener) GetDynamicArbiterHeight() uint64 {
 // a node that syncs the ELA chain while replaying legacy blocks still ends up
 // with the records those blocks ask about.
 //
+// This is the ONLY call site, deliberately:
+//   - it sits above the isCurrent/dynamicArbiterHeight branches, so coverage
+//     tracks what has been *applied* rather than what the arbiter schedule
+//     happens to care about — skipping the gated blocks would leave holes in the
+//     height index;
+//   - it is nil-checked, so blocks that arrive before SpvDbInit has run are
+//     skipped quietly instead of logging one error per block;
+//   - an earlier port called ApplyElaBlock a second time inside the isCurrent
+//     branch, which decoded every live block twice for no benefit.
+//
 // A failure is logged and the sync continues. The ELA block is already on the ELA
 // chain, so stopping here would just trade one stuck node for another; the BSC
 // block anchored on that ELA height will fail loudly with
@@ -68,18 +78,6 @@ func (l *BlockListener) NotifyBlock(block *util.Block, isCurrent bool) {
 		}
 		l.blockNumber = block.Height
 		l.StoreAuxBlock(block)
-
-		// Recharge records are written for every ELA block, and deliberately
-		// before the dynamicArbiterHeight early return below: coverage has to
-		// track what has been *applied*, not what the arbiter schedule happens to
-		// care about. Skipping those blocks would leave holes in the height index.
-		//
-		// An error here is logged and not retried; ApplyElaBlock refuses to advance
-		// coverage on failure, so every later read at or above this height fails
-		// loudly instead of reading a half-written block.
-		if err := ApplyElaBlock(GetRechargeStore(), block); err != nil {
-			log.Error("applying ELA block to the recharge store failed", "height", block.Height, "err", err)
-		}
 
 		log.Info("BlockListener handle block ", "height", l.blockNumber, "l.dynamicArbiterHeight ", l.dynamicArbiterHeight)
 

@@ -10,6 +10,7 @@ import (
 	elacommon "github.com/elastos/Elastos.ELA/common"
 	elatx "github.com/elastos/Elastos.ELA/core/transaction"
 	elacom "github.com/elastos/Elastos.ELA/core/types/common"
+	it "github.com/elastos/Elastos.ELA/core/types/interfaces"
 	"github.com/elastos/Elastos.ELA/core/types/outputpayload"
 	"github.com/elastos/Elastos.ELA/core/types/payload"
 
@@ -85,13 +86,27 @@ func elaBlockHash(block *util.Block) ethCommon.Hash {
 // decodeElaTransaction turns the SPV layer's opaque transaction into the full ELA
 // transaction, which is where TxType/Payload/Outputs live. util.Transaction only
 // exposes Hash/Serialize/Deserialize/MatchFilter.
-func decodeElaTransaction(t util.Transaction) (*elatx.BaseTransaction, error) {
+//
+// The re-decode MUST go through transaction.GetTransactionByBytes. Elastos.ELA's
+// BaseTransaction.Deserialize goes straight to DeserializeUnsigned, which reads
+// one byte as the *payload version* and then dispatches on the *already set*
+// tx.txType. A bare `new(elatx.BaseTransaction)` therefore has txType 0
+// (CoinBase), reads the 0x09 version byte as its payload version, and every
+// version 9 transaction fails with
+// "[Attribute error] Deserialize Unsupported attribute Description".
+// GetTransactionByBytes consumes the version/txType flag bytes and hands back the
+// concrete per-type transaction, which is also what keeps the payload type right.
+func decodeElaTransaction(t util.Transaction) (it.Transaction, error) {
 	buf := new(bytes.Buffer)
 	if err := t.Serialize(buf); err != nil {
 		return nil, err
 	}
-	tx := new(elatx.BaseTransaction)
-	if err := tx.Deserialize(bytes.NewReader(buf.Bytes())); err != nil {
+	r := bytes.NewReader(buf.Bytes())
+	tx, err := elatx.GetTransactionByBytes(r)
+	if err != nil {
+		return nil, err
+	}
+	if err := tx.Deserialize(r); err != nil {
 		return nil, err
 	}
 	return tx, nil
@@ -104,14 +119,14 @@ func decodeElaTransaction(t util.Transaction) (*elatx.BaseTransaction, error) {
 //     (outputpayload.CrossChainOutput), fee = output value - target amount;
 //   - payload version 0: CrossChainAmounts/CrossChainAddresses on the payload,
 //     fee = output value - cross chain amount, memo always empty.
-func rechargeDatasOf(tx *elatx.BaseTransaction) (RechargeDatas, error) {
+func rechargeDatasOf(tx it.Transaction) (RechargeDatas, error) {
 	if tx.PayloadVersion() >= payload.TransferCrossChainVersionV1 {
 		return rechargeDatasFromOutputs(tx)
 	}
 	return rechargeDatasFromLegacyPayload(tx)
 }
 
-func rechargeDatasFromOutputs(tx *elatx.BaseTransaction) (RechargeDatas, error) {
+func rechargeDatasFromOutputs(tx it.Transaction) (RechargeDatas, error) {
 	datas := make(RechargeDatas, 0)
 	for _, out := range tx.Outputs() {
 		if out == nil || out.Type != elacom.OTCrossChain {
@@ -137,7 +152,7 @@ func rechargeDatasFromOutputs(tx *elatx.BaseTransaction) (RechargeDatas, error) 
 	return datas, nil
 }
 
-func rechargeDatasFromLegacyPayload(tx *elatx.BaseTransaction) (RechargeDatas, error) {
+func rechargeDatasFromLegacyPayload(tx it.Transaction) (RechargeDatas, error) {
 	version := tx.PayloadVersion()
 	p := new(payload.TransferCrossChainAsset)
 	if err := p.Deserialize(bytes.NewReader(tx.Payload().Data(version)), version); err != nil {
