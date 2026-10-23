@@ -65,6 +65,9 @@ var (
 	_ func()                 = UninstallHeightView
 	_ func() LegacyStateView = CurrentRechargeView
 
+	// The listener side: the only writer, and the only place where coverage moves.
+	_ func(*RechargeStore, *util.Block) error = ApplyElaBlock
+
 	// The error-returning replacements for the three zero-value read points.
 	_ func(string) (*big.Int, common.Address, *big.Int, error)    = FindOutputFeeAndaddressByTxHash
 	_ func(string) ([]byte, error)                                = FindOutRechargeInput

@@ -197,23 +197,41 @@ func GetRechargeStore() *RechargeStore {
 // InstallHeightView pins the legacy state view to elaHeight, i.e. publishes a
 // view that answers every LegacyStateView read as of that height.
 //
+// WHAT THE HEIGHT IS FOR - and what it is NOT for.
+//
+// The pinned ELA height feeds exactly one read today: ELAHeight(), which
+// GetArbiters() uses to pick the producer set behind the 0x3e8 arbiters
+// precompile. That is a read whose answer really is a function of ELA height.
+//
+// It is NOT the availability gate for recharge data. Recharge() and
+// IsFailedElaTx() look the record up by tx hash across every height the store
+// has written, because pgp-chain did the same: its keys are the bare tx hash
+// (pgp-chain/spv/recharge.go:44-60) and a miss falls back to a per-hash live
+// fetch, never to a height filter.
+//
+// The real chain settles this. Block 30115 redeems an ELA tx that sits at ELA
+// height 2,076,538 while its header.Nonce is 2,076,267, and the block executed
+// successfully there (header gasUsed 0, which pgp-chain only produces when the
+// gateway call returns no VM error, plus a non-empty logsBloom). Any
+// implementation that caps the recharge read at the pinned height rejects that
+// block.
+//
 // CALLER CONTRACT (core/):
 //
 //   - WHEN: once per block, from the block execution entry point, after the
 //     header is known and the EVM of that block has not yet executed a single
-//     transaction. The argument is uint32(header.Nonce), i.e. the ELA height the
-//     block was produced against (pgp-chain stores types.EncodeNonce(GetSpvHeight())
-//     there, consensus/pbft/pbft.go:492).
+//     transaction. The argument is uint32(header.Nonce) (pgp-chain stores
+//     types.EncodeNonce(GetSpvHeight()) there, consensus/pbft/pbft.go:492).
 //   - UNTIL WHEN: pair every call with a deferred UninstallHeightView(), so the
 //     window in which a stale view is visible is the block execution itself.
 //   - CONCURRENCY: this is a process-wide slot, so two blocks must not be
 //     executed concurrently under different heights. The *view* is a value type
 //     with no mutable state, so concurrent reads through one installed view are
 //     fine; it is the install/uninstall window that is exclusive.
-//   - IF FORGOTTEN: the previous block's view stays installed and every read
-//     answers with the previous ELA height, silently and with no error. That is
-//     the one failure mode this API cannot detect; it is why Uninstall is part of
-//     the contract and why CurrentRechargeView exists.
+//   - IF FORGOTTEN: the previous block's view stays installed and the arbiters
+//     read answers with the previous ELA height, silently and with no error.
+//     That is the one failure mode this API cannot detect; it is why Uninstall is
+//     part of the contract and why CurrentRechargeView exists.
 //   - RETURN: ErrRechargeStoreNotInitialised when SpvDbInit has not run yet.
 func InstallHeightView(elaHeight uint32) error {
 	s := GetRechargeStore()
@@ -241,6 +259,11 @@ func (s *RechargeStore) HeightView(elaHeight uint32) LegacyStateView {
 
 // heightScopedView binds a store to one ELA height. It holds no mutable state,
 // so two blocks can be executed with two different views concurrently.
+//
+// The height it carries is ONLY for reads that genuinely select by ELA height -
+// today that is ELAHeight(), which feeds GetArbiters() and through it the 0x3e8
+// arbiters precompile. It is deliberately NOT applied to Recharge or
+// IsFailedElaTx; see RechargeAny for the block that proves why.
 type heightScopedView struct {
 	store  *RechargeStore
 	height uint32
@@ -257,14 +280,22 @@ func (v heightScopedView) Recharge(txHash string) (RechargeDatas, *big.Int, erro
 	if v.store == nil {
 		return nil, nil, ErrRechargeStoreNotInitialised
 	}
-	return v.store.RechargeAt(uint64(v.height), txHash)
+	// NOT RechargeAt(v.height, txHash). pgp block 30115 redeems an ELA tx from
+	// ELA height 2,076,538 while its header.Nonce - the height pgp-chain would
+	// have pinned here - is 2,076,267, and the block still executed successfully
+	// on the real chain (header gasUsed 0, non-empty logsBloom). A height-capped
+	// read returns ErrRechargeUnavailable for it and turns a valid block into a
+	// rejected one.
+	return v.store.RechargeAny(txHash)
 }
 
 func (v heightScopedView) IsFailedElaTx(txHash string) (bool, error) {
 	if v.store == nil {
 		return false, ErrRechargeStoreNotInitialised
 	}
-	return v.store.IsFailedElaTxAt(uint64(v.height), txHash)
+	// Same reasoning as Recharge: pgp-chain answered this with a per-hash SPV
+	// query (HaveRetSideChainDepositCoinTx), never with a height filter.
+	return v.store.IsFailedElaTxAny(txHash)
 }
 
 // ---------------------------------------------------------------------------
@@ -561,6 +592,170 @@ func (s *RechargeStore) lookupAt(dataPrefix, indexPrefix []byte, elaHeight uint6
 	return value, best, true, nil
 }
 
+// lookupNewest returns the value written for hash at the highest height that has
+// one, with no upper bound.
+//
+// This is the counterpart of lookupAt for reads that must NOT be pinned to an
+// ELA height. pgp-chain's recharge reads are of that kind: its store key is the
+// bare tx hash (pgp-chain/spv/recharge.go:44-60 reads
+// hash+"Fee"/"Address"/"Output"/"Input"), and a miss falls back to a live
+// per-hash fetch through SpvService.GetTransaction, never to a height filter.
+//
+// Unlike lookupAt this does not break out of the iteration early, because the
+// height that satisfies the query is the last one rather than the first one past
+// a bound. The same hash can legitimately appear at several heights after an ELA
+// reorg; the newest wins.
+func (s *RechargeStore) lookupNewest(dataPrefix, indexPrefix []byte, hash common.Hash) (value []byte, at uint64, found bool, err error) {
+	prefix := make([]byte, 0, len(indexPrefix)+32)
+	prefix = append(prefix, indexPrefix...)
+	prefix = append(prefix, hash[:]...)
+
+	it := s.db.NewIterator(prefix, nil)
+	defer it.Release()
+
+	best := uint64(0)
+	haveBest := false
+	for it.Next() {
+		key := it.Key()
+		if len(key) != len(prefix)+8 {
+			return nil, 0, false, fmt.Errorf("%w: index key %x has the wrong length", ErrRechargeStoreCorrupt, key)
+		}
+		h := binary.BigEndian.Uint64(key[len(prefix):])
+		if !haveBest || h > best {
+			best, haveBest = h, true
+		}
+	}
+	if err := it.Error(); err != nil {
+		return nil, 0, false, err
+	}
+	if !haveBest {
+		return nil, 0, false, nil
+	}
+
+	key := storeKey(dataPrefix, hash, best)
+	ok, err := s.db.Has(key)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	if !ok {
+		return nil, 0, false, fmt.Errorf("%w: index entry for %x at ELA height %d has no data record", ErrRechargeStoreCorrupt, hash, best)
+	}
+	value, err = s.db.Get(key)
+	if err != nil {
+		return nil, 0, false, err
+	}
+	return value, best, true, nil
+}
+
+// requireAdvanced fails when the store has never been advanced at all.
+//
+// It is the height-free replacement for requireCovered on the unpinned read
+// paths: those reads cannot state which ELA height they need, so the only thing
+// worth refusing is a store with no coverage marker whatsoever. Beyond that, a
+// missing record is reported by the caller as ErrRechargeUnavailable, which is
+// what pgp-chain did when its live fallback fetch came back empty.
+func (s *RechargeStore) requireAdvanced() error {
+	covered, found, err := s.coverage()
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("%w: the store has not been advanced at all", ErrRechargeHeightNotCovered)
+	}
+	_ = covered
+	return nil
+}
+
+// RechargeAny returns the recharge record of elaHash without pinning the read to
+// an ELA height.
+//
+// WHY THIS EXISTS: pgp block 30115 executes a Recharge for an ELA tx that sits
+// at ELA height 2,076,538 while the block's own header.Nonce (the value
+// pgp-chain writes with types.EncodeNonce(GetSpvHeight()),
+// consensus/pbft/pbft.go:492) is 2,076,267. The block succeeded on the real
+// chain: its header records gasUsed 0, which pgp-chain only produces when a
+// gateway call returns no VM error (core/state_transition.go:325), and its
+// logsBloom is non-zero. So the original node answered a lookup for a record
+// 271 ELA blocks ahead of the height it stamped into its own header.
+//
+// That is possible because the fallback fetch is per hash, not per height.
+// Pinning the read to header.Nonce therefore rejects a block that the reference
+// implementation accepted - which is why this method ignores heights entirely.
+//
+// Absence is still an error and never an empty result: in pgp-chain a lookup
+// that finds nothing ends in "is failed elaTx" / "not recharge tx" errors out of
+// TrySetRechargeDataFromSpvService, which the 0x3f1 precompile turns into a
+// failing call. "Unknown" never means "no recharge" there, so it must not mean
+// that here either.
+func (s *RechargeStore) RechargeAny(elaHash string) (RechargeDatas, *big.Int, error) {
+	if err := s.requireAdvanced(); err != nil {
+		return nil, nil, err
+	}
+	hash, err := normaliseElaHash(elaHash)
+	if err != nil {
+		return nil, nil, err
+	}
+	failed, _, found, err := s.lookupNewest(keyFailedData, keyFailedIndex, hash)
+	if err != nil {
+		return nil, nil, err
+	}
+	if found && len(failed) > 0 {
+		return nil, nil, fmt.Errorf("%w: %s", ErrRechargeElaTxFailed, elaHash)
+	}
+	value, at, ok, err := s.lookupNewest(keyRechargeData, keyRechargeIndex, hash)
+	if err != nil {
+		return nil, nil, err
+	}
+	if !ok {
+		return nil, nil, fmt.Errorf("%w: %s (no ELA height pin)", ErrRechargeUnavailable, elaHash)
+	}
+	return decodeStoredRecharge(value, at, elaHash)
+}
+
+// IsFailedElaTxAny reports whether elaHash was marked failed, without pinning the
+// read to an ELA height. See RechargeAny for why the pin is wrong.
+//
+// Absence is a real answer here, unlike for Recharge: pgp-chain answered this
+// with SpvService.HaveRetSideChainDepositCoinTx (spv/spv_module.go:359), a plain
+// per-hash query whose "no" is the answer.
+func (s *RechargeStore) IsFailedElaTxAny(elaHash string) (bool, error) {
+	if err := s.requireAdvanced(); err != nil {
+		return false, err
+	}
+	hash, err := normaliseElaHash(elaHash)
+	if err != nil {
+		return false, err
+	}
+	value, _, found, err := s.lookupNewest(keyFailedData, keyFailedIndex, hash)
+	if err != nil {
+		return false, err
+	}
+	return found && len(value) > 0, nil
+}
+
+// decodeStoredRecharge turns a stored blob into the in-memory shape.
+func decodeStoredRecharge(value []byte, at uint64, elaHash string) (RechargeDatas, *big.Int, error) {
+	record := new(storedRecharge)
+	if err := rlp.DecodeBytes(value, record); err != nil {
+		return nil, nil, fmt.Errorf("spv: decoding recharge record for %s at ELA height %d: %w", elaHash, at, err)
+	}
+	if len(record.Addresses) != len(record.Amounts) || len(record.Amounts) != len(record.Fees) || len(record.Fees) != len(record.Memos) {
+		return nil, nil, fmt.Errorf("%w: recharge record for %s at ELA height %d has mismatched column lengths", ErrRechargeStoreCorrupt, elaHash, at)
+	}
+	datas := make(RechargeDatas, len(record.Fees))
+	totalFee := big.NewInt(0)
+	for i := range datas {
+		datas[i] = &RechargeData{
+			TargetAddress: record.Addresses[i],
+			TargetAmount:  record.Amounts[i],
+			Fee:           record.Fees[i],
+			TargetData:    record.Memos[i],
+		}
+		totalFee.Add(totalFee, record.Fees[i])
+	}
+	return datas, totalFee, nil
+}
+
 // RechargeAt returns the recharge record of elaHash as of elaHeight.
 //
 // It returns ErrRechargeElaTxFailed if the tx is marked failed at or before that
@@ -588,22 +783,7 @@ func (s *RechargeStore) RechargeAt(elaHeight uint64, elaHash string) (RechargeDa
 	if !ok {
 		return nil, nil, fmt.Errorf("%w: %s at ELA height %d", ErrRechargeUnavailable, elaHash, elaHeight)
 	}
-	record := new(storedRecharge)
-	if err := rlp.DecodeBytes(value, record); err != nil {
-		return nil, nil, fmt.Errorf("spv: decoding recharge record for %s at ELA height %d: %w", elaHash, at, err)
-	}
-	datas := make(RechargeDatas, len(record.Fees))
-	totalFee := big.NewInt(0)
-	for i := range datas {
-		datas[i] = &RechargeData{
-			TargetAddress: record.Addresses[i],
-			TargetAmount:  record.Amounts[i],
-			Fee:           record.Fees[i],
-			TargetData:    record.Memos[i],
-		}
-		totalFee.Add(totalFee, record.Fees[i])
-	}
-	return datas, totalFee, nil
+	return decodeStoredRecharge(value, at, elaHash)
 }
 
 // IsFailedElaTxAt reports whether elaHash was marked failed at or before

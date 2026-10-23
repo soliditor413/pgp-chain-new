@@ -73,8 +73,12 @@ func ApplyElaBlock(store *RechargeStore, block *util.Block) error {
 }
 
 // elaBlockHash converts the ELA block hash to the representation the store keeps
-// for reorg forensics.
+// for reorg forensics. A block whose header has not been populated yields the zero
+// hash, which the store treats as "unknown" and does not record.
 func elaBlockHash(block *util.Block) ethCommon.Hash {
+	if block == nil || block.BlockHeader == nil {
+		return ethCommon.Hash{}
+	}
 	return ethCommon.BytesToHash(block.Hash().Bytes())
 }
 

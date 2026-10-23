@@ -345,6 +345,10 @@ func IsFailedElaTx(elaTx string) (bool, error) {
 	// Do not move the store's marks behind this call and do not treat the two as
 	// equivalent: the store's marks come from the recharge listener, this one from
 	// the ELA chain's own bookkeeping.
+	//
+	// TODO(spv-porter): replace with a height-indexed ELASPV query once the ELA side
+	// exposes one. Removing it instead of replacing it would change which txs count
+	// as failed, which is a consensus change, not a cleanup.
 	hash, err := common.Uint256FromHexString(elaTx)
 	if err != nil {
 		return false, err

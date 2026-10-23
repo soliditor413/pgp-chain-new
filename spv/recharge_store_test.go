@@ -14,25 +14,21 @@ const (
 	testElaHash2 = "00000000000000000000000000000000000000000000000000000000000000aa"
 )
 
+var testElaBlockHash = common.HexToHash("0x1111111111111111111111111111111111111111111111111111111111111111")
+
 func newTestStore() *RechargeStore {
 	return NewRechargeStore(memorydb.New())
 }
 
-// elaHashForHeight gives every test height a distinct, deterministic ELA block
-// hash so the reorg detector has something to compare.
-func elaHashForHeight(h uint64) common.Hash {
-	return common.BigToHash(new(big.Int).SetUint64(h + 1))
-}
-
-// storeRechargeAtReplayHeight writes a recharge record and then marks the ELA
-// height as applied, which is what the listener does (via ApplyElaBlock).
-func storeRechargeAtReplayHeight(t *testing.T, s *RechargeStore, h uint64, elaHash string, datas RechargeDatas) {
+// putAt writes a recharge record and marks the ELA block applied, which is what
+// the listener does per block (PutRecharge ... AdvanceCoverage, in that order).
+func putAt(t *testing.T, s *RechargeStore, height uint64, hash string, datas RechargeDatas) {
 	t.Helper()
-	if err := s.PutRecharge(h, elaHash, datas); err != nil {
-		t.Fatalf("PutRecharge at %d: %v", h, err)
+	if err := s.PutRecharge(height, hash, datas); err != nil {
+		t.Fatalf("PutRecharge(%d): %v", height, err)
 	}
-	if err := s.AdvanceCoverage(h, elaHashForHeight(h)); err != nil {
-		t.Fatalf("AdvanceCoverage to %d: %v", h, err)
+	if err := s.AdvanceCoverage(height, testElaBlockHash); err != nil {
+		t.Fatalf("AdvanceCoverage(%d): %v", height, err)
 	}
 }
 
@@ -57,7 +53,7 @@ func rechargeFixture(fee, amount int64) RechargeDatas {
 // H comes back unchanged, and the total fee is the sum of the entries.
 func TestRechargeStoreRoundTrip(t *testing.T) {
 	s := newTestStore()
-	storeRechargeAtReplayHeight(t, s, 100, testElaHash, rechargeFixture(3, 10))
+	putAt(t, s, 100, testElaHash, rechargeFixture(3, 10))
 
 	datas, totalFee, err := s.RechargeAt(100, testElaHash)
 	if err != nil {
@@ -88,10 +84,10 @@ func TestRechargeStoreRoundTrip(t *testing.T) {
 // a read at height H must see exactly the records written at heights <= H.
 func TestRechargeStoreAnswersAsOfHeight(t *testing.T) {
 	s := newTestStore()
-	storeRechargeAtReplayHeight(t, s, 100, testElaHash, rechargeFixture(3, 10))
+	putAt(t, s, 100, testElaHash, rechargeFixture(3, 10))
 	// Simulate the listener having applied ELA blocks up to 5000 with no further
 	// recharges; without this a read at 101 is *uncovered*, not *unknown*.
-	if err := s.AdvanceCoverage(5000, elaHashForHeight(5000)); err != nil {
+	if err := s.AdvanceCoverage(5000, testElaBlockHash); err != nil {
 		t.Fatalf("AdvanceCoverage: %v", err)
 	}
 
@@ -123,8 +119,11 @@ func TestRechargeStoreAnswersAsOfHeight(t *testing.T) {
 // earlier height saw.
 func TestRechargeStoreVersionsByHeight(t *testing.T) {
 	s := newTestStore()
-	storeRechargeAtReplayHeight(t, s, 100, testElaHash, rechargeFixture(3, 10))
-	storeRechargeAtReplayHeight(t, s, 200, testElaHash, rechargeFixture(7, 20))
+	putAt(t, s, 100, testElaHash, rechargeFixture(3, 10))
+	putAt(t, s, 200, testElaHash, rechargeFixture(7, 20))
+	if err := s.AdvanceCoverage(300, testElaBlockHash); err != nil {
+		t.Fatalf("AdvanceCoverage: %v", err)
+	}
 
 	datas, _, err := s.RechargeAt(150, testElaHash)
 	if err != nil {
@@ -147,70 +146,42 @@ func TestRechargeStoreVersionsByHeight(t *testing.T) {
 // store that has only seen ELA height 100 must not answer for height 1000, which
 // it would otherwise do by reporting every tx as unknown and not-failed.
 //
-// ELA height 0 gets no special treatment: pgp-chain had no height dimension on
-// this path, so there is no height-0 behaviour to copy, and an empty store must
-// refuse height 0 exactly like any other height.
+// ELA height 0 is deliberately included: there is no special case for it, because
+// pgp-chain had no height dimension on the recharge path and inventing one would
+// be the same fabrication the store exists to prevent.
 func TestRechargeStoreRefusesUncoveredHeight(t *testing.T) {
 	s := newTestStore()
 
-	for _, h := range []uint64{0, 5, 30115} {
+	for _, h := range []uint64{0, 5} {
 		if _, _, err := s.RechargeAt(h, testElaHash); !errors.Is(err, ErrRechargeHeightNotCovered) {
-			t.Fatalf("RechargeAt(%d) on an empty store error = %v, want ErrRechargeHeightNotCovered", h, err)
+			t.Fatalf("RechargeAt(%d) on an empty store = %v, want ErrRechargeHeightNotCovered", h, err)
 		}
 		if _, err := s.IsFailedElaTxAt(h, testElaHash); !errors.Is(err, ErrRechargeHeightNotCovered) {
-			t.Fatalf("IsFailedElaTxAt(%d) on an empty store error = %v, want ErrRechargeHeightNotCovered", h, err)
+			t.Fatalf("IsFailedElaTxAt(%d) on an empty store = %v, want ErrRechargeHeightNotCovered", h, err)
 		}
 	}
 
-	storeRechargeAtReplayHeight(t, s, 100, testElaHash, rechargeFixture(3, 10))
+	putAt(t, s, 100, testElaHash, rechargeFixture(3, 10))
 	if _, _, err := s.RechargeAt(1000, testElaHash); !errors.Is(err, ErrRechargeHeightNotCovered) {
 		t.Fatalf("RechargeAt(1000) error = %v, want ErrRechargeHeightNotCovered", err)
 	}
-	if height, covered, err := s.CoveredThrough(); err != nil || !covered || height != 100 {
-		t.Fatalf("CoveredThrough = (%d, %v, %v), want (100, true, nil)", height, covered, err)
+	if covered, found, err := s.CoveredThrough(); err != nil || !found || covered != 100 {
+		t.Fatalf("CoveredThrough = (%d, %v, %v), want (100, true, nil)", covered, found, err)
 	}
 }
 
-// TestRechargeStoreCoveragePresence pins the difference between "never advanced"
-// and "advanced to height 0". Collapsing the two into a single 0 is how an
-// unsynced node would start answering "no record" for everything.
-func TestRechargeStoreCoveragePresence(t *testing.T) {
+// TestPutRechargeDoesNotAdvanceCoverage pins the ordering rule: a record written
+// mid-block must not make the block look covered.
+func TestPutRechargeDoesNotAdvanceCoverage(t *testing.T) {
 	s := newTestStore()
-	if height, covered, err := s.CoveredThrough(); err != nil || covered || height != 0 {
-		t.Fatalf("CoveredThrough on a fresh store = (%d, %v, %v), want (0, false, nil)", height, covered, err)
-	}
-
-	if err := s.AdvanceCoverage(0, common.HexToHash(testElaHash2)); err != nil {
-		t.Fatalf("AdvanceCoverage(0): %v", err)
-	}
-	if height, covered, err := s.CoveredThrough(); err != nil || !covered || height != 0 {
-		t.Fatalf("CoveredThrough after height 0 = (%d, %v, %v), want (0, true, nil)", height, covered, err)
-	}
-	// Covered at height 0 means "ELA block 0 applied", so a read there is a real
-	// "no such record" rather than "I have not synced".
-	if _, _, err := s.RechargeAt(0, testElaHash); !errors.Is(err, ErrRechargeUnavailable) {
-		t.Fatalf("RechargeAt(0) after covering height 0 = %v, want ErrRechargeUnavailable", err)
-	}
-}
-
-// TestRechargeStorePutDoesNotAdvanceCoverage pins the ordering rule: writing a
-// record must not publish the height as covered, because the same block may still
-// have more records to write. A reader must not be able to see a half-written
-// block as "covered".
-func TestRechargeStorePutDoesNotAdvanceCoverage(t *testing.T) {
-	s := newTestStore()
-	if err := s.PutRecharge(30115, testElaHash, rechargeFixture(3, 10)); err != nil {
+	if err := s.PutRecharge(100, testElaHash, rechargeFixture(3, 10)); err != nil {
 		t.Fatalf("PutRecharge: %v", err)
 	}
-	if _, _, err := s.RechargeAt(30115, testElaHash); !errors.Is(err, ErrRechargeHeightNotCovered) {
+	if _, found, err := s.CoveredThrough(); err != nil || found {
+		t.Fatalf("CoveredThrough after a bare PutRecharge = (found=%v, err=%v), want (false, nil)", found, err)
+	}
+	if _, _, err := s.RechargeAt(100, testElaHash); !errors.Is(err, ErrRechargeHeightNotCovered) {
 		t.Fatalf("RechargeAt before AdvanceCoverage = %v, want ErrRechargeHeightNotCovered", err)
-	}
-
-	if err := s.AdvanceCoverage(30115, elaHashForHeight(30115)); err != nil {
-		t.Fatalf("AdvanceCoverage: %v", err)
-	}
-	if _, _, err := s.RechargeAt(30115, testElaHash); err != nil {
-		t.Fatalf("RechargeAt after AdvanceCoverage: %v", err)
 	}
 }
 
@@ -218,34 +189,76 @@ func TestRechargeStorePutDoesNotAdvanceCoverage(t *testing.T) {
 // recharges) still moves coverage, otherwise every later read would fail.
 func TestRechargeStoreAdvanceCoverage(t *testing.T) {
 	s := newTestStore()
-	if err := s.AdvanceCoverage(50, elaHashForHeight(50)); err != nil {
+	if err := s.AdvanceCoverage(50, testElaBlockHash); err != nil {
 		t.Fatalf("AdvanceCoverage: %v", err)
 	}
 	if failed, err := s.IsFailedElaTxAt(50, testElaHash); err != nil || failed {
 		t.Fatalf("IsFailedElaTxAt = (%v, %v), want (false, nil)", failed, err)
 	}
 	// Coverage never moves backwards.
-	if err := s.AdvanceCoverage(10, elaHashForHeight(10)); err != nil {
+	if err := s.AdvanceCoverage(10, testElaBlockHash); err != nil {
 		t.Fatalf("AdvanceCoverage(10): %v", err)
 	}
-	if height, _, _ := s.CoveredThrough(); height != 50 {
-		t.Fatalf("CoveredThrough = %d after a backwards advance, want 50", height)
+	if covered, _, _ := s.CoveredThrough(); covered != 50 {
+		t.Fatalf("CoveredThrough = %d after a backwards advance, want 50", covered)
 	}
 }
 
-// TestRechargeStoreReorgKeepsData covers the ELA reorg policy: the same height
-// with a different block hash is logged, not rejected, and the previously written
-// records stay readable.
-func TestRechargeStoreReorgKeepsData(t *testing.T) {
+// TestCoveragePresenceDistinguishesNeverAdvanced pins the third return value of
+// CoveredThrough. Collapsing "never advanced" and "advanced to ELA height 0" into
+// a single 0 is how an unsynced node would start answering "no record" with
+// confidence instead of failing.
+func TestCoveragePresenceDistinguishesNeverAdvanced(t *testing.T) {
 	s := newTestStore()
-	storeRechargeAtReplayHeight(t, s, 100, testElaHash, rechargeFixture(3, 10))
-
-	// Same height, different ELA block hash.
-	if err := s.AdvanceCoverage(100, elaHashForHeight(999)); err != nil {
-		t.Fatalf("AdvanceCoverage with a different block hash: %v", err)
+	if covered, found, err := s.CoveredThrough(); err != nil || found || covered != 0 {
+		t.Fatalf("fresh store CoveredThrough = (%d, %v, %v), want (0, false, nil)", covered, found, err)
 	}
-	if _, _, err := s.RechargeAt(100, testElaHash); err != nil {
-		t.Fatalf("RechargeAt after the reorg warning: %v", err)
+	if _, _, err := s.RechargeAt(0, testElaHash); !errors.Is(err, ErrRechargeHeightNotCovered) {
+		t.Fatalf("RechargeAt(0) on a fresh store = %v, want ErrRechargeHeightNotCovered", err)
+	}
+
+	if err := s.AdvanceCoverage(0, common.HexToHash("0xaa")); err != nil {
+		t.Fatalf("AdvanceCoverage(0): %v", err)
+	}
+	if covered, found, err := s.CoveredThrough(); err != nil || !found || covered != 0 {
+		t.Fatalf("after covering height 0, CoveredThrough = (%d, %v, %v), want (0, true, nil)", covered, found, err)
+	}
+	// Height 0 is now genuinely covered, so the answer is "no such record" rather
+	// than "the store has not got there yet".
+	if _, _, err := s.RechargeAt(0, testElaHash); !errors.Is(err, ErrRechargeUnavailable) {
+		t.Fatalf("RechargeAt(0) after covering height 0 = %v, want ErrRechargeUnavailable", err)
+	}
+}
+
+// TestAdvanceCoverageRemembersElaBlockHash covers the reorg forensic trail: the
+// height -> ELA block hash mapping is kept, and a second write at the same height
+// with a different hash is recorded rather than rejected.
+func TestAdvanceCoverageRemembersElaBlockHash(t *testing.T) {
+	db := memorydb.New()
+	s := NewRechargeStore(db)
+
+	first := common.HexToHash("0x01")
+	if err := s.AdvanceCoverage(7, first); err != nil {
+		t.Fatalf("AdvanceCoverage: %v", err)
+	}
+	key := storeKey(keyElaBlockHash, common.Hash{}, 7)
+	stored, err := db.Get(key)
+	if err != nil {
+		t.Fatalf("block hash entry missing: %v", err)
+	}
+	if common.BytesToHash(stored) != first {
+		t.Fatalf("stored block hash = %v, want %v", common.BytesToHash(stored), first)
+	}
+
+	// Same height, different hash: the old data is kept and no error is raised
+	// (a WARN is logged, which is what gets us a post-mortem trail).
+	second := common.HexToHash("0x02")
+	if err := s.AdvanceCoverage(7, second); err != nil {
+		t.Fatalf("AdvanceCoverage with a different hash at the same height: %v", err)
+	}
+	stored, _ = db.Get(key)
+	if common.BytesToHash(stored) != first {
+		t.Fatalf("stored block hash was rewritten to %v, want the original %v", common.BytesToHash(stored), first)
 	}
 }
 
@@ -253,11 +266,11 @@ func TestRechargeStoreReorgKeepsData(t *testing.T) {
 // the in-memory failedTxList.
 func TestRechargeStoreFailedMark(t *testing.T) {
 	s := newTestStore()
-	storeRechargeAtReplayHeight(t, s, 100, testElaHash, rechargeFixture(3, 10))
+	putAt(t, s, 100, testElaHash, rechargeFixture(3, 10))
 	if err := s.MarkFailedElaTx(120, testElaHash); err != nil {
 		t.Fatalf("MarkFailedElaTx: %v", err)
 	}
-	if err := s.AdvanceCoverage(120, elaHashForHeight(120)); err != nil {
+	if err := s.AdvanceCoverage(120, testElaBlockHash); err != nil {
 		t.Fatalf("AdvanceCoverage: %v", err)
 	}
 
@@ -287,6 +300,9 @@ func TestRechargeStoreFailedMark(t *testing.T) {
 // a real record.
 func TestRechargeStoreRejectsBadHash(t *testing.T) {
 	s := newTestStore()
+	if err := s.AdvanceCoverage(1, testElaBlockHash); err != nil {
+		t.Fatalf("AdvanceCoverage: %v", err)
+	}
 	for _, hash := range []string{"", "0x", "dead", testElaHash[:63], testElaHash + "00", "0x" + repeatByte('z', 64)} {
 		if err := s.PutRecharge(1, hash, rechargeFixture(1, 1)); err == nil {
 			t.Fatalf("PutRecharge accepted %q", hash)
@@ -318,7 +334,7 @@ func TestRechargeStoreDetectsCorruptIndex(t *testing.T) {
 	if err := db.Put(storeKey(keyRechargeIndex, hash, 10), []byte{1}); err != nil {
 		t.Fatalf("seeding index: %v", err)
 	}
-	if err := s.AdvanceCoverage(10, elaHashForHeight(10)); err != nil {
+	if err := s.AdvanceCoverage(10, testElaBlockHash); err != nil {
 		t.Fatalf("AdvanceCoverage: %v", err)
 	}
 	if _, _, err := s.RechargeAt(10, testElaHash); !errors.Is(err, ErrRechargeStoreCorrupt) {
@@ -342,8 +358,7 @@ func TestHeightScopedView(t *testing.T) {
 	}
 
 	s := newTestStore()
-	storeRechargeAtReplayHeight(t, s, 100, testElaHash, rechargeFixture(3, 10))
-
+	putAt(t, s, 100, testElaHash, rechargeFixture(3, 10))
 	view := s.HeightView(100)
 	if h, err := view.ELAHeight(); err != nil || h != 100 {
 		t.Fatalf("ELAHeight = (%d, %v), want (100, nil)", h, err)
@@ -356,57 +371,70 @@ func TestHeightScopedView(t *testing.T) {
 	}
 }
 
-// TestInstallHeightView covers the per-block lifecycle core/ drives: install,
-// read, uninstall. Uninstall must leave CurrentRechargeView nil so a forgotten
-// install on the next block fails loudly instead of reusing the old height.
+// TestInstallHeightView covers the two-step wiring: the view published to the
+// precompiles is pinned to the block's ELA anchor, and uninstalling it makes the
+// next reader fail instead of silently reusing the previous height.
 func TestInstallHeightView(t *testing.T) {
 	SetRechargeStore(nil)
-	SetStateView(nil)
+	UninstallHeightView()
+	defer func() {
+		SetRechargeStore(nil)
+		UninstallHeightView()
+	}()
+
 	if err := InstallHeightView(7); !errors.Is(err, ErrRechargeStoreNotInitialised) {
 		t.Fatalf("InstallHeightView without a store = %v, want ErrRechargeStoreNotInitialised", err)
 	}
+	if CurrentRechargeView() != nil {
+		t.Fatal("CurrentRechargeView() is non-nil with no store")
+	}
 
 	s := newTestStore()
-	storeRechargeAtReplayHeight(t, s, 100, testElaHash, rechargeFixture(3, 10))
-	if err := s.AdvanceCoverage(120, elaHashForHeight(120)); err != nil {
+	putAt(t, s, 100, testElaHash, rechargeFixture(3, 10))
+	if err := s.AdvanceCoverage(120, testElaBlockHash); err != nil {
 		t.Fatalf("AdvanceCoverage: %v", err)
 	}
 	SetRechargeStore(s)
-	defer func() {
-		SetRechargeStore(nil)
-		SetStateView(nil)
-	}()
 
-	if CurrentRechargeView() != nil {
-		t.Fatal("CurrentRechargeView must be nil before any install")
-	}
 	if err := InstallHeightView(100); err != nil {
 		t.Fatalf("InstallHeightView: %v", err)
 	}
-	if CurrentRechargeView() == nil {
-		t.Fatal("CurrentRechargeView is nil right after a successful install")
+	if v := CurrentRechargeView(); v == nil {
+		t.Fatal("CurrentRechargeView() is nil right after InstallHeightView")
 	}
-	if h, err := CurrentRechargeView().ELAHeight(); err != nil || h != 100 {
+	if h, err := StateView().ELAHeight(); err != nil || h != 100 {
 		t.Fatalf("installed ELAHeight = (%d, %v), want (100, nil)", h, err)
 	}
-	if _, _, err := CurrentRechargeView().Recharge(testElaHash); err != nil {
+	if _, _, err := StateView().Recharge(testElaHash); err != nil {
 		t.Fatalf("installed view Recharge: %v", err)
 	}
 
-	// A second install replaces the view rather than accumulating.
+	// Installing a second height must be independent, not cumulative: the
+	// reported height moves to 99 ...
 	if err := InstallHeightView(99); err != nil {
 		t.Fatalf("InstallHeightView(99): %v", err)
 	}
-	if _, _, err := CurrentRechargeView().Recharge(testElaHash); !errors.Is(err, ErrRechargeUnavailable) {
-		t.Fatalf("Recharge as of 99 = %v, want ErrRechargeUnavailable", err)
+	if h, err := StateView().ELAHeight(); err != nil || h != 99 {
+		t.Fatalf("installed ELAHeight = (%d, %v), want (99, nil)", h, err)
+	}
+	// ... while the recharge read still answers, because it is not pinned to that
+	// height. A record written at ELA height 100 must stay visible from a view
+	// pinned at 99; pgp block 30115 is the real-world case of the same gap
+	// (header.Nonce 2,076,267 against a record at 2,076,538).
+	if _, _, err := StateView().Recharge(testElaHash); err != nil {
+		t.Fatalf("Recharge from a view pinned below the record: %v, want success", err)
 	}
 
+	// After Uninstall everything must fail: this is what stops a forgotten
+	// InstallHeightView from silently answering with the previous block's height.
 	UninstallHeightView()
 	if CurrentRechargeView() != nil {
-		t.Fatal("CurrentRechargeView is not nil after UninstallHeightView")
+		t.Fatal("CurrentRechargeView() is non-nil after UninstallHeightView")
 	}
-	// The nil-safe facade still answers, with an error rather than a panic.
+	if _, err := StateView().ELAHeight(); !errors.Is(err, ErrLegacyStateViewMissing) {
+		t.Fatalf("ELAHeight after uninstall = %v, want ErrLegacyStateViewMissing", err)
+	}
 	if _, _, err := StateView().Recharge(testElaHash); !errors.Is(err, ErrLegacyStateViewMissing) {
-		t.Fatalf("StateView().Recharge after uninstall = %v, want ErrLegacyStateViewMissing", err)
+		t.Fatalf("Recharge after uninstall = %v, want ErrLegacyStateViewMissing", err)
 	}
 }

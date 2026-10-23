@@ -88,7 +88,7 @@ func TestRechargeReadPointsUseStore(t *testing.T) {
 	if err := s.PutRecharge(100, testElaHash, rechargeFixture(3, 10)); err != nil {
 		t.Fatalf("PutRecharge: %v", err)
 	}
-	if err := s.AdvanceCoverage(150); err != nil {
+	if err := s.AdvanceCoverage(150, testElaBlockHash); err != nil {
 		t.Fatalf("AdvanceCoverage: %v", err)
 	}
 	SetStateView(s.HeightView(120))
@@ -120,7 +120,15 @@ func TestRechargeReadPointsUseStore(t *testing.T) {
 }
 
 // TestGetRechargeDataByTxhashUsesStore pins that the 0x3f1 entry point hands back
-// the ELA-height-pinned record and the summed fee.
+// the store's record and the summed fee, and that the view's ELA height does NOT
+// select which record is returned.
+//
+// The height-independence is not an oversight, it is the rule: pgp block 30115
+// redeems an ELA tx sitting at ELA height 2,076,538 while its own header.Nonce -
+// the height pgp-chain would pin - is 2,076,267, and the block executed
+// successfully on the real chain. A height-capped read rejects it. What decides
+// between two versions of the same hash is recency (an ELA reorg rewrites at a
+// later height), never the pin.
 func TestGetRechargeDataByTxhashUsesStore(t *testing.T) {
 	SetStateView(nil)
 	if _, _, err := GetRechargeDataByTxhash(testElaHash); !errors.Is(err, ErrLegacyStateViewMissing) {
@@ -128,30 +136,26 @@ func TestGetRechargeDataByTxhashUsesStore(t *testing.T) {
 	}
 
 	s := newTestStore()
-	// Version 1 at ELA height 100, version 2 at 200; the view decides which one.
-	if err := s.PutRecharge(100, "0x"+testElaHash, rechargeFixture(3, 10)); err != nil {
-		t.Fatalf("PutRecharge at 100: %v", err)
-	}
-	if err := s.PutRecharge(200, testElaHash, rechargeFixture(7, 20)); err != nil {
-		t.Fatalf("PutRecharge at 200: %v", err)
-	}
+	// Version 1 at ELA height 100, version 2 at 200. Every pin must see version 2.
+	putAt(t, s, 100, "0x"+testElaHash, rechargeFixture(3, 10))
+	putAt(t, s, 200, testElaHash, rechargeFixture(7, 20))
 
-	SetStateView(s.HeightView(150))
-	datas, totalFee, err := GetRechargeDataByTxhash(testElaHash)
-	if err != nil {
-		t.Fatalf("GetRechargeDataByTxhash: %v", err)
-	}
-	if datas[0].Fee.Cmp(big.NewInt(3)) != 0 || totalFee.Cmp(big.NewInt(9)) != 0 {
-		t.Fatalf("fee/total = %v/%v, want 3/9", datas[0].Fee, totalFee)
-	}
+	// 150 sits between the two writes, 200 is on the newest, 999 is past coverage.
+	for _, pin := range []uint32{150, 200, 999} {
+		SetStateView(s.HeightView(pin))
 
-	SetStateView(s.HeightView(200))
-	datas, totalFee, err = GetRechargeDataByTxhash("0x" + testElaHash)
-	if err != nil {
-		t.Fatalf("GetRechargeDataByTxhash at 200: %v", err)
-	}
-	if datas[0].Fee.Cmp(big.NewInt(7)) != 0 || totalFee.Cmp(big.NewInt(21)) != 0 {
-		t.Fatalf("fee/total at 200 = %v/%v, want 7/21", datas[0].Fee, totalFee)
+		if h, err := StateView().ELAHeight(); err != nil || h != pin {
+			t.Fatalf("pin %d: ELAHeight = (%d, %v), want (%d, nil) - the pin is still reported for GetArbiters", pin, h, err, pin)
+		}
+
+		datas, totalFee, err := GetRechargeDataByTxhash(testElaHash)
+		if err != nil {
+			t.Fatalf("GetRechargeDataByTxhash at pin %d: %v", pin, err)
+		}
+		if datas[0].Fee.Cmp(big.NewInt(7)) != 0 || totalFee.Cmp(big.NewInt(21)) != 0 {
+			t.Fatalf("pin %d: fee/total = %v/%v, want 7/21 (the newest write at ELA height 200)",
+				pin, datas[0].Fee, totalFee)
+		}
 	}
 	SetStateView(nil)
 }
