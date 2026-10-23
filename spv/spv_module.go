@@ -161,6 +161,11 @@ func SpvDbInit(spvdataDir string, pledgeBillContract string, signer ethCommon.Ad
 	// installed view stays null and every legacy read fails loudly, which is the
 	// intended behaviour for this phase.
 	SetRechargeStore(NewRechargeStore(db))
+
+	// The read path is only useful if the precompile that consumes it is real;
+	// until this call the 0x3f1 address is a stub that charges its gas and fails.
+	registerRechargePrecompile()
+
 	// TODO(spv-porter): pgp-chain also wired the write path here
 	//   ipcClient = ethclient.NewClient(client)
 	//   pledgeBill.Init(db, &transactionDBMutex, pledgeBillContract, signer, ipcClient)

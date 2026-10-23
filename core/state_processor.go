@@ -35,6 +35,7 @@ import (
 	"github.com/ethereum/go-ethereum/internal/telemetry"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/spv"
 	"github.com/ethereum/go-ethereum/trie"
 	"github.com/holiman/uint256"
 )
@@ -82,6 +83,36 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 	var tracingStateDB = vm.StateDB(statedb)
 	if hooks := cfg.Tracer; hooks != nil {
 		tracingStateDB = state.NewHookedState(statedb, hooks)
+	}
+
+	// Pin the ELA-height-scoped SPV view to this block before a single
+	// transaction runs, and drop it on the way out.
+	//
+	// pgp-chain recorded the ELA main chain height it observed when sealing a
+	// block in header.Nonce (pgp-chain/consensus/pbft/pbft.go:492,
+	// types.EncodeNonce(GetSpvHeight())), and EncodeNonce is a plain big-endian
+	// write (pgp-chain/core/types/block.go:49), so header.Nonce is that height
+	// verbatim — block 30115 carries 2,076,267, which is an ELA height. Every
+	// legacy read on the execution path (the 0x3f1 recharge lookup today, the
+	// arbiters lookup at 0x3e8 next) has to answer as of that height rather than
+	// as of the node's sync position, or two nodes replaying the same block
+	// disagree.
+	//
+	// Two consequences worth spelling out:
+	//
+	//   - the deferred Uninstall is not optional. Leaving the view installed makes
+	//     the *next* block answer with this block's ELA height, which is the one
+	//     failure mode the view API cannot detect (see InstallHeightView).
+	//   - the install window is process-wide, so two blocks must not execute
+	//     concurrently in one process. insertChain is sequential; the miner and
+	//     eth_call never reach this point with a PGP legacy header, and eth_call's
+	//     simulated block context carries no Nonce, so they fail loudly instead of
+	//     guessing.
+	if config.IsPGPLegacy(blockNumber) {
+		if err := spv.InstallHeightView(uint32(header.Nonce.Uint64())); err != nil {
+			return nil, fmt.Errorf("pinning the ELA height view for block %d: %w", blockNumber, err)
+		}
+		defer spv.UninstallHeightView()
 	}
 
 	// Mutate the block and state according to any hard-fork specs
