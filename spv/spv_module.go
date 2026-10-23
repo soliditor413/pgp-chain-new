@@ -15,6 +15,8 @@ import (
 	"github.com/elastos/Elastos.ELA.SPV/util"
 	"github.com/elastos/Elastos.ELA/common"
 	"github.com/elastos/Elastos.ELA/common/config"
+	elatx "github.com/elastos/Elastos.ELA/core/transaction"
+	"github.com/elastos/Elastos.ELA/core/types/functions"
 	elaCrypto "github.com/elastos/Elastos.ELA/crypto"
 	"github.com/elastos/Elastos.ELA/elanet/filter"
 
@@ -170,8 +172,34 @@ func SpvDbInit(spvdataDir string, pledgeBillContract string, signer ethCommon.Ad
 	_ = client
 }
 
+// initElaTransactionFunctions wires Elastos.ELA's transaction factory hooks.
+//
+// Elastos.ELA dispatches transaction construction and deserialisation through
+// package level function variables in core/types/functions. An ELA node fills
+// them in from its own start-up: cmd/ela.go and pgp-chain's cmd/pgp/config.go:90
+// both assign all four before touching any config. Nothing in this tree imports
+// that start-up path, so without this the very first thing NewService does —
+// chainParams.Sterilize() -> core.GenesisBlock() -> functions.CreateTransaction —
+// calls a nil function and takes the node down with a SIGSEGV.
+//
+// It also resets config.DefaultParams. Sterilize mutates it in place (it
+// multiplies DPoSConfiguration.SignTolerance by time.Second, converts the
+// address strings to program hashes and builds GenesisBlock), so calling it on
+// an already-sterilised value compounds. Taking a fresh copy each time makes
+// NewService safe to call more than once in one process — which the tests do.
+func initElaTransactionFunctions() {
+	functions.GetTransactionByTxType = elatx.GetTransaction
+	functions.GetTransactionByBytes = elatx.GetTransactionByBytes
+	functions.CreateTransaction = elatx.CreateTransaction
+	functions.GetTransactionParameters = elatx.GetTransactionparameters
+
+	config.DefaultParams = *config.GetDefaultParams()
+}
+
 // Spv service initialization
 func NewService(cfg *Config, tmux *event.TypeMux, dynamicArbiterHeight uint64) (*Service, error) {
+	initElaTransactionFunctions()
+
 	var chainParams *config.Configuration
 	switch strings.ToLower(cfg.ActiveNet) {
 	case "testnet", "test", "t":
