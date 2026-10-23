@@ -19,7 +19,9 @@ import (
 	"github.com/ethereum/go-ethereum/core/forkid"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/trie"
 )
 
 // TestProtocolLength pins the message code window of the protocol.
@@ -292,23 +294,16 @@ func TestSyncerDoesNotLatchOnShutdown(t *testing.T) {
 		t.Fatal("a shutting-down chain must not latch the syncer")
 	}
 
-	// Case 2: handler already closed, ordinary error. Nothing to record.
-	h.Close()
+	// Case 2: the latch must still work, otherwise Case 1 proves nothing. A real
+	// refusal - an ordinary error that is not a shutdown sentinel - is exactly
+	// what the latch is for. Note this runs on the *same* handler that Case 1 left
+	// open, so it also pins that a shutdown-adjacent event does not leave the
+	// syncer in some half-disabled state.
 	s.stopAtBoundary(peer, 1923, header, errors.New("state root mismatch"))
-	if s.blocked.Load() {
-		t.Fatal("stopAtBoundary must not latch after the handler is closed")
+	if !s.blocked.Load() {
+		t.Fatal("a real boundary must still latch the syncer")
 	}
-
-	// Case 3: the latch must still work, otherwise the two cases above prove
-	// nothing. A live handler plus a real refusal is exactly what the latch is
-	// for.
-	h2 := newHandler(nil, 860621)
-	defer h2.Close()
-	s2 := newChainSyncer(h2)
-	s2.stopAtBoundary(peer, 1923, header, errors.New("state root mismatch"))
-	if !s2.blocked.Load() {
-		t.Fatal("a live handler must still latch on a real boundary")
-	}
+	h.Close()
 }
 
 // TestDispatchDiscardsUnknownCode is the guard against the 0x08 collision: pgp
@@ -377,5 +372,194 @@ func TestDispatchRejectsOversizedMessage(t *testing.T) {
 		}
 	case <-time.After(10 * time.Second):
 		t.Fatal("dispatch did not reject the oversized message")
+	}
+}
+
+// fakeChain is the chain surface eth/64 needs, with InsertChain under the test's
+// control.
+//
+// The point is the return value: core.BlockChain can return (0, nil) and (n, nil)
+// when it stops inserting (core/blockchain.go:2282 and :2431), and no test can
+// make a real chain do that on demand. With this fake the syncer's decision for
+// each shape of InsertChain result is exercised through the real syncToHead.
+type fakeChain struct {
+	head     *types.Header
+	byNumber map[uint64]*types.Header
+	insert   func(types.Blocks) (int, error)
+	calls    int
+}
+
+func (c *fakeChain) Config() *params.ChainConfig {
+	// No Legacy field, so canExecuteBatch lets every batch through: these tests
+	// are about the InsertChain result, not the execution-rule gate.
+	return &params.ChainConfig{ChainID: big.NewInt(860621)}
+}
+func (c *fakeChain) Genesis() *types.Block {
+	return types.NewBlockWithHeader(&types.Header{Number: big.NewInt(0), Difficulty: big.NewInt(1)})
+}
+func (c *fakeChain) CurrentHeader() *types.Header { return c.head }
+func (c *fakeChain) CurrentBlock() *types.Header  { return c.head }
+func (c *fakeChain) GetHeaderByNumber(number uint64) *types.Header {
+	return c.byNumber[number]
+}
+func (c *fakeChain) GetHeaderByHash(common.Hash) *types.Header { return nil }
+func (c *fakeChain) GetBody(common.Hash) *types.Body           { return nil }
+func (c *fakeChain) GetTd(common.Hash, uint64) *big.Int        { return big.NewInt(1) }
+func (c *fakeChain) InsertChain(blocks types.Blocks) (int, error) {
+	c.calls++
+	return c.insert(blocks)
+}
+
+type fakeBackend struct{ chain ChainReader }
+
+func (b fakeBackend) Chain() ChainReader { return b.chain }
+
+// servePeer answers the id-less eth/64 requests a syncer makes: headers by
+// number from the table, and one empty body per requested hash.
+//
+// The bodies are empty, so the headers must carry the empty transaction root and
+// the empty uncle hash - fetchBlocks matches bodies back to headers by content,
+// not by position (that is what makes a truncated answer safe), and a body whose
+// roots do not match any header is silently skipped, which would look like a
+// truncated response instead of a served one.
+func servePeer(peer *Peer, remote *p2p.MsgPipeRW, headers map[uint64]*types.Header) {
+	for {
+		msg, err := remote.ReadMsg()
+		if err != nil {
+			return
+		}
+		switch msg.Code {
+		case GetBlockHeadersMsg:
+			var req GetBlockHeadersRequest
+			if err := msg.Decode(&req); err != nil {
+				return
+			}
+			var out []*types.Header
+			for i := uint64(0); i < req.Amount; i++ {
+				if header, ok := headers[req.Origin.Number+i]; ok {
+					out = append(out, header)
+				}
+			}
+			peer.deliverHeaders(out)
+
+		case GetBlockBodiesMsg:
+			var hashes []common.Hash
+			if err := msg.Decode(&hashes); err != nil {
+				return
+			}
+			bodies := make([]*types.Body, len(hashes))
+			for i := range bodies {
+				bodies[i] = new(types.Body)
+			}
+			peer.deliverBodies(bodies)
+		}
+	}
+}
+
+// TestSyncerInsertOutcomes drives the four shapes of InsertChain result through
+// the real syncToHead and pins what the syncer does with each.
+//
+// The two that report no error at all are the dangerous ones: core returns
+// (nil, 0, nil) when the chain is already stopping on entry
+// (core/blockchain.go:2282) and (nil, it.index, nil) when it stops mid-batch
+// (core/blockchain.go:2431 breaks while err is still nil). Before this was
+// handled, both fell through to the success accounting, which counted the whole
+// batch as imported and advanced origin past blocks that were never written -
+// a silent stall with no error anywhere to point at.
+//
+// The refusal case is the control: it must still latch, otherwise an
+// implementation that never latches at all would satisfy the two cases above.
+func TestSyncerInsertOutcomes(t *testing.T) {
+	emptyTxRoot := types.DeriveSha(types.Transactions{}, trie.NewStackTrie(nil))
+	emptyUncle := types.CalcUncleHash(nil)
+	newHeader := func(number uint64, parent common.Hash) *types.Header {
+		return &types.Header{
+			Number:     new(big.Int).SetUint64(number),
+			ParentHash: parent,
+			Difficulty: big.NewInt(1),
+			GasLimit:   30_000_000,
+			Time:       1762224252,
+			BaseFee:    big.NewInt(0),
+			TxHash:     emptyTxRoot,
+			UncleHash:  emptyUncle,
+		}
+	}
+	local := newHeader(100, common.Hash{})
+	h101 := newHeader(101, local.Hash())
+	h102 := newHeader(102, h101.Hash())
+
+	// The peer starts on a head we do not have. That makes peer.Head() an
+	// observable of how far the syncer thinks it got: advancing it to a block
+	// that was never written is the exact damage the silent (n, nil) returns did,
+	// so each case pins the head it must end on.
+	unknownHead := common.HexToHash("0xdead00000000000000000000000000000000000000000000000000000000beef")
+
+	for _, tc := range []struct {
+		name     string
+		insert   func(types.Blocks) (int, error)
+		latched  bool
+		wantHead common.Hash
+	}{
+		{
+			// core/blockchain.go:2282 - stopped before the first block.
+			name:     "nothing inserted, no error",
+			insert:   func(types.Blocks) (int, error) { return 0, nil },
+			latched:  false,
+			wantHead: unknownHead,
+		},
+		{
+			// core/blockchain.go:2431 - stopped mid-batch.
+			name:     "prefix inserted, no error",
+			insert:   func(types.Blocks) (int, error) { return 1, nil },
+			latched:  false,
+			wantHead: h101.Hash(),
+		},
+		{
+			name:     "nothing inserted, refused",
+			insert:   func(types.Blocks) (int, error) { return 0, errors.New("state root mismatch") },
+			latched:  true,
+			wantHead: unknownHead,
+		},
+		{
+			name:     "whole batch inserted",
+			insert:   func(blocks types.Blocks) (int, error) { return len(blocks), nil },
+			latched:  false,
+			wantHead: h102.Hash(),
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			chain := &fakeChain{
+				head:     local,
+				byNumber: map[uint64]*types.Header{100: local, 101: h101, 102: h102},
+				insert:   tc.insert,
+			}
+			remote, localEnd := p2p.MsgPipe()
+			defer remote.Close()
+			defer localEnd.Close()
+
+			peer := NewPeer(ETH64, "test-peer", localEnd)
+			defer peer.Close()
+			// A head that differs from ours, otherwise syncToHead returns before
+			// doing anything.
+			peer.SetHead(unknownHead, big.NewInt(2))
+
+			go servePeer(peer, remote, chain.byNumber)
+
+			h := newHandler(fakeBackend{chain: chain}, 860621)
+			defer h.Close()
+			s := newChainSyncer(h)
+			s.syncToHead(peer)
+
+			if chain.calls != 1 {
+				t.Fatalf("InsertChain called %d times, want exactly 1", chain.calls)
+			}
+			if got := s.blocked.Load(); got != tc.latched {
+				t.Fatalf("blocked = %v, want %v", got, tc.latched)
+			}
+			if head, _ := peer.Head(); head != tc.wantHead {
+				t.Fatalf("peer head advanced to %s, want %s: the syncer counted blocks that were never inserted",
+					head, tc.wantHead)
+			}
+		})
 	}
 }

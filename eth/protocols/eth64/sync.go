@@ -74,11 +74,6 @@ func (s *chainSyncer) loop() {
 		case <-s.triggerCh:
 		case <-ticker.C:
 		}
-		// A trigger and a close can become ready together; the select picks one
-		// at random, so re-check before doing any work or writing metrics.
-		if s.closed() {
-			return
-		}
 		if s.blocked.Load() {
 			continue
 		}
@@ -155,11 +150,6 @@ func (s *chainSyncer) syncToHead(peer *Peer) {
 		var lastImported *types.Header
 		aborted := false
 		for len(batch) > 0 {
-			// Each iteration is a full body round trip, so this loop can outlive
-			// a shutdown. Bail out before touching the chain or the meters.
-			if s.closed() {
-				return
-			}
 			blocks, complete, err := s.fetchBlocks(peer, batch)
 			if err != nil {
 				peer.Log().Debug("Body fetch failed", "count", len(batch), "err", err)
@@ -206,6 +196,27 @@ func (s *chainSyncer) syncToHead(peer *Peer) {
 				peer.SetHead(lastImported.Hash(), peer.TD())
 				aborted = true
 				break
+			}
+			// InsertChain can also import nothing - or only a prefix - without
+			// reporting an error. core returns (nil, 0, nil) when the chain is
+			// already stopping on entry (core/blockchain.go:2282) and
+			// (nil, it.index, nil) when it stops in the middle of a batch
+			// (core/blockchain.go:2431 breaks the loop while err is still nil).
+			//
+			// Falling through to the accounting below would count the whole batch
+			// as imported: origin would advance past blocks that were never written
+			// and the log would report progress that did not happen, so the sync
+			// either re-requests a batch it already "moved past" or stalls with no
+			// error anywhere. Nothing refused a block here, so this must not latch.
+			if inserted < len(blocks) {
+				peer.Log().Debug("eth/64 sync stopped: the chain stopped inserting without reporting an error",
+					"origin", origin, "requested", len(blocks), "inserted", inserted)
+				if inserted > 0 {
+					importedMeter.Mark(int64(inserted))
+					lastImported = blocks[inserted-1].Header()
+					peer.SetHead(lastImported.Hash(), peer.TD())
+				}
+				return
 			}
 			importedMeter.Mark(int64(len(blocks)))
 			origin += uint64(len(blocks))
@@ -254,25 +265,21 @@ func canExecuteBatch(cfg *params.ChainConfig, blocks []*types.Block) bool {
 // anything, and latches the syncer so the same failure is not repeated every
 // round.
 //
-// Two cases must NOT latch, because neither is a verdict on the block:
+// One case must NOT latch, because it is not a verdict on the block: the node is
+// shutting down. InsertChain reports "blockchain is stopped" whenever a batch
+// happens to be in flight when Close runs, and latching on that parks the syncer
+// for the rest of the process life. The check is made on the error
+// (core.IsChainStopped) and deliberately NOT on the handler's close channel: the
+// channel says the handler was closed, which is a different (and, in production,
+// never-observed) condition, while the error says a block was actually refused
+// for a reason that is purely local and transient.
 //
-//   - the node is shutting down (core.IsChainStopped). InsertChain reports
-//     "blockchain is stopped" whenever a batch happens to be in flight when
-//     Close runs, and latching on that parks the syncer for the rest of the
-//     process life;
-//   - the handler is already closed, in which case writing metrics afterwards is
-//     just noise in the shutdown path.
-//
-// Both are logged at DEBUG: an operator watching a restart must not see a chain
-// boundary that never happened, and boundary-stops must stay a real signal.
+// It is logged at DEBUG for the same reason it does not latch: an operator
+// watching a restart must not see a chain boundary that never happened, and
+// boundary-stops must stay a real signal.
 func (s *chainSyncer) stopAtBoundary(peer *Peer, origin uint64, refused *types.Header, err error) {
 	if core.IsChainStopped(err) {
 		peer.Log().Debug("eth/64 sync stopped: the chain is shutting down, not refusing the block",
-			"origin", origin, "block", refused.Number, "err", err)
-		return
-	}
-	if s.closed() {
-		peer.Log().Debug("eth/64 sync stopped: handler already closed",
 			"origin", origin, "block", refused.Number, "err", err)
 		return
 	}
@@ -280,17 +287,6 @@ func (s *chainSyncer) stopAtBoundary(peer *Peer, origin uint64, refused *types.H
 	peer.Log().Warn("eth/64 download stopped: the chain refused this block and nothing was imported",
 		"origin", origin, "block", refused.Number, "hash", refused.Hash(), "err", err)
 	s.blocked.Store(true)
-}
-
-// closed reports whether the handler has been closed. Non-blocking: the sync
-// loop calls it between downloads, not to wait for shutdown.
-func (s *chainSyncer) closed() bool {
-	select {
-	case <-s.h.closeCh:
-		return true
-	default:
-		return false
-	}
 }
 
 // Reset clears the hard-boundary latch and schedules a new sync round.

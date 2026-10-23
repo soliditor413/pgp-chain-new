@@ -5,20 +5,45 @@ package eth64
 
 import (
 	"fmt"
+	"math/big"
 	"sync"
 	"time"
 
-	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
+	"github.com/ethereum/go-ethereum/params"
 )
+
+// ChainReader is the chain surface eth/64 actually uses.
+//
+// It exists instead of *core.BlockChain so the syncer's decisions can be tested
+// without a real blockchain: the branches that matter (a batch refused outright,
+// a batch accepted only in part, a batch accepted but not inserted) are all
+// decided from the return value of InsertChain, and *core.BlockChain cannot
+// produce them on demand.
+//
+// Every method here is already on *core.BlockChain, so the eth package keeps
+// passing its concrete chain. The set is a superset of forkid.Blockchain, which
+// is what lets handshake.go hand it to forkid.NewFilter unchanged.
+type ChainReader interface {
+	Config() *params.ChainConfig
+	Genesis() *types.Block
+	CurrentHeader() *types.Header
+	CurrentBlock() *types.Header
+	GetHeaderByNumber(number uint64) *types.Header
+	GetHeaderByHash(hash common.Hash) *types.Header
+	GetBody(hash common.Hash) *types.Body
+	GetTd(hash common.Hash, number uint64) *big.Int
+	InsertChain(chain types.Blocks) (int, error)
+}
 
 // Backend is the minimal chain access eth/64 needs. It is intentionally tiny so
 // that the eth package can adapt its handler without exposing its internals.
 type Backend interface {
 	// Chain returns the local blockchain.
-	Chain() *core.BlockChain
+	Chain() ChainReader
 }
 
 // handler owns the eth/64 peer set and the single sync loop.

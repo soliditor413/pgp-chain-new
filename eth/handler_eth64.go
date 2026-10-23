@@ -4,7 +4,6 @@
 package eth
 
 import (
-	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth64"
 	"github.com/ethereum/go-ethereum/p2p"
 )
@@ -15,8 +14,9 @@ import (
 // corrupt the eth/68 or bsc peer sets.
 type eth64Handler handler
 
-// Chain implements eth64.Backend.
-func (h *eth64Handler) Chain() *core.BlockChain { return h.chain }
+// Chain implements eth64.Backend. The concrete chain satisfies eth64.ChainReader,
+// which is the narrowest surface eth/64 uses.
+func (h *eth64Handler) Chain() eth64.ChainReader { return h.chain }
 
 // makeETH64Protocols returns the pgp-chain eth/64 protocol entry. It is only
 // registered for chains that carry the pgp legacy history, never for
