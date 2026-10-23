@@ -497,6 +497,16 @@ func (st *stateTransition) preCheck() error {
 			}
 			// This will panic if baseFee is nil, but basefee presence is verified
 			// as part of header validation.
+			//
+			// The one way to get here with a nil BaseFee is a pgp legacy header
+			// whose block context was built without a chain: the substitution of
+			// zero for the missing field in NewEVMBlockContext is gated on
+			// `chain != nil`, so `NewEVMBlockContext(header, nil, …)` leaves it
+			// nil. A real node always passes its chain and never reaches this,
+			// but a fixture that builds a context by hand does — and it fails as
+			// a SIGSEGV inside CmpBig, which reads like a library bug rather
+			// than the fixture's fault. Pass a ChainContext whose Config() is the
+			// pgp config, or set BaseFee explicitly.
 			if msg.GasFeeCap.CmpBig(st.evm.Context.BaseFee) < 0 {
 				return fmt.Errorf("%w: address %v, maxFeePerGas: %s, baseFee: %s", ErrFeeCapTooLow,
 					msg.From.Hex(), msg.GasFeeCap, st.evm.Context.BaseFee)
