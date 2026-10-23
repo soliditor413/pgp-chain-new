@@ -244,6 +244,32 @@ func NewService(cfg *Config, tmux *event.TypeMux, dynamicArbiterHeight uint64) (
 
 	SpvService = &Service{service, cfg.GenesisHash, tmux}
 
+	// The transaction listener is what puts an address into the SPV bloom
+	// filter, so it has to be registered before anything asks the ELA chain for
+	// merkle blocks. Without it the peer sends merkle blocks that match nothing,
+	// every block arrives with an empty transaction list, and the recharge store
+	// fills with nothing while reporting full coverage — silently.
+	//
+	// Resolve the address first: a bad genesis address must fail here rather
+	// than leave a half-registered service behind.
+	programHash, err := common.Uint168FromAddress(cfg.GenesisAddress)
+	if err != nil {
+		log.Error("Spv resolve the ELA filter address: ", "address", cfg.GenesisAddress, "err", err)
+		return nil, err
+	}
+	err = service.RegisterTransactionListener(&transactionListener{
+		address: cfg.GenesisAddress,
+		service: service,
+	})
+	if err != nil {
+		log.Error("Spv Register Transaction Listener: ", "err", err)
+		return nil, err
+	}
+	// One line that makes "did the filter get installed, and for what" visible
+	// in the log, so this failure can never again cost a full sync to diagnose.
+	log.Info("pgp: registered the ELA filter address",
+		"address", cfg.GenesisAddress, "programHash", programHash.String())
+
 	// The block listener is part of the read path, not the write path:
 	// GetSpvHeight, SpvIsWorkingHeight and the consensus mode switch all go
 	// through it, so it is registered even in this read-only port.
@@ -255,13 +281,14 @@ func NewService(cfg *Config, tmux *event.TypeMux, dynamicArbiterHeight uint64) (
 		return nil, err
 	}
 
-	// TODO(spv-porter): pgp-chain registered the write path here and is not
-	// ported yet:
-	//   - &listener{address: cfg.GenesisAddress, service: service}
-	//     (recharge notify -> SavePayloadInfo -> SendTransaction)
+	// TODO(spv-porter): pgp-chain registered two more listeners here and neither
+	// is ported yet:
+	//   - &listener{...}'s *write* path: SavePayloadInfo -> SendTransaction, and
+	//     the genesis extra-data scan that populated blocksigner.Signers and
+	//     blocksigner.SelfIsProducer. The address-carrying read-only
+	//     transactionListener above is registered, so the bloom filter is
+	//     populated; what is missing is the code that submits ELA transactions.
 	//   - &pledgeBill.PledgeBillListener{Service: service}
-	//   - the genesis extra-data scan that populated blocksigner.Signers and
-	//     blocksigner.SelfIsProducer.
 
 	return SpvService, nil
 }

@@ -54,23 +54,48 @@ func ApplyElaBlock(store *RechargeStore, block *util.Block) error {
 		if err != nil {
 			return fmt.Errorf("spv: decoding ELA tx %d of block %d: %w", i, height, err)
 		}
-		if tx.TxType() != elacom.TransferCrossChainAsset {
-			continue
-		}
-		datas, err := rechargeDatasOf(tx)
-		if err != nil {
-			return fmt.Errorf("spv: ELA tx %s at height %d: %w", tx.Hash().String(), height, err)
-		}
-		if len(datas) == 0 {
-			// A TransferCrossChainAsset tx with no cross-chain output carries no
-			// recharge data; pgp-chain stored nothing for it either.
-			continue
-		}
-		if err := store.PutRecharge(height, tx.Hash().String(), datas); err != nil {
-			return fmt.Errorf("spv: storing recharge for ELA tx %s at height %d: %w", tx.Hash().String(), height, err)
+		if err := ApplyElaTransaction(store, height, tx); err != nil {
+			return fmt.Errorf("spv: applying ELA tx %d of block %d: %w", i, height, err)
 		}
 	}
 	return store.AdvanceCoverage(height, elaBlockHash(block))
+}
+
+// ApplyElaTransaction indexes one already-decoded ELA transaction at elaHeight.
+// It does not touch the coverage marker; only AdvanceCoverage (i.e. ApplyElaBlock)
+// may do that, because a single transaction cannot prove its block complete.
+//
+// It exists for the transaction listener, which is handed a decoded
+// it.Transaction by the SPV layer and would otherwise have to serialise it only
+// to deserialise it again. Both entries therefore converge on the same "write
+// one record" step, while ApplyElaBlock keeps ownership of coverage.
+//
+// A transaction that is not a TransferCrossChainAsset, or one that carries no
+// cross-chain output, is not an error: it simply has no recharge record. That
+// mirrors ApplyElaBlock's loop, which skipped exactly these.
+func ApplyElaTransaction(store *RechargeStore, elaHeight uint64, tx it.Transaction) error {
+	if store == nil {
+		return ErrRechargeStoreNotInitialised
+	}
+	if tx == nil {
+		return nil
+	}
+	if tx.TxType() != elacom.TransferCrossChainAsset {
+		return nil
+	}
+	datas, err := rechargeDatasOf(tx)
+	if err != nil {
+		return fmt.Errorf("spv: ELA tx %s at height %d: %w", tx.Hash().String(), elaHeight, err)
+	}
+	if len(datas) == 0 {
+		// A TransferCrossChainAsset tx with no cross-chain output carries no
+		// recharge data; pgp-chain stored nothing for it either.
+		return nil
+	}
+	if err := store.PutRecharge(elaHeight, tx.Hash().String(), datas); err != nil {
+		return fmt.Errorf("spv: storing recharge for ELA tx %s at height %d: %w", tx.Hash().String(), elaHeight, err)
+	}
+	return nil
 }
 
 // elaBlockHash converts the ELA block hash to the representation the store keeps

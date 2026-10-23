@@ -7,6 +7,7 @@ import (
 
 	"github.com/elastos/Elastos.ELA.SPV/util"
 	elacommon "github.com/elastos/Elastos.ELA/common"
+	elacom "github.com/elastos/Elastos.ELA/core/types/common"
 )
 
 // fakeHeader stands in for util.BlockHeader, which is an interface: a zero
@@ -111,5 +112,82 @@ func TestNewRechargeDataValidatesAddress(t *testing.T) {
 	}
 	if string(data.TargetData) != "m" {
 		t.Fatalf("memo = %q", data.TargetData)
+	}
+}
+
+// TestApplyElaTransactionIndexesRealTx covers the transaction-listener path: a
+// single decoded tx is enough to write the record, and it must NOT move the
+// coverage marker on its own.
+func TestApplyElaTransactionIndexesRealTx(t *testing.T) {
+	tx, err := decodeElaTransaction(realElaTx30115(t))
+	if err != nil {
+		t.Fatalf("decodeElaTransaction: %v", err)
+	}
+
+	s := newTestStore()
+	if err := ApplyElaTransaction(s, elaHeight30115, tx); err != nil {
+		t.Fatalf("ApplyElaTransaction: %v", err)
+	}
+
+	// One transaction cannot prove its block complete, so the read must still be
+	// gated on coverage: that is the whole reason AdvanceCoverage lives in
+	// ApplyElaBlock.
+	if _, _, err := s.RechargeAt(elaHeight30115, elaHash30115); !errors.Is(err, ErrRechargeHeightNotCovered) {
+		t.Fatalf("RechargeAt before AdvanceCoverage = %v, want ErrRechargeHeightNotCovered", err)
+	}
+
+	if err := s.AdvanceCoverage(elaHeight30115, testElaBlockHash); err != nil {
+		t.Fatalf("AdvanceCoverage: %v", err)
+	}
+	datas, fee, err := s.RechargeAt(elaHeight30115, elaHash30115)
+	if err != nil {
+		t.Fatalf("RechargeAt after AdvanceCoverage: %v", err)
+	}
+	if len(datas) != 1 {
+		t.Fatalf("got %d recharge records, want 1", len(datas))
+	}
+	if fee.String() != "150000" {
+		t.Fatalf("fee = %s, want 150000", fee)
+	}
+	if datas[0].TargetAddress.Hex() != rechargeTarget30115 {
+		t.Fatalf("target = %s, want %s", datas[0].TargetAddress.Hex(), rechargeTarget30115)
+	}
+}
+
+// TestApplyElaTransactionSkipsNonCrossChainTx pins the type filter: a tx of any
+// other type must be a no-op rather than an error, otherwise the listener would
+// log a failure for every ordinary ELA transaction it is handed.
+func TestApplyElaTransactionSkipsNonCrossChainTx(t *testing.T) {
+	tx, err := decodeElaTransaction(realElaTx30115(t))
+	if err != nil {
+		t.Fatalf("decodeElaTransaction: %v", err)
+	}
+	tx.SetTxType(elacom.TransferAsset)
+
+	s := newTestStore()
+	if err := ApplyElaTransaction(s, elaHeight30115, tx); err != nil {
+		t.Fatalf("ApplyElaTransaction: %v", err)
+	}
+	if err := s.AdvanceCoverage(elaHeight30115, testElaBlockHash); err != nil {
+		t.Fatalf("AdvanceCoverage: %v", err)
+	}
+	if _, _, err := s.RechargeAt(elaHeight30115, elaHash30115); !errors.Is(err, ErrRechargeUnavailable) {
+		t.Fatalf("RechargeAt = %v, want ErrRechargeUnavailable (nothing stored)", err)
+	}
+}
+
+// TestApplyElaTransactionRejectsMissingStore keeps the listener from silently
+// dropping records when SpvDbInit has not run.
+func TestApplyElaTransactionRejectsMissingStore(t *testing.T) {
+	tx, err := decodeElaTransaction(realElaTx30115(t))
+	if err != nil {
+		t.Fatalf("decodeElaTransaction: %v", err)
+	}
+	if err := ApplyElaTransaction(nil, elaHeight30115, tx); !errors.Is(err, ErrRechargeStoreNotInitialised) {
+		t.Fatalf("ApplyElaTransaction(nil store) = %v, want ErrRechargeStoreNotInitialised", err)
+	}
+	// A nil tx is not an error: it means "nothing to index".
+	if err := ApplyElaTransaction(newTestStore(), elaHeight30115, nil); err != nil {
+		t.Fatalf("ApplyElaTransaction(nil tx) = %v, want nil", err)
 	}
 }

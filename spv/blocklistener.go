@@ -8,6 +8,7 @@ import (
 	"github.com/elastos/Elastos.ELA.SPV/util"
 
 	"github.com/elastos/Elastos.ELA/core/transaction"
+	elacom "github.com/elastos/Elastos.ELA/core/types/common"
 	"github.com/elastos/Elastos.ELA/core/types/payload"
 	"github.com/elastos/Elastos.ELA/dpos/p2p/peer"
 
@@ -34,10 +35,39 @@ type BlockListener struct {
 	param                auxParam
 	handle               func(block interface{}) error
 	dynamicArbiterHeight uint64
+
+	// Cumulative counters reported with the progress line. They exist because
+	// an empty bloom filter is indistinguishable from a healthy sync in every
+	// other signal: coverage advances, no error is logged, and the recharge
+	// store simply stays empty. "txs" going up is the proof that the filter
+	// installed by transactionListener actually matches something.
+	txsSeen           atomic.Uint64
+	crossChainTxsSeen atomic.Uint64
 }
 
 func (l *BlockListener) GetDynamicArbiterHeight() uint64 {
 	return atomic.LoadUint64(&l.dynamicArbiterHeight)
+}
+
+// countCrossChainTxs reports how many of the block's transactions are
+// TransferCrossChainAsset. A transaction that fails to decode is not counted;
+// ApplyElaBlock reports that failure on its own, and duplicating it here would
+// just double the log volume during a bad stretch.
+func countCrossChainTxs(block *util.Block) uint64 {
+	var count uint64
+	for _, t := range block.Transactions {
+		if t == nil {
+			continue
+		}
+		tx, err := decodeElaTransaction(t)
+		if err != nil {
+			continue
+		}
+		if tx.TxType() == elacom.TransferCrossChainAsset {
+			count++
+		}
+	}
+	return count
 }
 
 // NotifyBlock is the ELA listener callback.
@@ -66,6 +96,11 @@ func (l *BlockListener) GetDynamicArbiterHeight() uint64 {
 // want.
 func (l *BlockListener) NotifyBlock(block *util.Block, isCurrent bool) {
 	if block != nil {
+		txs := uint64(len(block.Transactions))
+		crossChainTxs := countCrossChainTxs(block)
+		txsSoFar := l.txsSeen.Add(txs)
+		crossChainTxsSoFar := l.crossChainTxsSeen.Add(crossChainTxs)
+
 		if store := GetRechargeStore(); store != nil {
 			if err := ApplyElaBlock(store, block); err != nil {
 				log.Error("failed to index ELA block into the recharge store; "+
@@ -77,7 +112,12 @@ func (l *BlockListener) NotifyBlock(block *util.Block, isCurrent bool) {
 				// start-up and the first reorg or error. One line every 10k blocks
 				// is ~230 lines for a full sync and is the only way to tell "still
 				// syncing" from "stuck" from the log alone.
-				log.Info("ELA main chain sync progress", "elaHeight", block.Height, "current", isCurrent)
+				//
+				// txs/crossChainTxs are cumulative. If txs stays at 0 while
+				// elaHeight climbs, the bloom filter has no address (see
+				// transactionListener) and every recharge record is missing.
+				log.Info("ELA main chain sync progress", "elaHeight", block.Height,
+					"txs", txsSoFar, "crossChainTxs", crossChainTxsSoFar, "current", isCurrent)
 			}
 		}
 	}
