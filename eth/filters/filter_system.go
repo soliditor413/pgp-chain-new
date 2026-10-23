@@ -260,8 +260,15 @@ func NewEventSystem(sys *FilterSystem) *EventSystem {
 	if m.txsSub == nil || m.logsSub == nil || m.rmLogsSub == nil || m.chainSub == nil {
 		log.Crit("Subscribe for event system failed")
 	}
-	if m.voteSub == nil || m.finalizedHeaderSub == nil {
-		log.Warn("Subscribe for vote or finalized header event failed")
+	if m.voteSub == nil {
+		// The vote feed only exists on chains running an engine with a vote
+		// pool (Parlia). The pgp-chain legacy history routes consensus through
+		// the height router, which has none, so the feed is legitimately absent
+		// there and must not be reported as an error.
+		log.Debug("Vote event subscription unavailable")
+	}
+	if m.finalizedHeaderSub == nil {
+		log.Warn("Subscribe for finalized header event failed")
 	}
 
 	go m.eventLoop()

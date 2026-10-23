@@ -156,7 +156,17 @@ func (v *BlockValidator) ValidateState(block *types.Block, statedb *state.StateD
 	// For valid blocks this should always validate to true.
 	validateFuns := []func() error{
 		func() error {
-			rbloom := types.MergeBloom(res.Receipts)
+			// The legacy pgp-chain header bloom is the union of the receipt logs
+			// AND the sender/recipient of every transaction
+			// (pgp-chain/core/block_validator.go:98). MergeBloom cannot be used
+			// for it: it skips receipts without logs, which would drop the
+			// from/to bits of a plain transfer.
+			var rbloom types.Bloom
+			if v.config.IsPGPLegacy(block.Number()) {
+				rbloom = types.CreateBloomWithTxList(res.Receipts, block.Transactions())
+			} else {
+				rbloom = types.MergeBloom(res.Receipts)
+			}
 			if rbloom != header.Bloom {
 				return fmt.Errorf("invalid bloom (remote: %x  local: %x)", header.Bloom, rbloom)
 			}

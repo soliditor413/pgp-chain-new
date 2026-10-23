@@ -275,6 +275,12 @@ type DeriveReceiptContext struct {
 	LogIndex     uint // Number of logs in the block until this receipt
 	Tx           *Transaction
 	TxIndex      uint
+
+	// LegacyBloom selects the pgp-chain legacy bloom (logs + sender +
+	// recipient) instead of the standard logs-only bloom. It is set by the
+	// caller, which is the only place that knows the chain configuration, so
+	// that these types do not have to depend on it.
+	LegacyBloom bool
 }
 
 // DeriveFields fills the receipt with computed fields based on consensus
@@ -317,7 +323,11 @@ func (r *Receipt) DeriveFields(signer Signer, context DeriveReceiptContext) {
 		logIndex++
 	}
 	// Also derive the Bloom if not derived yet
-	r.Bloom = CreateBloom(r)
+	if context.LegacyBloom {
+		r.Bloom = CreateBloomWithTx(r, context.Tx)
+	} else {
+		r.Bloom = CreateBloom(r)
+	}
 }
 
 // ReceiptForStorage is a wrapper around a Receipt with RLP serialization
@@ -387,6 +397,10 @@ func (rs Receipts) EncodeIndex(i int, w *bytes.Buffer) {
 // data and contextual infos like containing block and transactions.
 func (rs Receipts) DeriveFields(config *params.ChainConfig, blockHash common.Hash, blockNumber uint64, blockTime uint64, baseFee *big.Int, blobGasPrice *big.Int, txs []*Transaction) error {
 	signer := MakeSigner(config, new(big.Int).SetUint64(blockNumber), blockTime)
+	// The legacy pgp-chain receipts carry the from/to bloom, so re-deriving them
+	// (which happens whenever receipts are read back from the database) has to
+	// reproduce that variant instead of the logs-only one.
+	legacyBloom := config.IsPGPLegacy(new(big.Int).SetUint64(blockNumber))
 
 	logIndex := uint(0)
 	if len(txs) != len(rs) {
@@ -407,6 +421,7 @@ func (rs Receipts) DeriveFields(config *params.ChainConfig, blockHash common.Has
 			LogIndex:     logIndex,
 			Tx:           txs[i],
 			TxIndex:      uint(i),
+			LegacyBloom:  legacyBloom,
 		})
 		logIndex += uint(len(rs[i].Logs))
 	}

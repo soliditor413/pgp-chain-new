@@ -69,6 +69,20 @@ func NewEVMBlockContext(header *types.Header, chain ChainContext, author *common
 	}
 	if header.BaseFee != nil {
 		baseFee = new(big.Int).Set(header.BaseFee)
+	} else if chain != nil && chain.Config().IsPGPLegacy(header.Number) {
+		// pgp-chain never activated EIP-1559: its headers carry no BaseFee field
+		// at all, so there is nothing to copy. Leaving the context field nil is
+		// not an option — the London fee arithmetic does
+		// uint256.FromBig(Context.BaseFee) (core/state_transition.go) and panics
+		// on nil. Zero is also what the chain itself means: pgp-chain's BASEFEE
+		// opcode pushes 0 when the field is absent (pgp-chain core/vm/eips.go
+		// enable3198), and with baseFee 0 the effective tip equals the full gas
+		// price, which is exactly pgp-chain's minerFee = gasUsed * gasPrice.
+		//
+		// chain is nil for callers that build a context without a chain (the bintrie
+		// and runtime tests pass one), so the legacy test has to come with a nil
+		// guard: without it those callers panic the moment the header has no BaseFee.
+		baseFee = new(big.Int)
 	}
 	if header.ExcessBlobGas != nil {
 		blobBaseFee = eip4844.CalcBlobFee(chain.Config(), header)
@@ -94,6 +108,11 @@ func NewEVMBlockContext(header *types.Header, chain ChainContext, author *common
 		Random:         random,
 		SlotNum:        slotNum,
 		MilliTimestamp: header.MilliTimestamp(),
+		// pgp-chain stores the ELA SPV height of the block in the nonce
+		// (types.EncodeNonce(GetSpvHeight())); the legacy state transition reads
+		// it back through Context.Nonce to pin the recharge-completion lookup to
+		// this block instead of the node's live head.
+		Nonce: header.Nonce.Uint64(),
 	}
 }
 

@@ -26,6 +26,16 @@ import (
 )
 
 // CheckMaxInitCodeSize checks the size of contract initcode against the protocol-defined limit.
+//
+// The Shanghai gate below is true on the pgp-chain legacy range and must stay
+// true: pgp-chain's genesis timestamp is already past its ShanghaiTime, so
+// params.Rules hard-wires IsShanghai for legacy blocks
+// (params/config.go:2249-2252), and pgp-chain enforces the same 49152 limit
+// there (pgp-chain/core/state_transition.go:299-300). Do NOT "align" the legacy
+// range by turning this off. The EIP-3860 *word gas* is the rule that pgp never
+// had, and it is disabled separately in core/state_transition.go:618-623. Getting
+// the two confused makes a 49999-byte create acceptable here and rejected by
+// every pgp node.
 func CheckMaxInitCodeSize(rules *params.Rules, size uint64) error {
 	if rules.IsAmsterdam {
 		if size > params.MaxInitCodeSizeAmsterdam {

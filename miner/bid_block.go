@@ -131,7 +131,14 @@ func (w *worker) prepareBidBlockTask(
 		return nil, errors.New("worker is not running")
 	}
 
-	p := w.engine.(*parlia.Parlia)
+	// Bid blocks are signed with Parlia system transactions, so they can only be
+	// handled by the Parlia engine. Chains that route consensus through a
+	// different engine (e.g. the pgp-chain legacy history, which uses the height
+	// router) must fail cleanly here instead of panicking on a bare assertion.
+	p, ok := w.engine.(*parlia.Parlia)
+	if !ok {
+		return nil, fmt.Errorf("bid blocks require the parlia engine, have %T", w.engine)
+	}
 
 	// Copy the tx slice so bind-signing does not mutate the cached BidBlock.
 	allTxs := make([]*types.Transaction, len(decoded.Txs))

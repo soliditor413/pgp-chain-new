@@ -245,11 +245,13 @@ func getGenesisState(db ethdb.Database, blockhash common.Hash) (alloc types.Gene
 	var genesis *Genesis
 	switch blockhash {
 	case params.MainnetGenesisHash:
-		genesis = DefaultGenesisBlock()
+		genesis = DefaultEthereumGenesisBlock()
 	case params.BSCGenesisHash:
 		genesis = DefaultBSCGenesisBlock()
 	case params.ChapelGenesisHash:
 		genesis = DefaultChapelGenesisBlock()
+	case params.PGPGenesisHash:
+		genesis = DefaultPGPGenesisBlock()
 	}
 	if genesis != nil {
 		return genesis.Alloc, nil
@@ -376,8 +378,8 @@ func SetupGenesisBlockWithOverride(db ethdb.Database, triedb *triedb.Database, g
 	ghash := rawdb.ReadCanonicalHash(db, 0)
 	if (ghash == common.Hash{}) {
 		if genesis == nil {
-			log.Info("Writing default BSC mainnet genesis block")
-			genesis = DefaultBSCGenesisBlock()
+			log.Info("Writing default pgp-chain mainnet genesis block")
+			genesis = DefaultPGPGenesisBlock()
 		} else {
 			log.Info("Writing custom genesis block")
 		}
@@ -443,6 +445,14 @@ func SetupGenesisBlockWithOverride(db ethdb.Database, triedb *triedb.Database, g
 		return nil, common.Hash{}, nil, err
 	}
 
+	// Safety net: never let a pgp-chain configuration run on top of a database
+	// that belongs to another chain. This happens when a node is pointed at an
+	// old BSC/Chapel datadir: the genesis blocks differ, so syncing simply
+	// stops, but the failure is silent and hard to diagnose.
+	if err := checkPGPDatabaseMatch(newCfg, ghash); err != nil {
+		return nil, common.Hash{}, nil, err
+	}
+
 	// Sanity-check the new configuration.
 	if err := newCfg.CheckConfigForkOrder(); err != nil {
 		return nil, common.Hash{}, nil, err
@@ -463,6 +473,22 @@ func SetupGenesisBlockWithOverride(db ethdb.Database, triedb *triedb.Database, g
 	return newCfg, ghash, nil, nil
 }
 
+// checkPGPDatabaseMatch rejects a pgp-chain configuration that is paired with a
+// database initialised for a different chain. BSC/Chapel/Rialto and custom
+// networks are not affected: the check only fires when the configured chain ID
+// is pgp-chain's.
+func checkPGPDatabaseMatch(cfg *params.ChainConfig, ghash common.Hash) error {
+	if cfg == nil || cfg.ChainID == nil || ghash == params.PGPGenesisHash {
+		return nil
+	}
+	if cfg.ChainID.Cmp(params.PGPChainConfig.ChainID) != 0 {
+		return nil
+	}
+	return fmt.Errorf("database was initialised for a different chain: stored genesis is %s, pgp-chain mainnet genesis is %s; "+
+		"point --datadir at a pgp-chain data directory or wipe this one with 'geth removedb'",
+		ghash.Hex(), params.PGPGenesisHash.Hex())
+}
+
 // LoadChainConfig retrieves the predefined chain configuration for the built-in network.
 // For non-built-in networks, it first attempts to load the stored chain configuration from the database.
 // If the configuration is not present, it returns the configuration specified in the provided genesis specification.
@@ -472,6 +498,15 @@ func LoadChainConfig(db ethdb.Database, genesis *Genesis) (cfg *params.ChainConf
 	// chain config corresponds to the canonical chain.
 	stored := rawdb.ReadCanonicalHash(db, 0)
 	if stored != (common.Hash{}) {
+		// An explicitly requested genesis must match the one already stored,
+		// otherwise a node started with e.g. --mainnet against a datadir that
+		// was initialised for another chain would silently keep following that
+		// other chain, because the built-in config below wins over the flag.
+		if genesis != nil && genesis.Config != nil {
+			if ghash := genesis.ToBlock().Hash(); ghash != stored {
+				return nil, ghash, &GenesisMismatchError{Stored: stored, New: ghash}
+			}
+		}
 		builtInConf := params.GetBuiltInChainConfig(stored)
 		if builtInConf != nil {
 			return builtInConf, stored, nil
@@ -499,7 +534,7 @@ func LoadChainConfig(db ethdb.Database, genesis *Genesis) (cfg *params.ChainConf
 	}
 	// There is no stored chain config and no new config provided,
 	// In this case the default chain config(mainnet) will be used
-	return params.BSCChainConfig, params.BSCGenesisHash, nil
+	return params.PGPChainConfig, params.PGPGenesisHash, nil
 }
 
 // chainConfigOrDefault retrieves the attached chain configuration. If the genesis
@@ -573,7 +608,7 @@ func (g *Genesis) toBlockWithRoot(root common.Hash) *types.Block {
 	)
 	if conf := g.Config; conf != nil {
 		num := big.NewInt(int64(g.Number))
-		if conf.IsNotInBSC() && conf.IsShanghai(num, g.Timestamp) {
+		if conf.IsNotInBSC() && !conf.IsPGPLegacy(num) && conf.IsShanghai(num, g.Timestamp) {
 			head.WithdrawalsHash = &types.EmptyWithdrawalsHash
 			withdrawals = make([]*types.Withdrawal, 0)
 		}
@@ -691,8 +726,61 @@ func EnableUBTAtGenesis(db ethdb.Database, genesis *Genesis) (bool, error) {
 	return false, nil
 }
 
-// DefaultGenesisBlock returns the Ethereum main net genesis block.
+// DefaultPGPGenesisBlock returns the genesis block of the pgp-chain mainnet.
+//
+// The construction mirrors pgp-chain's core.DefaultGenesisBlock() byte for byte:
+// the state only contains the two pre-deployed cross-chain contracts (0x...64
+// ELAMinter and 0x...65 ELAToken) plus the initial 200M supply held by
+// 0x5d48e17f..., and extraData is 32 zero vanity bytes, 12 zero producer
+// addresses and an empty 65 byte seal.
+//
+// Any change here changes params.PGPGenesisHash and immediately makes the node
+// incompatible with the live network, so it must be covered by a test.
+func DefaultPGPGenesisBlock() *Genesis {
+	initBalance, ok := big.NewInt(0).SetString("200000000000000000000000000", 10)
+	if !ok {
+		panic("invalid pgp genesis balance")
+	}
+	// 32 byte vanity + 12 producer addresses (all zero in the shipped genesis)
+	// + 65 byte seal.
+	extra := make([]byte, extraVanitySize+producerCount*common.AddressLength+extraSealSize)
+
+	return &Genesis{
+		Config:     params.PGPChainConfig,
+		Timestamp:  1762218000,
+		GasLimit:   0x2068F7700,
+		Difficulty: big.NewInt(1),
+		ExtraData:  extra,
+		Alloc: GenesisAlloc{
+			params.ELAMINTER: {
+				Code:    params.ELAMINTER_CODE,
+				Balance: big.NewInt(0),
+			},
+			params.ELATOKEN: {
+				Code:    params.ELATOKEN_CODE,
+				Balance: big.NewInt(0),
+			},
+			common.HexToAddress("0x5d48e17ff0e45bf08fd47cc922612d6407140aeb"): {
+				Balance: initBalance,
+			},
+		},
+	}
+}
+
+// Legacy header layout of the pgp-chain genesis extraData.
+const (
+	extraVanitySize = 32
+	extraSealSize   = 65
+	producerCount   = 12
+)
+
+// DefaultGenesisBlock returns the genesis block of the pgp-chain mainnet.
 func DefaultGenesisBlock() *Genesis {
+	return DefaultPGPGenesisBlock()
+}
+
+// DefaultEthereumGenesisBlock returns the Ethereum main net genesis block.
+func DefaultEthereumGenesisBlock() *Genesis {
 	return &Genesis{
 		Config:     params.MainnetChainConfig,
 		Nonce:      66,

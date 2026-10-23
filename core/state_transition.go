@@ -347,6 +347,20 @@ type stateTransition struct {
 	gasRemaining  vm.GasBudget
 	state         vm.StateDB
 	evm           *vm.EVM
+
+	// passBalance is the temporary balance borrowed by a legacy recharge /
+	// refundWithdraw transaction, nil for every other transaction. passSnapshot
+	// is the state checkpoint taken right before the borrow; the settlement at
+	// the end of execute() either returns the borrow or rewinds the whole
+	// transaction to that checkpoint (pgp-chain semantics, see
+	// settlePassBalance).
+	passBalance  *uint256.Int
+	passSnapshot int
+
+	// vmErr records the EVM level error of the message, so the pass balance
+	// settlement can rewind the transaction exactly like pgp-chain does
+	// (pgp-chain/core/state_transition.go:263-267).
+	vmErr error
 }
 
 // newStateTransition initialises and returns a new state transition object.
@@ -452,16 +466,24 @@ func (st *stateTransition) preCheck() error {
 	}
 	isOsaka := st.evm.ChainConfig().IsOsaka(st.evm.Context.BlockNumber, st.evm.Context.Time)
 	isAmsterdam := st.evm.ChainConfig().IsAmsterdam(st.evm.Context.BlockNumber, st.evm.Context.Time)
+	// pgp-chain has no EIP-3607 check at all: its preCheck only validates the
+	// nonce and buys gas (pgp-chain/core/state_transition.go:221-232), so a
+	// legacy transaction may be sent from an account that has code. This tree
+	// applies the check unconditionally, so it has to be switched off for the
+	// legacy range explicitly.
+	isLegacy := st.evm.ChainConfig().IsPGPLegacy(st.evm.Context.BlockNumber)
 	if !msg.SkipTransactionChecks {
 		// Verify tx gas limit does not exceed EIP-7825 cap.
 		if isOsaka && !isAmsterdam && msg.GasLimit > params.MaxTxGas {
 			return fmt.Errorf("%w (cap: %d, tx: %d)", ErrGasLimitTooHigh, params.MaxTxGas, msg.GasLimit)
 		}
 		// Make sure the sender is an EOA
-		code := st.state.GetCode(msg.From)
-		_, delegated := types.ParseDelegation(code)
-		if len(code) > 0 && !delegated {
-			return fmt.Errorf("%w: address %v, len(code): %d", ErrSenderNoEOA, msg.From.Hex(), len(code))
+		if !isLegacy {
+			code := st.state.GetCode(msg.From)
+			_, delegated := types.ParseDelegation(code)
+			if len(code) > 0 && !delegated {
+				return fmt.Errorf("%w: address %v, len(code): %d", ErrSenderNoEOA, msg.From.Hex(), len(code))
+			}
 		}
 	}
 	// Make sure that transaction gasFeeCap is greater than the baseFee (post london)
@@ -538,7 +560,7 @@ func (st *stateTransition) preCheck() error {
 //
 // However if any consensus issue encountered, return the error directly with
 // nil evm execution result.
-func (st *stateTransition) execute() (*ExecutionResult, error) {
+func (st *stateTransition) execute() (result *ExecutionResult, err error) {
 	// First check this message satisfies all consensus rules before
 	// applying the message. The rules include these clauses
 	//
@@ -549,17 +571,38 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 	// 5. there is no overflow when calculating intrinsic gas
 	// 6. caller has enough balance to cover asset transfer for **topmost** call
 
-	// Check clauses 1-3, buy gas if everything is correct
-	if err := st.preCheck(); err != nil {
-		return nil, err
-	}
-
 	var (
 		msg              = st.msg
 		rules            = st.evm.ChainConfig().Rules(st.evm.Context.BlockNumber, st.evm.Context.Random != nil, st.evm.Context.Time)
 		contractCreation = msg.To == nil
 		floorDataGas     uint64
+		// legacyGasRefund marks the two ELA gateway calls (Recharge and
+		// refundWithdraw) that pgp-chain executes on the house: the pass balance
+		// is lent to the sender, the gas is refunded in full and the fee goes
+		// back to the sender (pgp-chain/core/state_transition.go:256-282,
+		// :325-334, :437-447).
+		legacyGasRefund = rules.IsPGPLegacy &&
+			(params.IsPGPRechargeTx(msg.Data, msg.To) || params.IsPGPRefundWithdrawTx(msg.Data, msg.To))
 	)
+	if legacyGasRefund {
+		// pgp-chain refuses a Recharge whose ELA side is already settled
+		// (pgp-chain/core/state_transition.go:256-261). The answer is a slot in
+		// ELAMinter's own storage, so it is read from the state being executed
+		// rather than from anything outside the block - see
+		// legacyRechargeAlreadyCompleted.
+		if legacyRechargeAlreadyCompleted(st.state, msg.Data, msg.To) {
+			return nil, errLegacyTxAlreadyCompleted
+		}
+		// The borrow has to happen before preCheck/buyGas, otherwise the sender
+		// cannot pay for the gas of the gateway call (it has nothing to spend).
+		st.passSnapshot = st.borrowPassBalance()
+		defer func() { st.settlePassBalance(&result, &err) }()
+	}
+
+	// Check clauses 1-3, buy gas if everything is correct
+	if err := st.preCheck(); err != nil {
+		return nil, err
+	}
 	if st.evm.ChainConfig().IsNano(st.evm.Context.BlockNumber) {
 		for _, blackListAddr := range types.NanoBlackList {
 			if blackListAddr == msg.From {
@@ -571,7 +614,13 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 		}
 	}
 	// Check clauses 4-5, subtract intrinsic gas if everything is correct
-	cost, err := IntrinsicGas(msg.Data, msg.AccessList, msg.SetCodeAuthorizations, contractCreation, rules.IsHomestead, rules.IsIstanbul, rules.IsShanghai, rules.IsAmsterdam)
+	//
+	// pgp-chain's IntrinsicGas has no EIP-3860 word gas at all
+	// (pgp-chain/core/state_transition.go:125-163), so the legacy range must not
+	// be charged for it even though it is Shanghai-active. The init code *size*
+	// limit further down is a different rule and does apply.
+	cost, err := IntrinsicGas(msg.Data, msg.AccessList, msg.SetCodeAuthorizations, contractCreation,
+		rules.IsHomestead, rules.IsIstanbul, rules.IsShanghai && !rules.IsPGPLegacy, rules.IsAmsterdam)
 	if err != nil {
 		return nil, err
 	}
@@ -656,9 +705,17 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 	// Record the gas used excluding gas refunds. This value represents the actual
 	// gas allowance required to complete execution.
 	peakGasUsed := st.gasUsed()
+	st.vmErr = vmerr
 
-	// Compute refund counter, capped to a refund quotient.
-	st.gasRemaining.Refund(st.calcRefund())
+	if legacyGasRefund && vmerr == nil {
+		// pgp-chain's refundCostGas: a successful recharge / refundWithdraw
+		// hands the entire gas back, so the receipt reports GasUsed 0 and the
+		// block gas counter does not move (pgp-chain/core/state_transition.go:437-447).
+		st.gasRemaining.Refund(vm.NewGasBudget(st.gasUsed()))
+	} else {
+		// Compute refund counter, capped to a refund quotient.
+		st.gasRemaining.Refund(st.calcRefund())
+	}
 
 	if rules.IsPrague {
 		// After EIP-7623: Data-heavy transactions pay the floor gas.
@@ -688,9 +745,18 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 	}
 	effectiveTip := msg.GasPrice
 	if rules.IsLondon {
-		baseFee, overflow := uint256.FromBig(st.evm.Context.BaseFee)
-		if overflow {
-			return nil, fmt.Errorf("invalid baseFee: %v", st.evm.Context.BaseFee)
+		// A legacy header carries no baseFee at all, in which case
+		// core.NewEVMBlockContext substitutes zero and the tip is the full gas
+		// price — the same arithmetic pgp-chain does with its
+		// minerFee = gasUsed * gasPrice. The nil check keeps synthetic contexts
+		// (RPC simulation, tests) from panicking.
+		baseFee := new(uint256.Int)
+		if st.evm.Context.BaseFee != nil {
+			var overflow bool
+			baseFee, overflow = uint256.FromBig(st.evm.Context.BaseFee)
+			if overflow {
+				return nil, fmt.Errorf("invalid baseFee: %v", st.evm.Context.BaseFee)
+			}
 		}
 		effectiveTip = new(uint256.Int).Sub(msg.GasPrice, baseFee)
 	}
@@ -698,7 +764,9 @@ func (st *stateTransition) execute() (*ExecutionResult, error) {
 	fee := new(uint256.Int).SetUint64(st.gasUsed())
 	fee.Mul(fee, effectiveTip)
 	// consensus engine is parlia
-	if st.evm.ChainConfig().IsInBSC() {
+	if rules.IsPGPLegacy {
+		st.payLegacyFee(fee, legacyGasRefund)
+	} else if st.evm.ChainConfig().IsInBSC() {
 		st.state.AddBalance(consensus.SystemAddress, fee, tracing.BalanceIncreaseRewardTransactionFee)
 		// add extra blob fee reward
 		if rules.IsCancun {
@@ -789,10 +857,132 @@ func (st *stateTransition) applyAuthorization(auth *types.SetCodeAuthorization) 
 	return nil
 }
 
+// payLegacyFee distributes the transaction fee with the pgp-chain legacy rules.
+//
+// pgp-chain settles the fee inside the transaction rather than in Finalize
+// (pgp-chain/core/state_transition.go:331-352):
+//
+//   - recharge / refundWithdraw: the whole fee is returned to the sender, the
+//     call is free;
+//   - otherwise GasFeeRecipientRatio percent (65 on mainnet, integer division
+//     rounding down) goes to the PG fee sink and the remainder to the block
+//     producer named in the header.
+//
+// The producer is Context.Coinbase, which core.NewEVMBlockContext fills from
+// Engine.Author — consensus/pgp.Author returns the header coinbase, so this is
+// the block's producer exactly as pgp-chain sees it.
+func (st *stateTransition) payLegacyFee(fee *uint256.Int, gasRefunded bool) {
+	if gasRefunded {
+		st.state.AddBalance(st.msg.From, fee, tracing.BalanceIncreaseRewardTransactionFee)
+		return
+	}
+	sink, ratio := st.evm.ChainConfig().GasFeeSplit()
+	if ratio > 0 && sink != (common.Address{}) {
+		pgFee := new(uint256.Int).Mul(fee, uint256.NewInt(ratio))
+		pgFee.Div(pgFee, uint256.NewInt(100))
+		st.state.AddBalance(sink, pgFee, tracing.BalanceIncreaseRewardTransactionFee)
+		fee = new(uint256.Int).Sub(fee, pgFee)
+	}
+	st.state.AddBalance(st.evm.Context.Coinbase, fee, tracing.BalanceIncreaseRewardTransactionFee)
+}
+
+// legacyRechargeAlreadyCompleted reports whether the ELA Minter contract at
+// params.ELAMINTER has already settled the ELA transaction named by a Recharge
+// call, in which case the transaction has to be rejected with
+// errLegacyTxAlreadyCompleted (pgp-chain/core/state_transition.go:256-261).
+//
+// The answer is a single storage slot, so it is read straight from the state
+// being executed. pgp-chain instead ABI-packed a completed(bytes32) call and
+// issued it to itself with nil call options (pgp-chain/spv/elaminter.go:113-134);
+// nil call options mean "latest state of the node", which is not something a
+// replay can reproduce. Reading the slot from state removes the whole problem:
+// the state at block N is the state at block N, whenever it is replayed, and no
+// ELA SPV database is involved.
+//
+// Only Recharge is checked. pgp-chain's IsCompletedByTxInput matches the Recharge
+// method id and answers "not completed" for every other method, refundWithdraw
+// included (pgp-chain/spv/elaminter.go:86-96). That filter is not cosmetic:
+// refundWithdraw(bytes32) writes the *same* mapping (completed is slot 1 of
+// ELAMinter, see params.CompletedSlot), so a withdraw would look "already
+// completed" to a storage-only check the moment the withdraw itself landed, and
+// every such transaction would be rejected - transactions pgp-chain accepted and
+// that are therefore already in the chain.
+//
+// params.IsPGPRechargeTx and params.LegacyRechargeElaHash both filter on the
+// method id. The redundancy is deliberate: the gate states the consensus rule,
+// the extractor keeps its own check because it reproduces pgp-chain's filtering
+// on its own.
+func legacyRechargeAlreadyCompleted(state vm.StateDB, input []byte, to *common.Address) bool {
+	if !params.IsPGPRechargeTx(input, to) {
+		return false
+	}
+	elaHash, ok := params.LegacyRechargeElaHash(input)
+	if !ok {
+		return false
+	}
+	slot := params.CompletedSlot(common.HexToHash(elaHash))
+	return state.GetState(params.ELAMINTER, slot) == params.CompletedSetValue
+}
+
+// borrowPassBalance lends the configured pass balance to the sender of a legacy
+// recharge / refundWithdraw transaction, recording the checkpoint needed to
+// settle it afterwards (pgp-chain/core/state_transition.go:256-282).
+func (st *stateTransition) borrowPassBalance() int {
+	amount := uint256.NewInt(st.evm.ChainConfig().PassBalance())
+	if amount.Sign() == 0 {
+		return -1
+	}
+	snapshot := st.state.Snapshot()
+	st.passBalance = amount
+	st.state.AddBalance(st.msg.From, amount, tracing.BalanceIncreaseRewardTransactionFee)
+	return snapshot
+}
+
+// settlePassBalance takes the borrowed pass balance back, following pgp-chain's
+// three way branch exactly:
+//
+//  1. the transaction failed (EVM error or consensus error) → the whole
+//     transaction is rewound to the checkpoint taken before the borrow;
+//  2. the sender ended up with less than the borrowed amount, i.e. the call
+//     spent from the pass balance → the transaction is rewound and rejected with
+//     ErrGasLimitReached;
+//  3. otherwise the borrow is simply taken back.
+//
+// Case 2 is a consensus rule, not a local policy: pgp-chain returns the error
+// from TransitionDb, which makes the block invalid.
+func (st *stateTransition) settlePassBalance(result **ExecutionResult, err *error) {
+	if st.passBalance == nil {
+		return
+	}
+	if st.vmErr != nil || *err != nil {
+		st.state.RevertToSnapshot(st.passSnapshot)
+		return
+	}
+	if have := st.state.GetBalance(st.msg.From); have.Cmp(st.passBalance) < 0 {
+		if *result != nil {
+			(*result).UsedGas = 0
+			(*result).MaxUsedGas = 0
+			(*result).Err = nil
+			(*result).ReturnData = nil
+		}
+		if *err == nil {
+			*err = ErrGasLimitReached
+		}
+		st.state.RevertToSnapshot(st.passSnapshot)
+		return
+	}
+	st.state.SubBalance(st.msg.From, st.passBalance, tracing.BalanceChangeUnspecified)
+}
+
 // calcRefund computes refund counter, capped to a refund quotient.
 func (st *stateTransition) calcRefund() vm.GasBudget {
 	var refund uint64
-	if !st.evm.ChainConfig().IsLondon(st.evm.Context.BlockNumber) {
+	// pgp-chain caps refunds at gasUsed/2 unconditionally: it defines
+	// RefundQuotientEIP3529 but never uses it
+	// (pgp-chain/core/state_transition.go:420-435), so EIP-3529 does not apply
+	// to the legacy range even though it is London-active by block number.
+	if st.evm.ChainConfig().IsPGPLegacy(st.evm.Context.BlockNumber) ||
+		!st.evm.ChainConfig().IsLondon(st.evm.Context.BlockNumber) {
 		// Before EIP-3529: refunds were capped to gasUsed / 2
 		refund = st.gasUsed() / params.RefundQuotient
 	} else {

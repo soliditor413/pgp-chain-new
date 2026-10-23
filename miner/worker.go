@@ -1075,7 +1075,14 @@ func (w *worker) prepareWork(genParams *generateParams, witness bool) (*environm
 	}
 	// Set baseFee and GasLimit if we are on an EIP-1559 chain
 	if w.chainConfig.IsLondon(header.Number) {
-		header.BaseFee = eip1559.CalcBaseFee(w.chainConfig, parent)
+		// pgp-chain's legacy headers carry no baseFee field at all: EIP-1559
+		// never activated on that history, so deriving one here would append a
+		// 16th header field and change the block hash (params.pgp_config.go,
+		// IsPGPLegacy). The legacy fee arithmetic expects baseFee to be absent,
+		// which core.NewEVMBlockContext turns into zero.
+		if !w.chainConfig.IsPGPLegacy(header.Number) {
+			header.BaseFee = eip1559.CalcBaseFee(w.chainConfig, parent)
+		}
 		if w.chainConfig.IsNotInBSC() && !w.chainConfig.IsLondon(parent.Number) {
 			parentGasLimit := parent.GasLimit * w.chainConfig.ElasticityMultiplier()
 			header.GasLimit = core.CalcGasLimit(parentGasLimit, w.config.GasCeil)
@@ -1270,7 +1277,12 @@ func (w *worker) generateWork(genParam *generateParams, witness bool) *newPayloa
 		}
 	}
 	body := types.Body{Transactions: work.txs, Withdrawals: genParam.withdrawals}
-	if w.chainConfig.IsNotInBSC() {
+	// The legacy pgp-chain blocks have no withdrawals: their headers carry no
+	// WithdrawalsHash field, so defaulting the body to an empty list here would
+	// make types.NewBlock derive EmptyWithdrawalsHash and add a 16th header
+	// field. Guarding on IsPGPLegacy keeps the body nil, which is what
+	// BlockValidator requires whenever header.WithdrawalsHash is nil.
+	if w.chainConfig.IsNotInBSC() && !w.chainConfig.IsPGPLegacy(work.header.Number) {
 		if !w.chainConfig.IsShanghai(work.header.Number, work.header.Time) {
 			if body.Withdrawals != nil {
 				return &newPayloadResult{err: errors.New("unexpected withdrawals before shanghai")}

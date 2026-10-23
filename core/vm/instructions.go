@@ -482,6 +482,24 @@ func opRandom(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	return nil, nil
 }
 
+// opDifficultyLegacy implements 0x44 on the pgp-chain legacy blocks.
+//
+// pgp-chain's Shanghai table descends from the merge table, so its 0x44 is
+// opRandom, which pushes zero when Context.Random is nil
+// (pgp-chain/core/vm/instructions.go:488-495). Legacy headers always carry a
+// non-zero difficulty, so Random is nil and the answer is always zero — not
+// Context.Difficulty, which is what the shared opDifficulty above would return.
+// The Random branch is kept for completeness so the opcode stays consistent if a
+// caller ever supplies one.
+func opDifficultyLegacy(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
+	if evm.Context.Random != nil {
+		scope.Stack.get().SetBytes(evm.Context.Random.Bytes())
+	} else {
+		scope.Stack.get().Clear()
+	}
+	return nil, nil
+}
+
 func opGasLimit(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 	scope.Stack.get().SetUint64(evm.Context.GasLimit)
 	return nil, nil

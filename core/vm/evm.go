@@ -100,6 +100,15 @@ type BlockContext struct {
 	BlobBaseFee *big.Int       // Provides information for BLOBBASEFEE (0 if vm runs with NoBaseFee flag and 0 blob gas price)
 	Random      *common.Hash   // Provides information for PREVRANDAO
 	SlotNum     uint64         // Provides information for SLOTNUM
+	// Nonce is the block header's nonce.
+	//
+	// Ethereum only ever put a proof-of-work result here, so nothing in the EVM
+	// reads it. pgp-chain does: it stores the ELA SPV height of the block in
+	// header.Nonce (types.EncodeNonce(GetSpvHeight()), pgp-chain/consensus/pbft/pbft.go:492),
+	// and the legacy state transition needs it to answer "was this recharge
+	// already settled at that height" reproducibly. It is carried on the block
+	// context because that is the only channel ApplyMessage has.
+	Nonce uint64
 	// MilliTimestamp is the block timestamp in milliseconds (BEP-520), i.e.
 	// Header.MilliTimestamp(). It is consumed by the BEP-706 milliTimestamp
 	// precompile (Jenner fork). Constructors that bypass NewEVMBlockContext
@@ -188,6 +197,11 @@ func NewEVM(blockCtx BlockContext, statedb StateDB, chainConfig *params.ChainCon
 
 	// Select the jump table for the current fork.
 	switch {
+	case evm.chainRules.IsPGPLegacy:
+		// Checked first: the legacy pgp-chain rules must win over every fork
+		// flag that is also set on them (they are Shanghai-and-beyond by time,
+		// see params.ChainConfig.Rules).
+		evm.table = &legacyInstructionSet
 	case evm.chainRules.IsAmsterdam:
 		evm.table = &amsterdamInstructionSet
 	case evm.chainRules.IsOsaka:

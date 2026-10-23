@@ -63,6 +63,15 @@ func CalcBaseFee(config *params.ChainConfig, parent *types.Header) *big.Int {
 	if config.IsInBSC() {
 		return new(big.Int).SetUint64(params.InitialBaseFeeForBSC)
 	}
+	// The pgp-chain legacy blocks never activated EIP-1559: their headers carry
+	// no baseFee field at all (nil), so the adjustment below would dereference
+	// nil. Zero is the value the chain itself implies — see the matching note in
+	// core.NewEVMBlockContext — and it keeps every baseFee comparison
+	// (txpool fee caps, RPC gas price, fee history) a no-op, which is what an
+	// EIP-1559-free chain means.
+	if config.IsPGPLegacy(parent.Number) {
+		return new(big.Int)
+	}
 
 	// If the current block is the first EIP-1559 block, return the InitialBaseFee.
 	if !config.IsLondon(parent.Number) {

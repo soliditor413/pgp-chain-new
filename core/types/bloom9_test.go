@@ -193,3 +193,66 @@ func BenchmarkCreateBloom(b *testing.B) {
 		}
 	})
 }
+
+// TestCreateBloomWithTxList pins the pgp-chain legacy bloom: the logs of a
+// receipt plus the sender and the recipient of its transaction
+// (pgp-chain/core/types/bloom9.go:104-134).
+//
+// The plain CreateBloom stays logs-only, which is what every other chain needs;
+// the legacy variant is selected by the caller through
+// DeriveReceiptContext.LegacyBloom / core.BlockValidator.
+func TestCreateBloomWithTxList(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("failed to generate key: %v", err)
+	}
+	from := crypto.PubkeyToAddress(key.PublicKey)
+	to := common.HexToAddress("0x00000000000000000000000000000000000000aa")
+
+	// Unprotected (Frontier) and EIP-155 signed transactions must both resolve
+	// their sender: the legacy chain has no chainId protection requirement.
+	tx1, err := SignTx(NewTransaction(0, to, big.NewInt(1), 21000, big.NewInt(1), nil), FrontierSigner{}, key)
+	if err != nil {
+		t.Fatalf("failed to sign the frontier transaction: %v", err)
+	}
+	tx2, err := SignTx(NewTransaction(1, to, big.NewInt(1), 21000, big.NewInt(1), nil), NewEIP155Signer(big.NewInt(860621)), key)
+	if err != nil {
+		t.Fatalf("failed to sign the EIP-155 transaction: %v", err)
+	}
+	txs := Transactions{tx1, tx2}
+	receipts := make(Receipts, len(txs))
+	for i, tx := range txs {
+		receipts[i] = &Receipt{TxHash: tx.Hash(), Status: ReceiptStatusSuccessful}
+	}
+
+	legacy := CreateBloomWithTxList(receipts, txs)
+	if !legacy.Test(from.Bytes()) {
+		t.Fatal("legacy bloom must contain the sender")
+	}
+	if !legacy.Test(to.Bytes()) {
+		t.Fatal("legacy bloom must contain the recipient")
+	}
+	// No logs, no log addresses.
+	if CreateBloom(receipts[0]) != EmptyBloom {
+		t.Fatal("the standard bloom of a log-less receipt must stay empty")
+	}
+	// A receipt whose transaction is missing from the list contributes nothing
+	// (pgp-chain skips it the same way).
+	orphan := CreateBloomWithTxList(Receipts{{TxHash: common.HexToHash("0xdead")}}, txs)
+	if orphan != EmptyBloom {
+		t.Fatal("a receipt without a matching transaction must not change the bloom")
+	}
+
+	// Contract creation: only the sender is mixed in.
+	create, err := SignTx(NewContractCreation(2, big.NewInt(0), 100000, big.NewInt(1), []byte{0x00}), FrontierSigner{}, key)
+	if err != nil {
+		t.Fatalf("failed to sign the creation: %v", err)
+	}
+	bloom := CreateBloomWithTxList(Receipts{{TxHash: create.Hash()}}, Transactions{create})
+	if !bloom.Test(from.Bytes()) {
+		t.Fatal("legacy bloom must contain the sender of a creation")
+	}
+	if bloom.Test(to.Bytes()) {
+		t.Fatal("a creation has no recipient and must not mix one in")
+	}
+}

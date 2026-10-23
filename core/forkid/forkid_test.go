@@ -46,7 +46,7 @@ func TestCreation(t *testing.T) {
 		// Mainnet test cases
 		{
 			params.MainnetChainConfig,
-			core.DefaultGenesisBlock().ToBlock(),
+			core.DefaultEthereumGenesisBlock().ToBlock(),
 			[]testcase{
 				{0, 0, ID{Hash: checksumToBytes(0xfc64ec04), Next: 1150000}},                    // Unsynced
 				{1149999, 0, ID{Hash: checksumToBytes(0xfc64ec04), Next: 1150000}},              // Last Frontier block
@@ -319,11 +319,41 @@ func TestValidation(t *testing.T) {
 		// fork) at timestamp 1668000000, before Cancun. Local is incompatible.
 		{params.MainnetChainConfig, 20999999, 1699999999, ID{Hash: checksumToBytes(0x71147644), Next: 1700000000}, ErrLocalIncompatibleOrStale},
 	}
-	genesis := core.DefaultGenesisBlock().ToBlock()
+	genesis := core.DefaultEthereumGenesisBlock().ToBlock()
 	for i, tt := range tests {
 		filter := newFilter(tt.config, genesis, func() (uint64, uint64) { return tt.head, tt.time })
 		if err := filter(tt.id); err != tt.err {
 			t.Errorf("test %d: validation error mismatch: have %v, want %v", i, err, tt.err)
+		}
+	}
+}
+
+// TestPGPForkID pins the EIP-2124 fork identifier of the pgp-chain mainnet.
+//
+// The values are computed the same way pgp-chain's client does: CRC32 over the
+// genesis hash, then over the big-endian fork numbers [1 2 3]. pgp-chain only
+// gathers *big.Int fields named "*Block", and it never had a timestamp based
+// fork, so the checksum must not include ShanghaiTime. If this test breaks, the
+// eth/64 handshake with a pgp peer is rejected with ErrForkIDRejected even
+// though everything else looks fine.
+func TestPGPForkID(t *testing.T) {
+	genesis := core.DefaultPGPGenesisBlock().ToBlock()
+	if have, want := genesis.Hash(), params.PGPGenesisHash; have != want {
+		t.Fatalf("genesis hash mismatch: have %x, want %x", have, want)
+	}
+	cases := []struct {
+		head uint64
+		want ID
+	}{
+		// Unsynced: only the genesis checksum, next fork is block 1.
+		{0, ID{Hash: checksumToBytes(0x2d177b6c), Next: 1}},
+		// Every pgp fork is at block 1, 2 or 3, so past block 3 no fork is due.
+		{3, ID{Hash: checksumToBytes(0x73afe804), Next: 0}},
+		{1_000_000, ID{Hash: checksumToBytes(0x73afe804), Next: 0}},
+	}
+	for _, c := range cases {
+		if have := NewID(params.PGPChainConfig, genesis, c.head, genesis.Time()); have != c.want {
+			t.Errorf("head %d: fork id mismatch: have %v, want %v", c.head, have, c.want)
 		}
 	}
 }

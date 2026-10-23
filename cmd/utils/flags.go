@@ -161,7 +161,8 @@ var (
 	}
 	BSCMainnetFlag = &cli.BoolFlag{
 		Name:     "mainnet",
-		Usage:    "BSC mainnet",
+		Aliases:  []string{"bsc", "pgp"},
+		Usage:    "PGP mainnet",
 		Category: flags.EthCategory,
 	}
 	ChapelFlag = &cli.BoolFlag{
@@ -1805,6 +1806,17 @@ func SetP2PConfig(ctx *cli.Context, cfg *p2p.Config) {
 	if ctx.IsSet(DiscoveryV5Flag.Name) {
 		cfg.DiscoveryV5 = ctx.Bool(DiscoveryV5Flag.Name)
 	}
+	// The pgp-chain mainnet is based on geth v1.9.1 and therefore only speaks
+	// discovery v4: v5 packets sent to its bootnodes are answered with v4 frames
+	// and rejected as "invalid packet header", leaving the node without peers.
+	// Turn v4 on for the PGP preset, but keep v5 running as well — p2p serves
+	// both versions over a single UDP socket (see p2p/server.go sharedUDPConn),
+	// so the node stays a first class v5 participant for everything else and v4
+	// is only what the legacy peers are reached through. An explicit
+	// --discv4 / --discv5 still wins.
+	if ctx.Bool(BSCMainnetFlag.Name) && !ctx.IsSet(DiscoveryV4Flag.Name) {
+		cfg.DiscoveryV4 = true
+	}
 
 	if netrestrict := ctx.String(NetrestrictFlag.Name); netrestrict != "" {
 		list, err := netutil.ParseNetlist(netrestrict)
@@ -2383,10 +2395,15 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	switch {
 	case ctx.Bool(BSCMainnetFlag.Name):
 		if !ctx.IsSet(NetworkIdFlag.Name) {
-			cfg.NetworkId = 56
+			cfg.NetworkId = params.PGPChainConfig.ChainID.Uint64()
 		}
-		cfg.Genesis = core.DefaultBSCGenesisBlock()
-		SetDNSDiscoveryDefaults(cfg, params.BSCGenesisHash)
+		cfg.Genesis = core.DefaultPGPGenesisBlock()
+		// pgp-chain has no DNS discovery tree yet, so this is a no-op until one
+		// is added to params/dnsdisc. It is kept so that the mainnet preset
+		// behaves the same way as the other built-in networks.
+		SetDNSDiscoveryDefaults(cfg, params.PGPGenesisHash)
+		log.Info("Using pgp-chain mainnet preset",
+			"networkid", cfg.NetworkId, "genesis", cfg.Genesis.ToBlock().Hash())
 	case ctx.Bool(ChapelFlag.Name) || cfg.NetworkId == 97:
 		if !ctx.IsSet(NetworkIdFlag.Name) {
 			cfg.NetworkId = 97
@@ -2863,7 +2880,7 @@ func MakeGenesis(ctx *cli.Context) *core.Genesis {
 	var genesis *core.Genesis
 	switch {
 	case ctx.Bool(BSCMainnetFlag.Name):
-		genesis = core.DefaultBSCGenesisBlock()
+		genesis = core.DefaultPGPGenesisBlock()
 	case ctx.Bool(ChapelFlag.Name):
 		genesis = core.DefaultChapelGenesisBlock()
 	case ctx.Bool(DeveloperFlag.Name):

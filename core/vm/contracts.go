@@ -562,6 +562,13 @@ func init() {
 
 func activePrecompiledContracts(rules params.Rules) PrecompiledContracts {
 	switch {
+	// pgp-chain legacy rules come first and unconditionally: their set is
+	// neither an Ethereum fork's nor a BSC fork's, it is the nine Ethereum
+	// precompiles plus the twelve ELA ones (see contracts_pgp.go). Gating this on
+	// IsShanghai would not work -- bsc has no Shanghai precompile set at all --
+	// and gating it on anything else would let a BSC fork case shadow it.
+	case rules.IsPGPLegacy:
+		return pgpLegacyPrecompiledContracts()
 	// UBT (binary-tree devnet experiment) deliberately stays above Jenner:
 	// it already shadows every BSC fork's precompile set (see IsPasteur
 	// below), and Jenner keeps that pre-existing precedence instead of
@@ -625,6 +632,12 @@ func ActivePrecompiledContracts(rules params.Rules) PrecompiledContracts {
 // ActivePrecompiles returns the precompile addresses enabled with the current configuration.
 func ActivePrecompiles(rules params.Rules) []common.Address {
 	switch {
+	// Must stay the first case, for the same reason as in
+	// activePrecompiledContracts above: this slice is the EIP-2929 warm set
+	// handed to state.Prepare, and the twenty-one legacy addresses have to be on
+	// it or every first access is charged 2600 instead of 100.
+	case rules.IsPGPLegacy:
+		return PrecompiledAddressesPGPLegacy
 	case rules.IsJenner:
 		return PrecompiledAddressesJenner
 	case rules.IsPasteur:

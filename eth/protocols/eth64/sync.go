@@ -1,0 +1,437 @@
+// Copyright 2026 The pgp-chain Authors
+// This file is part of the pgp-chain library.
+
+package eth64
+
+import (
+	"errors"
+	"sync/atomic"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus/pgp"
+	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/trie"
+)
+
+const (
+	// maxHeaderFetch is the number of headers pulled per round trip. pgp-chain's
+	// own downloader uses the same value.
+	maxHeaderFetch = 192
+
+	// maxBodyFetch is how many bodies are requested per round trip. It matches
+	// pgp-chain's downloader.MaxBlockFetch (pgp-chain/eth/downloader/downloader.go:42),
+	// which is the second cap on a BlockBodies answer: the server stops at
+	// min(2 MiB, 128 bodies) (pgp-chain/eth/handler.go:549). Asking for exactly
+	// that ceiling keeps the answer a single round trip per batch, and the 2 MiB
+	// cut is handled by the prefix logic in fetchBlocks.
+	maxBodyFetch = 128
+
+	// maxSyncRounds bounds one sync attempt so a hostile peer cannot make the
+	// syncer loop forever.
+	maxSyncRounds = 4096
+)
+
+// chainSyncer pulls the canonical chain from one eth/64 peer at a time.
+//
+// eth/64 has no request ids, so there is exactly one outstanding request at any
+// moment: request, wait for the matching response, then issue the next one.
+type chainSyncer struct {
+	h         *handler
+	triggerCh chan struct{}
+
+	// blocked latches once a block was refused by the chain. A refusal that
+	// makes no progress is a hard boundary (unsupported rule, unsupported
+	// precompile, state root mismatch), so retrying every 10 seconds would only
+	// spam the log with the same failure. Reset clears it.
+	blocked atomic.Bool
+}
+
+// newChainSyncer creates a syncer for the given handler.
+func newChainSyncer(h *handler) *chainSyncer {
+	return &chainSyncer{h: h, triggerCh: make(chan struct{}, 1)}
+}
+
+// trigger asks the syncer to run a round as soon as possible.
+func (s *chainSyncer) trigger() {
+	select {
+	case s.triggerCh <- struct{}{}:
+	default:
+	}
+}
+
+// loop runs sync rounds until the handler is closed.
+func (s *chainSyncer) loop() {
+	ticker := time.NewTicker(syncLoopInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-s.h.closeCh:
+			return
+		case <-s.triggerCh:
+		case <-ticker.C:
+		}
+		// A trigger and a close can become ready together; the select picks one
+		// at random, so re-check before doing any work or writing metrics.
+		if s.closed() {
+			return
+		}
+		if s.blocked.Load() {
+			continue
+		}
+		peer := s.h.peers.BestPeer()
+		if peer == nil {
+			continue
+		}
+		s.syncToHead(peer)
+	}
+}
+
+// syncToHead downloads and imports everything the peer has that we do not.
+func (s *chainSyncer) syncToHead(peer *Peer) {
+	chain := s.h.backend.Chain()
+	localHead := chain.CurrentBlock()
+	if localHead == nil {
+		return
+	}
+	peer.ResetLagging()
+
+	peerHead, _ := peer.Head()
+	if peerHead == localHead.Hash() {
+		return
+	}
+	ancestor, err := s.findAncestor(peer, localHead.Number.Uint64())
+	if err != nil {
+		peer.Log().Debug("Failed to find a common ancestor", "err", err)
+		peer.MarkLagging()
+		return
+	}
+	peer.Log().Info("eth/64 sync starting", "ancestor", ancestor, "localHead", localHead.Number, "peerHead", peerHead)
+
+	origin := ancestor + 1
+	for round := 0; round < maxSyncRounds; round++ {
+		select {
+		case <-s.h.closeCh:
+			return
+		default:
+		}
+		if peer.Lagging() {
+			return
+		}
+		headers, err := s.fetchHeaders(peer, origin)
+		if err != nil {
+			peer.Log().Debug("Header fetch failed", "origin", origin, "err", err)
+			peer.MarkLagging()
+			return
+		}
+		if len(headers) == 0 {
+			return // caught up
+		}
+		// The batch must continue our canonical chain, otherwise re-anchor.
+		parent := chain.GetHeaderByNumber(origin - 1)
+		if parent == nil || headers[0].ParentHash != parent.Hash() {
+			peer.Log().Debug("Header batch does not continue our chain", "origin", origin)
+			peer.MarkLagging()
+			return
+		}
+		for i := 1; i < len(headers); i++ {
+			if headers[i].Number.Uint64() != headers[i-1].Number.Uint64()+1 ||
+				headers[i].ParentHash != headers[i-1].Hash() {
+				peer.Log().Debug("Header batch is not contiguous", "index", i)
+				peer.MarkLagging()
+				return
+			}
+		}
+
+		// A body response may be cut short at the peer's 2 MiB ceiling. Import the
+		// served prefix and drain the rest of the batch here rather than going
+		// back to the outer loop: returning would discard 143 fetched headers and
+		// burn a round for every 49 blocks, which is what made the round budget
+		// the real limit on sync progress.
+		batch := headers
+		var lastImported *types.Header
+		aborted := false
+		for len(batch) > 0 {
+			// Each iteration is a full body round trip, so this loop can outlive
+			// a shutdown. Bail out before touching the chain or the meters.
+			if s.closed() {
+				return
+			}
+			blocks, complete, err := s.fetchBlocks(peer, batch)
+			if err != nil {
+				peer.Log().Debug("Body fetch failed", "count", len(batch), "err", err)
+				peer.MarkLagging()
+				return
+			}
+			if len(blocks) == 0 {
+				peer.Log().Debug("Peer served no body at all", "requested", len(batch))
+				peer.MarkLagging()
+				return
+			}
+			if !complete {
+				peer.Log().Debug("Body response truncated, importing the served prefix",
+					"requested", len(batch), "served", len(blocks), "next", batch[len(blocks)].Number)
+			}
+
+			if !canExecuteBatch(chain.Config(), blocks) {
+				// The legacy execution rules are not aligned, so the state root is
+				// bound to mismatch. Stop here instead of letting InsertChain fail:
+				// core records every block it fails to import in the on-disk bad
+				// block list (core/blockchain.go reportBadBlock ->
+				// rawdb.WriteBadBlock), and that list only keeps the ten most recent
+				// entries, which would destroy the evidence of where it started.
+				s.stopAtBoundary(peer, origin, blocks[0].Header(), errLegacyExecutionNotAligned)
+				return
+			}
+
+			inserted, err := chain.InsertChain(blocks)
+			if err != nil {
+				if inserted == 0 {
+					// Hard boundary: the chain refused the very first block of the
+					// batch and nothing was imported. Retrying the same block every
+					// round would only repeat the failure, so latch it.
+					s.stopAtBoundary(peer, origin, blocks[0].Header(), err)
+					return
+				}
+				// Blocks before the failure are in the chain, continue from there,
+				// but re-anchor from the outer loop: nothing after the refused
+				// block can be imported either.
+				peer.Log().Debug("Block import failed", "imported", inserted, "err", err)
+				importedMeter.Mark(int64(inserted))
+				origin += uint64(inserted)
+				lastImported = blocks[inserted-1].Header()
+				peer.SetHead(lastImported.Hash(), peer.TD())
+				aborted = true
+				break
+			}
+			importedMeter.Mark(int64(len(blocks)))
+			origin += uint64(len(blocks))
+			lastImported = blocks[len(blocks)-1].Header()
+			peer.SetHead(lastImported.Hash(), peer.TD())
+			batch = batch[len(blocks):]
+			if complete {
+				break
+			}
+		}
+		if aborted {
+			continue
+		}
+		if len(headers) < maxHeaderFetch {
+			peer.Log().Info("eth/64 sync caught up with peer", "head", lastImported.Number, "hash", lastImported.Hash())
+			return
+		}
+	}
+	peer.Log().Warn("eth/64 sync round limit reached", "rounds", maxSyncRounds)
+}
+
+// errLegacyExecutionNotAligned is reported when consensus/pgp signals that the
+// legacy execution rules are not aligned, so no block could be imported.
+var errLegacyExecutionNotAligned = errors.New("eth64: legacy execution rules are not aligned")
+
+// canExecuteBatch reports whether the batch may be handed to InsertChain.
+//
+// It is a property of the client, not of the batch: when
+// consensus/pgp.LegacyExecutionReady reports that a legacy rule is not aligned,
+// every legacy block would fail with a state root mismatch. Blocks at or after
+// the legacy fork are executed by the Parlia engine and are unaffected, hence
+// the per-height check.
+func canExecuteBatch(cfg *params.ChainConfig, blocks []*types.Block) bool {
+	if cfg == nil || cfg.Legacy == nil || pgp.LegacyExecutionReady() {
+		return true
+	}
+	for _, block := range blocks {
+		if cfg.IsPGPLegacy(block.Number()) {
+			return false
+		}
+	}
+	return true
+}
+
+// stopAtBoundary reports that the chain refused a block without importing
+// anything, and latches the syncer so the same failure is not repeated every
+// round.
+//
+// Two cases must NOT latch, because neither is a verdict on the block:
+//
+//   - the node is shutting down (core.IsChainStopped). InsertChain reports
+//     "blockchain is stopped" whenever a batch happens to be in flight when
+//     Close runs, and latching on that parks the syncer for the rest of the
+//     process life;
+//   - the handler is already closed, in which case writing metrics afterwards is
+//     just noise in the shutdown path.
+//
+// Both are logged at DEBUG: an operator watching a restart must not see a chain
+// boundary that never happened, and boundary-stops must stay a real signal.
+func (s *chainSyncer) stopAtBoundary(peer *Peer, origin uint64, refused *types.Header, err error) {
+	if core.IsChainStopped(err) {
+		peer.Log().Debug("eth/64 sync stopped: the chain is shutting down, not refusing the block",
+			"origin", origin, "block", refused.Number, "err", err)
+		return
+	}
+	if s.closed() {
+		peer.Log().Debug("eth/64 sync stopped: handler already closed",
+			"origin", origin, "block", refused.Number, "err", err)
+		return
+	}
+	boundaryStopMeter.Mark(1)
+	peer.Log().Warn("eth/64 download stopped: the chain refused this block and nothing was imported",
+		"origin", origin, "block", refused.Number, "hash", refused.Hash(), "err", err)
+	s.blocked.Store(true)
+}
+
+// closed reports whether the handler has been closed. Non-blocking: the sync
+// loop calls it between downloads, not to wait for shutdown.
+func (s *chainSyncer) closed() bool {
+	select {
+	case <-s.h.closeCh:
+		return true
+	default:
+		return false
+	}
+}
+
+// Reset clears the hard-boundary latch and schedules a new sync round.
+//
+// It is the intended entry point for anything that changes the client's ability
+// to execute legacy blocks at runtime (a new execution rule, a config change, a
+// restart of the ELA dependency): without a reset the syncer stays parked on the
+// first block it could not import, by design.
+func (s *chainSyncer) Reset() {
+	s.blocked.Store(false)
+	s.trigger()
+}
+
+// fetchHeaders requests amount headers starting at origin and waits for them.
+func (s *chainSyncer) fetchHeaders(peer *Peer, origin uint64) ([]*types.Header, error) {
+	headerReqMeter.Mark(1)
+	if err := peer.RequestHeadersByNumber(origin, maxHeaderFetch, 0, false); err != nil {
+		return nil, err
+	}
+	return peer.WaitHeaders(responseTimeout)
+}
+
+// fetchBlocks resolves the bodies of the given headers and assembles full blocks.
+//
+// The response is NOT guaranteed to have one entry per requested hash: pgp-chain's
+// answerGetBlockBodies stops at a 2 MiB soft limit and silently skips bodies it
+// does not have (pgp-chain/eth/handler.go:549-562). Bodies therefore have to be
+// matched back to headers by content: the transaction root and the uncle hash of
+// the body identify its header unambiguously.
+//
+// A truncated answer is not an error. The returned blocks are the contiguous
+// prefix the peer did serve and complete reports whether the whole request was
+// satisfied. Callers import the prefix and re-request the remainder: treating
+// truncation as a failure parks the sync on the same chunk forever, because the
+// next round starts from the same ancestor and gets cut at the same byte.
+func (s *chainSyncer) fetchBlocks(peer *Peer, headers []*types.Header) ([]*types.Block, bool, error) {
+	blocks := make([]*types.Block, 0, len(headers))
+
+	for start := 0; start < len(headers); start += maxBodyFetch {
+		end := min(start+maxBodyFetch, len(headers))
+		chunk := headers[start:end]
+
+		hashes := make([]common.Hash, len(chunk))
+		for i, header := range chunk {
+			hashes[i] = header.Hash()
+		}
+		bodyReqMeter.Mark(1)
+		if err := peer.RequestBodies(hashes); err != nil {
+			return nil, false, err
+		}
+		bodies, err := peer.WaitBodies(responseTimeout)
+		if err != nil {
+			return nil, false, err
+		}
+		// Index the (possibly partial) answer by its content.
+		index := make(map[bodyKey]*types.Body, len(bodies))
+		for _, body := range bodies {
+			if body == nil {
+				continue
+			}
+			key := bodyKey{
+				txRoot:    types.DeriveSha(types.Transactions(body.Transactions), trie.NewStackTrie(nil)),
+				uncleHash: types.CalcUncleHash(body.Uncles),
+			}
+			if _, exists := index[key]; !exists {
+				index[key] = body
+			}
+		}
+		for _, header := range chunk {
+			body, ok := index[bodyKey{txRoot: header.TxHash, uncleHash: header.UncleHash}]
+			if !ok {
+				// Everything before this header is a valid chain segment: the
+				// loop walks the chunk in order, so a gap here cannot be
+				// followed by a served body without breaking contiguity.
+				bodyTruncatedMeter.Mark(1)
+				peer.Log().Debug("Body response truncated at peer soft limit",
+					"block", header.Number, "served", len(blocks), "requested", len(headers))
+				return blocks, false, nil
+			}
+			blocks = append(blocks, types.NewBlockWithHeader(header).WithBody(types.Body{
+				Transactions: body.Transactions,
+				Uncles:       body.Uncles,
+			}))
+		}
+	}
+	return blocks, true, nil
+}
+
+// bodyKey identifies a block body by the two commitments its header carries.
+type bodyKey struct {
+	txRoot    common.Hash
+	uncleHash common.Hash
+}
+
+// findAncestor binary searches for the highest block number where our header and
+// the peer's header are identical.
+func (s *chainSyncer) findAncestor(peer *Peer, localHeight uint64) (uint64, error) {
+	chain := s.h.backend.Chain()
+
+	matches := func(number uint64) (bool, error) {
+		local := chain.GetHeaderByNumber(number)
+		if local == nil {
+			return false, nil
+		}
+		headerReqMeter.Mark(1)
+		if err := peer.RequestHeadersByNumber(number, 1, 0, false); err != nil {
+			return false, err
+		}
+		headers, err := peer.WaitHeaders(responseTimeout)
+		if err != nil {
+			return false, err
+		}
+		if len(headers) == 0 {
+			return false, nil
+		}
+		return headers[0].Hash() == local.Hash(), nil
+	}
+
+	// Fast path: the peer is often just barely ahead of us.
+	if ok, err := matches(localHeight); err == nil && ok {
+		ancestorHitMeter.Mark(1)
+		return localHeight, nil
+	} else if err != nil {
+		return 0, err
+	}
+	ancestorMissMeter.Mark(1)
+
+	// Genesis is always shared, otherwise the handshake would have rejected the
+	// peer on the genesis hash.
+	low, high := uint64(0), localHeight
+	for low+1 < high {
+		mid := low + (high-low)/2
+		ok, err := matches(mid)
+		if err != nil {
+			return 0, err
+		}
+		if ok {
+			low = mid
+		} else {
+			high = mid
+		}
+	}
+	return low, nil
+}

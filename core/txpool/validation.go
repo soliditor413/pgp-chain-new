@@ -125,8 +125,12 @@ func ValidateTransaction(tx *types.Transaction, head *types.Header, signer types
 		return core.ErrNonceMax
 	}
 	// Ensure the transaction has more gas than the bare minimum needed to cover
-	// the transaction metadata
-	intrGas, err := core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), tx.To() == nil, true, rules.IsIstanbul, rules.IsShanghai, rules.IsAmsterdam)
+	// the transaction metadata.
+	//
+	// The EIP-3860 word gas is gated on IsPGPLegacy for the same reason as in
+	// core/state_transition.go: the legacy pgp-chain rules never charged it, so
+	// the pool must not reject a transaction the consensus layer would accept.
+	intrGas, err := core.IntrinsicGas(tx.Data(), tx.AccessList(), tx.SetCodeAuthorizations(), tx.To() == nil, true, rules.IsIstanbul, rules.IsShanghai && !rules.IsPGPLegacy, rules.IsAmsterdam)
 	if err != nil {
 		return err
 	}

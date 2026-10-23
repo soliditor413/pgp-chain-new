@@ -21,6 +21,7 @@ import (
 	"fmt"
 	"math/big"
 
+	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/bitutil"
 	"github.com/ethereum/go-ethereum/common/hexutil"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -118,6 +119,70 @@ func CreateBloom(receipt *Receipt) Bloom {
 		}
 	}
 	return bin
+}
+
+// CreateBloomWithTxList creates the bloom filter the pgp-chain clients produce:
+// the logs of every receipt plus the sender and the recipient of every
+// transaction (pgp-chain/core/types/bloom9.go:104-134).
+//
+// This is consensus critical for the legacy pgp history in two places, because
+// the per-receipt bloom also travels inside the receipts trie:
+//   - header.Bloom
+//   - header.ReceiptHash
+//
+// The signer matches pgp-chain: unprotected transactions are recovered with the
+// Frontier signer, protected ones with EIP-155. A recipient of nil (contract
+// creation) contributes only the sender.
+func CreateBloomWithTxList(receipts Receipts, txs Transactions) Bloom {
+	var (
+		bin Bloom
+		buf [6]byte
+
+		signer        Signer = FrontierSigner{}
+		signerChainID *big.Int
+		haveEIP155    bool
+	)
+	byHash := make(map[common.Hash]*Transaction, len(txs))
+	for _, tx := range txs {
+		if tx != nil {
+			byHash[tx.Hash()] = tx
+		}
+	}
+	for _, receipt := range receipts {
+		for _, log := range receipt.Logs {
+			bin.AddWithBuffer(log.Address.Bytes(), &buf)
+			for _, b := range log.Topics {
+				bin.AddWithBuffer(b[:], &buf)
+			}
+		}
+		tx := byHash[receipt.TxHash]
+		if tx == nil {
+			continue
+		}
+		if tx.Protected() {
+			if !haveEIP155 || signerChainID.Cmp(tx.ChainId()) != 0 {
+				signerChainID = tx.ChainId()
+				signer = NewEIP155Signer(signerChainID)
+				haveEIP155 = true
+			}
+		} else {
+			signer = FrontierSigner{}
+		}
+		// pgp-chain ignores the recovery error and hashes the zero address in
+		// that case; keep the same behaviour so a malformed signature cannot
+		// change the bloom relative to the reference client.
+		from, _ := Sender(signer, tx)
+		bin.AddWithBuffer(from.Bytes(), &buf)
+		if to := tx.To(); to != nil {
+			bin.AddWithBuffer(to.Bytes(), &buf)
+		}
+	}
+	return bin
+}
+
+// CreateBloomWithTx creates the legacy bloom of a single receipt.
+func CreateBloomWithTx(receipt *Receipt, tx *Transaction) Bloom {
+	return CreateBloomWithTxList(Receipts{receipt}, Transactions{tx})
 }
 
 // MergeBloom merges the precomputed bloom filters in the Receipts without

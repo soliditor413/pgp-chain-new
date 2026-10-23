@@ -64,7 +64,34 @@ var (
 	pragueInstructionSet           = newPragueInstructionSet()
 	osakaInstructionSet            = newOsakaInstructionSet()
 	amsterdamInstructionSet        = newAmsterdamInstructionSet()
+
+	// legacyInstructionSet is the instruction set of the pgp-chain legacy
+	// history (see params.ChainConfig.IsPGPLegacy). pgp-chain builds its
+	// Shanghai table on top of the merge table (pgp-chain
+	// core/vm/jump_table.go:71-75), so 0x44 is PREVRANDAO/opRandom there, while
+	// this tree builds Shanghai on top of London, where 0x44 is DIFFICULTY and
+	// reads Context.Difficulty. Legacy blocks carry difficulty 2, so any
+	// contract reading 0x44 would see 2 instead of pgp-chain's 0 and the state
+	// root would diverge. Everything else is identical, hence a copy of the
+	// Shanghai table with that single slot replaced.
+	legacyInstructionSet = newLegacyInstructionSet()
 )
+
+// newLegacyInstructionSet derives the instruction set of the pgp-chain legacy
+// blocks from the Shanghai table.
+//
+// The table is copied: the package level shanghaiInstructionSet is shared by
+// every chain, so patching it in place would corrupt BSC and Ethereum.
+func newLegacyInstructionSet() JumpTable {
+	instructionSet := *copyJumpTable(&shanghaiInstructionSet)
+	instructionSet[PREVRANDAO] = &operation{
+		execute:     opDifficultyLegacy,
+		constantGas: GasQuickStep,
+		minStack:    minStack(0, 1),
+		maxStack:    maxStack(0, 1),
+	}
+	return validate(instructionSet)
+}
 
 // JumpTable contains the EVM opcodes supported at a given fork.
 type JumpTable [256]*operation

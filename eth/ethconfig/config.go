@@ -27,6 +27,8 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/clique"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/consensus/parlia"
+	"github.com/ethereum/go-ethereum/consensus/pgp"
+	"github.com/ethereum/go-ethereum/consensus/router"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/txpool/blobpool"
@@ -283,6 +285,19 @@ type Config struct {
 // Clique is allowed for now to live standalone, but ethash is forbidden and can
 // only exist on already merged networks.
 func CreateConsensusEngine(config *params.ChainConfig, db ethdb.Database, ee *ethapi.BlockChainAPI, genesisHash common.Hash) (consensus.Engine, error) {
+	// Chains that carry the pgp-chain legacy history are handled by the height
+	// router: the legacy PBFT/DPoS engine validates the blocks up to
+	// Legacy.ForkHeight, Parlia takes over from there (if it is configured).
+	if config.Legacy != nil {
+		legacy := pgp.New(config.Legacy)
+		var posa consensus.PoSA
+		if config.Parlia != nil {
+			posa = parlia.New(config, db, ee, genesisHash)
+		}
+		log.Info("Created pgp-chain height router",
+			"forkHeight", config.Legacy.ForkHeight, "parlia", posa != nil)
+		return router.New(legacy, posa, config.Legacy.ForkHeight), nil
+	}
 	if config.IsInBSC() {
 		return parlia.New(config, db, ee, genesisHash), nil
 	}

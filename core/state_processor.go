@@ -315,6 +315,14 @@ func MakeReceipt(evm *vm.EVM, result *ExecutionResult, statedb *state.StateDB, b
 	receipt.BlockHash = blockHash
 	receipt.BlockNumber = blockNumber
 	receipt.TransactionIndex = uint(statedb.TxIndex())
+	// The legacy pgp-chain bloom mixes the sender and the recipient into the
+	// per-receipt bloom (pgp-chain/core/state_processor.go:155), which is why it
+	// has to be built here, where the transaction is at hand. Setting it before
+	// the processors run also stops the async generator below from replacing it:
+	// the legacy bloom is never empty, because it always contains the sender.
+	if evm.ChainConfig().IsPGPLegacy(blockNumber) {
+		receipt.Bloom = types.CreateBloomWithTx(receipt, tx)
+	}
 	for _, receiptProcessor := range receiptProcessors {
 		receiptProcessor.Apply(receipt)
 	}

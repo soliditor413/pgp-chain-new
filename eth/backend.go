@@ -883,6 +883,9 @@ func (s *Ethereum) Protocols() []p2p.Protocol {
 		protos = append(protos, snap.MakeProtocols((*snapHandler)(s.handler))...)
 	}
 	protos = append(protos, bsc.MakeProtocols((*bscHandler)(s.handler))...)
+	// The pgp-chain legacy history is only reachable over eth/64. The protocol is
+	// registered for legacy chains only, so BSC/Chapel peers are unaffected.
+	protos = append(protos, s.makeETH64Protocols()...)
 
 	return protos
 }

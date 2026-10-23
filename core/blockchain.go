@@ -150,6 +150,30 @@ var (
 	errInvalidNewChain      = errors.New("invalid new chain")
 )
 
+// Exported forms of the two "the node is going away" sentinels, for callers
+// outside this package.
+//
+// They exist because the two meanings of a failed InsertChain are opposite and
+// must never be conflated: errChainStopped / errInsertionInterrupted say "this
+// node is shutting down, the block was never judged", while every other error
+// says "this block is invalid". A caller that treats the first as the second
+// permanently condemns an innocent block - that is exactly what happened to the
+// eth/64 syncer, which latched its "hard boundary" state on shutdown and then
+// refused to sync again until an explicit Reset.
+var (
+	ErrChainStopped         = errChainStopped
+	ErrInsertionInterrupted = errInsertionInterrupted
+)
+
+// IsChainStopped reports whether err means the local node is shutting down
+// rather than the block or chain being invalid.
+//
+// Callers that record, latch, meter or escalate a failed insert MUST check this
+// first: shutdown is not a verdict on the data.
+func IsChainStopped(err error) bool {
+	return errors.Is(err, errChainStopped) || errors.Is(err, errInsertionInterrupted)
+}
+
 var (
 	forkReadyInterval = 3 * time.Minute
 )

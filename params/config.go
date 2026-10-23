@@ -610,6 +610,8 @@ func GetBuiltInChainConfig(ghash common.Hash) *ChainConfig {
 		return ChapelChainConfig
 	case RialtoGenesisHash:
 		return RialtoChainConfig
+	case PGPGenesisHash:
+		return PGPChainConfig
 	default:
 		return nil
 	}
@@ -675,6 +677,7 @@ var NetworkNames = map[string]string{
 	BSCChainConfig.ChainID.String():     "bsc",
 	ChapelChainConfig.ChainID.String():  "chapel",
 	RialtoChainConfig.ChainID.String():  "rialto",
+	PGPChainConfig.ChainID.String():     "pgp",
 }
 
 // ChainConfig is the core config which determines the blockchain settings.
@@ -776,6 +779,11 @@ type ChainConfig struct {
 	Clique             *CliqueConfig       `json:"clique,omitempty"`
 	Parlia             *ParliaConfig       `json:"parlia,omitempty"`
 	BlobScheduleConfig *BlobScheduleConfig `json:"blobSchedule,omitempty"`
+
+	// Legacy holds the pgp-chain history parameters (pre-Parlia rules). It is
+	// only set for chains that have to replay the pgp-chain history and must not
+	// be named with a Block/Time suffix, see LegacyConfig for the reason.
+	Legacy *LegacyConfig `json:"legacy,omitempty"`
 }
 
 // EthashConfig is the consensus engine configs for proof-of-work based sealing.
@@ -2169,6 +2177,11 @@ type Rules struct {
 	// select the BSC precompile set (…ForBSC); non-BSC chains (e.g. the standard
 	// state / execution-spec tests) get the standard upstream set.
 	IsInBSC bool
+
+	// IsPGPLegacy is true when the pgp-chain legacy (pre-Parlia) rules apply,
+	// i.e. the block is below LegacyConfig.ForkHeight on a chain that configures
+	// Legacy. See ChainConfig.Rules for the rule differences.
+	IsPGPLegacy bool
 }
 
 // Rules ensures c's ChainID is not nil.
@@ -2176,7 +2189,7 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 	// disallow setting Merge out of order
 	isMerge = isMerge && c.IsLondon(num) // always false in BSC
 	isUBT := isMerge && c.IsUBT(num, timestamp)
-	return Rules{
+	rules := Rules{
 		IsHomestead:      c.IsHomestead(num),
 		IsEIP150:         c.IsEIP150(num),
 		IsEIP155:         c.IsEIP155(num),
@@ -2219,4 +2232,23 @@ func (c *ChainConfig) Rules(num *big.Int, isMerge bool, timestamp uint64) Rules 
 		IsEIP4762: isUBT,
 		IsInBSC:   c.IsInBSC(),
 	}
+	// The pgp-chain legacy history needs two corrections that the BSC gates above
+	// get wrong. Both matter from block 1, because the pgp genesis timestamp is
+	// already past ShanghaiTime:
+	//
+	//  1. Shanghai is enabled. BSC gates it behind (isMerge || IsInBSC()), and
+	//     pgp-chain is neither: Parlia is not configured yet and no block is a
+	//     merge block. pgp-chain's own IsShanghai only compares the timestamp
+	//     (pgp-chain params/config.go:627), so without this the legacy history
+	//     would run the London instruction set and any PUSH0 in a historical
+	//     contract would hit opUndefined.
+	//  2. The London gate must be bypassed. ChainConfig.IsShanghai also requires
+	//     IsLondon(num), but pgp's LondonBlock is 3 while Shanghai is already
+	//     active at genesis, so blocks 1 and 2 would still be wrong if the method
+	//     were used as-is.
+	if c.IsPGPLegacy(num) {
+		rules.IsPGPLegacy = true
+		rules.IsShanghai = isTimestampForked(c.ShanghaiTime, timestamp)
+	}
+	return rules
 }

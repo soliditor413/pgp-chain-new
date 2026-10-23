@@ -96,6 +96,12 @@ var (
 	// current network configuration.
 	ErrTxTypeNotSupported = types.ErrTxTypeNotSupported
 
+	// errLegacyTxAlreadyCompleted is returned for a legacy ELA Minter Recharge
+	// whose ELA transaction is already settled. pgp-chain calls it
+	// ErrMainTxHashCompleted (pgp-chain/core/errors.go) and also treats it as a
+	// block level failure.
+	errLegacyTxAlreadyCompleted = errors.New("pgp: main chain transaction already completed")
+
 	// ErrTipAboveFeeCap is a sanity error to ensure no one is able to specify a
 	// transaction with a tip higher than the total fee cap.
 	ErrTipAboveFeeCap = errors.New("max priority fee per gas higher than max fee per gas")

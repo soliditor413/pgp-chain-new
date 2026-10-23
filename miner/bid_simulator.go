@@ -567,7 +567,13 @@ func (b *bidSimulator) getBlockInterval(parentHeader *types.Header) uint64 {
 	if parentHeader == nil {
 		return 450 // fermiBlockInterval
 	}
-	parlia, _ := b.engine.(*parlia.Parlia)
+	parlia, ok := b.engine.(*parlia.Parlia)
+	if !ok {
+		// Only the Parlia engine keeps a block interval schedule. Chains that
+		// route consensus elsewhere (e.g. the pgp-chain legacy history) get the
+		// same fallback as a missing parent header instead of a nil dereference.
+		return 450 // fermiBlockInterval
+	}
 	// only `Number` and `ParentHash` are used when `BlockInterval`
 	tmpHeader := &types.Header{ParentHash: parentHeader.Hash(), Number: new(big.Int).Add(parentHeader.Number, common.Big1)}
 	blockInterval, err := parlia.BlockInterval(b.chain, tmpHeader)

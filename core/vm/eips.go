@@ -219,6 +219,14 @@ func opTstore(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
 
 // opBaseFee implements BASEFEE opcode
 func opBaseFee(pc *uint64, evm *EVM, scope *ScopeContext) ([]byte, error) {
+	// A legacy pgp-chain header carries no baseFee field at all, and synthetic
+	// contexts (RPC simulation, tests) may leave it nil. pgp-chain pushes zero
+	// in that case (pgp-chain/core/vm/eips.go:214-222, enable3198), whereas
+	// uint256.SetFromBig(nil) would dereference a nil big.Int here.
+	if evm.Context.BaseFee == nil {
+		scope.Stack.get().Clear()
+		return nil, nil
+	}
 	scope.Stack.get().SetFromBig(evm.Context.BaseFee)
 	return nil, nil
 }
