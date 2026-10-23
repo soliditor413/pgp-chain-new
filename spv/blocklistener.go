@@ -15,6 +15,10 @@ import (
 	"github.com/ethereum/go-ethereum/log"
 )
 
+// elaProgressInterval is how often NotifyBlock reports that the ELA main chain is
+// still advancing. See the log line for why it exists at all.
+const elaProgressInterval = 10000
+
 type auxParam struct {
 	block  *util.Block
 	height uint32
@@ -67,6 +71,13 @@ func (l *BlockListener) NotifyBlock(block *util.Block, isCurrent bool) {
 				log.Error("failed to index ELA block into the recharge store; "+
 					"any BSC block anchored on this ELA height will fail with ErrRechargeHeightNotCovered",
 					"elaHeight", block.Height, "err", err)
+			} else if block.Height%elaProgressInterval == 0 {
+				// The ELA sub-package logs are attached at Warn, so without this a
+				// node syncing 2.3M main chain blocks reports nothing between
+				// start-up and the first reorg or error. One line every 10k blocks
+				// is ~230 lines for a full sync and is the only way to tell "still
+				// syncing" from "stuck" from the log alone.
+				log.Info("ELA main chain sync progress", "elaHeight", block.Height, "current", isCurrent)
 			}
 		}
 	}

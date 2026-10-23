@@ -379,6 +379,11 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, isCon
 	// Start up the node itself
 	utils.StartNode(ctx, stack, isConsole)
 
+	// Start the ELA main chain SPV service. It has to be up before any legacy
+	// block is executed, because every ELA read on the execution path (the 0x3f1
+	// recharge precompile today) answers from what this service has synced.
+	startSpv(stack, backend)
+
 	// Unlock any account specifically requested
 	unlockAccounts(ctx, stack)
 

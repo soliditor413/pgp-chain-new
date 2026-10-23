@@ -258,6 +258,12 @@ func constructDevModeBanner(ctx *cli.Context, cfg gethConfig) string {
 // makeFullNode loads geth configuration and creates the Ethereum backend.
 func makeFullNode(ctx *cli.Context) (*node.Node, ethapi.Backend) {
 	stack, cfg := makeConfigNode(ctx)
+
+	// Register the ELA SPV shutdown hook before the node starts: RegisterLifecycle
+	// panics once it is running, and startSpv (which creates the service) runs
+	// only after that. The holder is a no-op until then.
+	stack.RegisterLifecycle(spvHolder)
+
 	if ctx.IsSet(utils.RialtoHash.Name) {
 		v := ctx.String(utils.RialtoHash.Name)
 		params.RialtoGenesisHash = common.HexToHash(v)

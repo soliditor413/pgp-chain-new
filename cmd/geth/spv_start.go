@@ -1,0 +1,128 @@
+package main
+
+import (
+	"math"
+	"path/filepath"
+	"sync"
+
+	elalog "github.com/elastos/Elastos.ELA/utils/elalog"
+
+	"github.com/ethereum/go-ethereum/cmd/utils"
+	"github.com/ethereum/go-ethereum/event"
+	"github.com/ethereum/go-ethereum/internal/ethapi"
+	"github.com/ethereum/go-ethereum/log"
+	"github.com/ethereum/go-ethereum/node"
+	"github.com/ethereum/go-ethereum/spv"
+)
+
+// spvServiceHolder carries the running ELA SPV service across the two places
+// that need it: the node lifecycle, which has to be registered in makeFullNode
+// because RegisterLifecycle panics ("can't register lifecycle on running/stopped
+// node") once the node is up, and startSpv, which creates the service after the
+// node is up.
+//
+// A package level holder is acceptable here for the same reason the client
+// identifier is: geth runs one node per process, and the SPV service is a
+// singleton of that node.
+var spvHolder = new(spvServiceHolder)
+
+type spvServiceHolder struct {
+	mu  sync.Mutex
+	svc *spv.Service
+}
+
+// Start is a no-op: startSpv starts the service itself, because it has to be
+// syncing before the first legacy block is executed and startNode may return
+// before the lifecycle start reaches us.
+func (h *spvServiceHolder) Start() error { return nil }
+
+// Stop is the part that matters. The SPV service owns two leveldb stores — the
+// ELA headers and the recharge index — and leaving them to the OS means an
+// unclean header store and a half-written coverage marker on every restart.
+func (h *spvServiceHolder) Stop() error {
+	h.mu.Lock()
+	svc := h.svc
+	h.svc = nil
+	h.mu.Unlock()
+
+	if svc != nil {
+		svc.Stop()
+		spv.Close()
+	}
+	return nil
+}
+
+func (h *spvServiceHolder) set(svc *spv.Service) {
+	h.mu.Lock()
+	h.svc = svc
+	h.mu.Unlock()
+}
+
+// startSpv starts the ELA main chain SPV service, which is where every piece of
+// ELA data used during execution comes from.
+//
+// It is the port of pgp-chain's startSpv (cmd/pgp/main.go:398-507). What it does:
+//
+//   - derives the ELA main chain address that this chain's deposits are paid to,
+//     from the genesis block hash. That single address is the whole filter: with
+//     FilterType = FTReturnSidechainDepositCoinFilter the ELA peers then send us
+//     the blocks' cross chain outputs paying it, i.e. exactly the deposits that
+//     back the 0x3f1 getMainChainRechargeData precompile, rather than the main
+//     chain's entire transaction set. Get it wrong and the filter matches
+//     nothing, so every deposit block fails with ErrRechargeUnavailable.
+//   - opens the recharge store (SpvDbInit), which also installs the real 0x3f1
+//     precompile in place of the always-failing stub.
+//   - starts the service, which connects to the ELA mainnet seeds, syncs headers
+//     from ELA height 0 and indexes every block into the recharge store through
+//     BlockListener.NotifyBlock. Nothing here trusts a peer's claim about a
+//     transaction: the transactions arrive as merkle proofs against headers this
+//     node synced itself, which is why there is no RPC fallback on this path.
+//
+// Only a pgp-chain has an ELA side to follow, so a node running any other chain
+// config skips this entirely.
+func startSpv(stack *node.Node, backend ethapi.Backend) {
+	bc := backend.Chain()
+	if bc == nil || !bc.Config().IsPGPLegacy(nil) {
+		return
+	}
+
+	genesis := bc.Genesis()
+	if genesis == nil {
+		utils.Fatalf("Cannot start the ELA SPV service: the chain has no genesis block")
+	}
+	depositAddress, err := spv.CalculateGenesisAddress(genesis.Hash().String())
+	if err != nil {
+		utils.Fatalf("Cannot derive the ELA deposit address from genesis %s: %v", genesis.Hash(), err)
+	}
+
+	// The ELA stores live next to the chain data so --datadir and the network
+	// subdirectory apply to them too.
+	dir := filepath.Join(stack.InstanceDir(), "spv")
+	log.Info("Starting the ELA SPV service",
+		"dataDir", dir, "genesis", genesis.Hash(), "elaDepositAddress", depositAddress)
+
+	// The ELA sub-packages log nothing until a logger is attached, and attaching
+	// at Info would emit one line per main chain block; see spv.AttachElaLogs.
+	spv.AttachElaLogs(elalog.LevelWarn)
+
+	spv.SpvDbInit(dir, "", [20]byte{}, nil)
+
+	// dynamicArbiterHeight is the ELA height from which the listener starts
+	// maintaining the next-turn DPOS arbiter set. That bookkeeping feeds the ELA
+	// dpos p2p / broadcast layer, which is a write path for a chain we only read
+	// and is not ported, so it is disabled by passing a height nothing reaches.
+	//
+	// This does NOT disable the arbiters precompile at 0x3e8: that path calls
+	// SpvService.GetArbiters(height) directly and reads the arbiters database the
+	// sync manager fills in, so it keeps working.
+	svc, err := spv.NewService(&spv.Config{
+		DataDir:        dir,
+		GenesisAddress: depositAddress,
+	}, new(event.TypeMux), math.MaxUint64)
+	if err != nil {
+		utils.Fatalf("SPV service init error: %v", err)
+	}
+
+	spvHolder.set(svc)
+	svc.Start()
+}
