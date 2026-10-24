@@ -21,6 +21,18 @@ import (
 // still advancing. See the log line for why it exists at all.
 const elaProgressInterval = 10000
 
+// testHookBeforeAuxBlockStore is called inside NotifyBlock's critical section,
+// between advancing blockNumber and recording the aux block. It is nil in
+// production.
+//
+// It exists because the torn (height, aux block) pair it guards against is only
+// reachable from a window two field writes wide, which the race detector finds
+// but a plain `go test ./spv/` does not: with the mutex removed,
+// TestNotifyBlockSerialisesHeightAndAuxBlock passes 30 runs out of 30 without
+// -race. Parking a writer inside the window instead makes the window observable
+// with the ordinary test runner, so the suite protects the mutex on its own.
+var testHookBeforeAuxBlockStore func()
+
 type auxParam struct {
 	block  *util.Block
 	height uint32
@@ -150,6 +162,9 @@ func (l *BlockListener) NotifyBlock(block *util.Block, isCurrent bool) {
 		advanced := block.Height > l.blockNumber
 		if advanced {
 			l.blockNumber = block.Height
+			if hook := testHookBeforeAuxBlockStore; hook != nil {
+				hook()
+			}
 			l.storeAuxBlockLocked(block)
 		}
 		height, aux := l.blockNumber, l.param.block
@@ -172,10 +187,21 @@ func (l *BlockListener) NotifyBlock(block *util.Block, isCurrent bool) {
 			return
 		}
 
-		// onBlockHandled is deliberately called after the unlock. It re-enters
-		// this listener (BlockHeight via InitNextTurnDposInfo) and does
-		// network-facing work, so holding l.mu across it would both deadlock
-		// and stall the SPV notification goroutine.
+		// onBlockHandled is deliberately called after the unlock, and it has to
+		// be the whole callback rather than a lock-free BlockHeight inside it:
+		// onBlockHandled re-enters this listener along three paths, every one of
+		// which would self-deadlock on the non-reentrant mutex.
+		//   1. InitNextTurnDposInfo -> BlockHeight()
+		//      (blocklistener.go, the guard before GetNextArbiters)
+		//   2. SpvIsWorkingHeight -> BlockHeight(), when nextTurnDposInfo != nil
+		//      (nextturn_dposinfo.go:48)
+		//   3. GetCurrentConsensusMode -> GetSpvHeight -> BlockHeight(), the
+		//      fallback taken when HeaderStore().GetBest() errors
+		//      (nextturn_dposinfo.go:148)
+		// So the boundary is "the listener's own state is consistent while the
+		// lock is held", not "the height onBlockHandled sees equals the block it
+		// was given" — it re-reads the live head by design, which may already be
+		// a block ahead.
 		l.onBlockHandled(aux)
 	}
 

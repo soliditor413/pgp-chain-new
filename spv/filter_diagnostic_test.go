@@ -59,8 +59,10 @@ func TestInspectTxFilterMatchesTheRegisteredAddress(t *testing.T) {
 // BloomBytes is the one number that separates that state from a healthy sync,
 // and it has to be readable at start-up rather than 2M ELA blocks later.
 //
-// It also pins that probing an empty filter must not panic: Filter.hash divides
-// by len(Filter)<<3.
+// It also pins why inspectTxFilter does not simply ask the bloom filter whether
+// it matches: bloom.Filter.matches returns true when HashFuncs is 0, and an
+// empty filter has HashFuncs 0, so an unguarded probe would answer "matches
+// everything" for a filter that can match nothing. Matches must stay false here.
 func TestInspectTxFilterDetectsAnEmptyFilter(t *testing.T) {
 	addr := testProgramHash(0x22)
 

@@ -79,9 +79,18 @@ func inspectTxFilter(tf *msg.TxFilterLoad, programHash *common.Uint168) (filterS
 		HashFuncs:  load.HashFuncs,
 		TxTypes:    len(load.TxTypes),
 	}
-	// Guard the match on a non-empty bitmap: Filter.hash divides by
-	// len(Filter)<<3, so probing an empty filter would panic rather than
-	// report "no match".
+	// Guard the match on a non-empty bitmap. The reason is not that probing an
+	// empty filter crashes — it does not. bloom.Filter.matches loops
+	// `for i := 0; i < HashFuncs; i++` and an empty filter has HashFuncs == 0
+	// (NewFilter derives it from the bitmap size, which is zero), so the loop
+	// body never runs and matches returns true. That vacuous "matches
+	// everything" is precisely the false positive this file exists to rule out:
+	// without the guard an empty filter would be reported as a healthy one that
+	// covers the registered address. Do not delete it on the assumption that
+	// something below would fail loudly — nothing below does.
+	//
+	// The ELA side guards the same way for the same reason: elanet's
+	// matchTxAndUpdate only consults the bloom filter `if len(bf.msg.Filter) != 0`.
 	if programHash != nil && len(load.Filter) != 0 {
 		snapshot.Matches = bloom.LoadFilter(&load).Matches(programHash.Bytes())
 	}

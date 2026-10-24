@@ -7,7 +7,9 @@ import (
 	"math"
 	"strconv"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/elastos/Elastos.ELA.SPV/util"
 
@@ -235,8 +237,11 @@ func TestNotifyBlockRunsTheCallbackOnlyAboveTheArbiterHeight(t *testing.T) {
 // a height it no longer holds the block for, which is what onBlockHandled hands
 // to the arbiters.
 //
-// Run with -race this fails on the unsynchronised field access itself; the
-// final invariant check catches the torn pair even without the detector.
+// Run with -race this fails on the unsynchronised field access itself. It does
+// NOT fail without the detector: the torn pair needs a window two field writes
+// wide, and with the mutex removed this test passed 30 plain runs out of 30. The
+// deterministic guard for the window itself, which works under a plain
+// `go test ./spv/`, is TestNotifyBlockKeepsTheCriticalSectionAcrossBothWrites.
 func TestNotifyBlockSerialisesHeightAndAuxBlock(t *testing.T) {
 	previousStore := GetRechargeStore()
 	SetRechargeStore(nil)
@@ -309,5 +314,85 @@ func TestStoreAuxBlockIsSafeOnItsOwn(t *testing.T) {
 	defer listener.mu.Unlock()
 	if listener.param.height != 42 || listener.param.block == nil || listener.param.block.Height != 42 {
 		t.Fatalf("param = (%v, %v), want the block at height 42", listener.param.height, listener.param.block)
+	}
+}
+
+// TestNotifyBlockKeepsTheCriticalSectionAcrossBothWrites proves the mutex
+// actually covers the whole sequence, under a plain `go test` with no detector.
+//
+// The failure it guards against is a torn (height, aux block) pair: advance
+// blockNumber, get preempted, let a second writer advance it further and store
+// its own aux block, then come back and overwrite the aux block with the older
+// one. That window is two field writes wide, so timing it from a test does not
+// work — with the mutex removed TestNotifyBlockSerialisesHeightAndAuxBlock
+// passes every run. Here writer A is parked inside the window instead, so
+// writer B has the entire window to run and there is nothing left to luck.
+func TestNotifyBlockKeepsTheCriticalSectionAcrossBothWrites(t *testing.T) {
+	previousStore := GetRechargeStore()
+	SetRechargeStore(nil)
+	t.Cleanup(func() { SetRechargeStore(previousStore) })
+
+	// The arbiter gate stays shut so onBlockHandled never runs.
+	listener := &BlockListener{dynamicArbiterHeight: math.MaxUint64}
+
+	var parked, intruded, hookCalls atomic.Int32
+	entered := make(chan struct{})
+	release := make(chan struct{})
+
+	previousHook := testHookBeforeAuxBlockStore
+	testHookBeforeAuxBlockStore = func() {
+		// Reaching this while writer A is parked means a second writer got
+		// through the window, i.e. the critical section does not cover both
+		// writes. Reaching it after A was released is the normal path.
+		if parked.Load() == 1 {
+			intruded.Store(1)
+		}
+		if hookCalls.Add(1) != 1 {
+			return
+		}
+		parked.Store(1)
+		close(entered)
+		<-release
+		parked.Store(0)
+	}
+	t.Cleanup(func() { testHookBeforeAuxBlockStore = previousHook })
+
+	firstDone := make(chan struct{})
+	go func() {
+		defer close(firstDone)
+		listener.NotifyBlock(elaBlockAt(1), true)
+	}()
+	<-entered
+
+	secondDone := make(chan struct{})
+	go func() {
+		defer close(secondDone)
+		listener.NotifyBlock(elaBlockAt(2), true)
+	}()
+
+	// Give writer B the whole window. With the mutex it blocks on l.mu for the
+	// entire duration, so this always runs to the timeout.
+	select {
+	case <-secondDone:
+	case <-time.After(100 * time.Millisecond):
+	}
+	close(release)
+	<-firstDone
+	<-secondDone
+
+	if intruded.Load() == 1 {
+		t.Fatal("a second writer completed its write sequence while the first was parked between " +
+			"the blockNumber update and the aux-block update: the critical section does not cover both writes")
+	}
+	if got := hookCalls.Load(); got != 2 {
+		t.Fatalf("hook calls = %d, want 2 (both writers must reach it)", got)
+	}
+
+	listener.mu.Lock()
+	height, paramHeight := listener.blockNumber, listener.param.height
+	listener.mu.Unlock()
+	if height != 2 || paramHeight != 2 {
+		t.Fatalf("(blockNumber, param.height) = (%d, %d), want (2, 2): the aux block belongs to another height",
+			height, paramHeight)
 	}
 }
