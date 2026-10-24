@@ -4,9 +4,12 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"math"
 	"strconv"
 	"sync"
 	"testing"
+
+	"github.com/elastos/Elastos.ELA.SPV/util"
 
 	"github.com/ethereum/go-ethereum/log"
 )
@@ -170,5 +173,141 @@ func TestNotifyBlockReportsProgressOnTheIntervalOnly(t *testing.T) {
 	}
 	if got := listener.txsSeen.Load(); got != 5 {
 		t.Fatalf("txsSeen = %d, want 5 (every block is counted, only some are reported)", got)
+	}
+}
+
+// TestNotifyBlockRunsTheCallbackOnlyAboveTheArbiterHeight pins the two early
+// returns that the mutex refactor had to preserve: a block below
+// dynamicArbiterHeight is recorded as the live head but does not reach the
+// registered callback, and a duplicate height does not reach it either. Both
+// were bare `return`s before the critical section was introduced, and falling
+// through to the callback instead would fire the legacy block handler on every
+// ELA block below the arbiter schedule.
+func TestNotifyBlockRunsTheCallbackOnlyAboveTheArbiterHeight(t *testing.T) {
+	previousStore := GetRechargeStore()
+	SetRechargeStore(nil)
+	t.Cleanup(func() { SetRechargeStore(previousStore) })
+
+	// onBlockHandled reaches into the package-level SPV service once the
+	// arbiter height is reached, so both globals are parked for the duration.
+	previousService, previousInfo := SpvService, nextTurnDposInfo
+	SpvService, nextTurnDposInfo = nil, nil
+	t.Cleanup(func() { SpvService, nextTurnDposInfo = previousService, previousInfo })
+
+	captureLogs(t)
+
+	var handled []uint32
+	listener := &BlockListener{dynamicArbiterHeight: 100}
+	listener.RegisterFunc(func(block interface{}) error {
+		if b, ok := block.(*util.Block); ok {
+			handled = append(handled, b.Height)
+		}
+		return nil
+	})
+
+	listener.NotifyBlock(elaBlockAt(99), true)
+	if len(handled) != 0 {
+		t.Fatalf("callback ran below dynamicArbiterHeight 100 at height 99: %v", handled)
+	}
+	if got := listener.BlockHeight(); got != 99 {
+		t.Fatalf("BlockHeight = %d, want 99 (the block is still recorded)", got)
+	}
+
+	listener.NotifyBlock(elaBlockAt(100), true)
+	if len(handled) != 1 || handled[0] != 100 {
+		t.Fatalf("callback calls = %v, want [100]", handled)
+	}
+
+	listener.NotifyBlock(elaBlockAt(100), true)
+	if len(handled) != 1 {
+		t.Fatalf("callback re-ran for a duplicate height: %v", handled)
+	}
+}
+
+// TestNotifyBlockSerialisesHeightAndAuxBlock is the concurrency guard for the
+// listener's live-head state.
+//
+// blockNumber and param used to be written by NotifyBlock with no
+// synchronisation while BlockHeight read blockNumber from the block execution
+// path, so two notifications could interleave: one advances blockNumber to H,
+// a second advances it to H+1 and stores its aux block, the first then resumes
+// and overwrites the aux block with the H one. The listener is then pointing at
+// a height it no longer holds the block for, which is what onBlockHandled hands
+// to the arbiters.
+//
+// Run with -race this fails on the unsynchronised field access itself; the
+// final invariant check catches the torn pair even without the detector.
+func TestNotifyBlockSerialisesHeightAndAuxBlock(t *testing.T) {
+	previousStore := GetRechargeStore()
+	SetRechargeStore(nil)
+	t.Cleanup(func() { SetRechargeStore(previousStore) })
+
+	// The arbiter gate stays shut so onBlockHandled, which touches the
+	// package-level SPV service, never runs: this test is about the mutex.
+	listener := &BlockListener{dynamicArbiterHeight: math.MaxUint64}
+
+	const writers, blocks = 8, 200
+
+	stop := make(chan struct{})
+	var readers sync.WaitGroup
+	for r := 0; r < 2; r++ {
+		readers.Add(1)
+		go func() {
+			defer readers.Done()
+			for {
+				select {
+				case <-stop:
+					return
+				default:
+					_ = listener.BlockHeight()
+				}
+			}
+		}()
+	}
+
+	var wg sync.WaitGroup
+	for w := 0; w < writers; w++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for n := 1; n <= blocks; n++ {
+				listener.NotifyBlock(elaBlockAt(uint32(n)), true)
+			}
+		}()
+	}
+	wg.Wait()
+	close(stop)
+	readers.Wait()
+
+	listener.mu.Lock()
+	height, paramHeight, paramBlock := listener.blockNumber, listener.param.height, listener.param.block
+	listener.mu.Unlock()
+
+	if height != blocks {
+		t.Fatalf("blockNumber = %d, want %d", height, blocks)
+	}
+	if paramHeight != height {
+		t.Fatalf("param.height = %d but blockNumber = %d: the height and the aux block disagree", paramHeight, height)
+	}
+	if paramBlock == nil {
+		t.Fatal("param.block is nil although the listener advanced to a live head")
+	}
+	if paramBlock.Height != height {
+		t.Fatalf("param.block.Height = %d but blockNumber = %d: the aux block belongs to another height",
+			paramBlock.Height, height)
+	}
+}
+
+// TestStoreAuxBlockIsSafeOnItsOwn keeps the exported entry point honest. It is
+// part of the spv.BlockListener interface, so it must take the lock itself
+// rather than assume it is only ever called from inside NotifyBlock.
+func TestStoreAuxBlockIsSafeOnItsOwn(t *testing.T) {
+	listener := new(BlockListener)
+	listener.StoreAuxBlock(elaBlockAt(42))
+
+	listener.mu.Lock()
+	defer listener.mu.Unlock()
+	if listener.param.height != 42 || listener.param.block == nil || listener.param.block.Height != 42 {
+		t.Fatalf("param = (%v, %v), want the block at height 42", listener.param.height, listener.param.block)
 	}
 }

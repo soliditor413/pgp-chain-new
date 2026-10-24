@@ -2,6 +2,7 @@ package spv
 
 import (
 	"bytes"
+	"sync"
 	"sync/atomic"
 
 	spv "github.com/elastos/Elastos.ELA.SPV/interface"
@@ -31,6 +32,15 @@ func (param *auxParam) clean() {
 }
 
 type BlockListener struct {
+	// mu guards blockNumber, param and handle. NotifyBlock is driven by the SPV
+	// sdk's notification goroutine while BlockHeight is read from the block
+	// execution path (nextturn_dposinfo.go) and from onBlockHandled's own
+	// re-entry, so the read-decide-write sequence "is this height newer than the
+	// last one, and if so remember its aux block" has to be one atomic step.
+	// Without it two notifications landing together can both pass the
+	// blockNumber comparison and the later one can pair a height with the other
+	// block's aux param.
+	mu                   sync.Mutex
 	blockNumber          uint32
 	param                auxParam
 	handle               func(block interface{}) error
@@ -132,24 +142,45 @@ func (l *BlockListener) NotifyBlock(block *util.Block, isCurrent bool) {
 	}
 
 	if isCurrent {
-		if block.Height <= l.blockNumber {
-			log.Warn("BlockListener handle block ", "height", l.blockNumber)
+		// One critical section: decide whether this block advances the live
+		// head, record it, and read back the aux block the arbiter schedule
+		// will be evaluated against. The reads and writes below used to be a
+		// bare sequence on unguarded fields.
+		l.mu.Lock()
+		advanced := block.Height > l.blockNumber
+		if advanced {
+			l.blockNumber = block.Height
+			l.storeAuxBlockLocked(block)
+		}
+		height, aux := l.blockNumber, l.param.block
+		due := uint64(height) >= l.GetDynamicArbiterHeight()
+		l.mu.Unlock()
+
+		// A duplicate height returns before l.handle below, exactly as the
+		// original did: the callback is for blocks that moved the head.
+		if !advanced {
+			log.Warn("BlockListener handle block ", "height", height)
 			return
 		}
-		l.blockNumber = block.Height
-		l.StoreAuxBlock(block)
 
-		log.Info("BlockListener handle block ", "height", l.blockNumber, "l.dynamicArbiterHeight ", l.dynamicArbiterHeight)
+		log.Info("BlockListener handle block ", "height", height, "l.dynamicArbiterHeight ", l.GetDynamicArbiterHeight())
 
-		if uint64(l.blockNumber) < l.dynamicArbiterHeight {
+		// The arbiter-schedule gate also returns before l.handle, as in
+		// pgp-chain: below dynamicArbiterHeight the live block is recorded but
+		// the consensus-mode switch and the registered callback are not run.
+		if !due {
 			return
 		}
 
-		l.onBlockHandled(l.param.block)
+		// onBlockHandled is deliberately called after the unlock. It re-enters
+		// this listener (BlockHeight via InitNextTurnDposInfo) and does
+		// network-facing work, so holding l.mu across it would both deadlock
+		// and stall the SPV notification goroutine.
+		l.onBlockHandled(aux)
 	}
 
-	if l.handle != nil {
-		l.handle(block)
+	if handle := l.handleFunc(); handle != nil {
+		handle(block)
 	}
 
 	// pgp-chain also broadcast dpos.ETOnSPVHeight here (blocklistener.go:65).
@@ -157,10 +188,22 @@ func (l *BlockListener) NotifyBlock(block *util.Block, isCurrent bool) {
 }
 
 func (l *BlockListener) BlockHeight() uint32 {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	return l.blockNumber
 }
 
+// StoreAuxBlock satisfies the SPV BlockListener interface. It has no caller
+// outside NotifyBlock today, but it is exported through that interface, so it
+// takes the lock itself rather than relying on its callers.
 func (l *BlockListener) StoreAuxBlock(block interface{}) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.storeAuxBlockLocked(block)
+}
+
+// storeAuxBlockLocked does the work of StoreAuxBlock. The caller must hold l.mu.
+func (l *BlockListener) storeAuxBlockLocked(block interface{}) {
 	b, ok := block.(*util.Block)
 	if !ok || b == nil {
 		log.Error("BlockListener StoreAuxBlock: unexpected block type")
@@ -173,8 +216,21 @@ func (l *BlockListener) StoreAuxBlock(block interface{}) {
 	}
 }
 
+// RegisterFunc installs the block callback. RegisterFunc runs at start-up,
+// before the SPV service is started, so the write cannot overlap a
+// notification in practice; it takes the lock anyway so that the read in
+// NotifyBlock is not a data race for the race detector.
 func (l *BlockListener) RegisterFunc(handleFunc func(block interface{}) error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
 	l.handle = handleFunc
+}
+
+// handleFunc returns the registered callback, or nil when none was registered.
+func (l *BlockListener) handleFunc() func(block interface{}) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return l.handle
 }
 
 // onBlockHandled keeps only the consensus mode switch of the original

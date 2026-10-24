@@ -270,6 +270,12 @@ func NewService(cfg *Config, tmux *event.TypeMux, dynamicArbiterHeight uint64) (
 	log.Info("pgp: registered the ELA filter address",
 		"address", cfg.GenesisAddress, "programHash", programHash.String())
 
+	// And one line that proves the registration actually reached the filter the
+	// peers will be sent. Registering can succeed while producing an empty
+	// filter, and every downstream signal is blind to that; see
+	// filter_diagnostic.go.
+	logTxFilterState(service, cfg.GenesisAddress, programHash)
+
 	// The block listener is part of the read path, not the write path:
 	// GetSpvHeight, SpvIsWorkingHeight and the consensus mode switch all go
 	// through it, so it is registered even in this read-only port.
