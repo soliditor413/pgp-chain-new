@@ -15,6 +15,7 @@ import (
 	"github.com/elastos/Elastos.ELA/core/types/payload"
 
 	ethCommon "github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/log"
 )
 
 // ApplyElaBlock is the only writer of recharge records. It replaces pgp-chain's
@@ -86,6 +87,17 @@ func ApplyElaTransaction(store *RechargeStore, elaHeight uint64, tx it.Transacti
 	datas, err := rechargeDatasOf(tx)
 	if err != nil {
 		return fmt.Errorf("spv: ELA tx %s at height %d: %w", tx.Hash().String(), elaHeight, err)
+	}
+	// One line per cross-chain output. A TransferCrossChainAsset carrying
+	// recharge data is rare enough over the whole ELA chain (hundreds, not
+	// millions) that logging it at Info is what makes an SPV disagreement
+	// debuggable after the fact: the record this writes is what the 0x3f1
+	// precompile later hands to a Recharge, so when a block executes
+	// differently from the reference, these lines say whether the ELA side
+	// delivered the same amounts.
+	for _, data := range datas {
+		log.Info("pgp: ELA recharge indexed", "elaHeight", elaHeight, "elaTx", tx.Hash().String(),
+			"targetAddress", data.TargetAddress, "targetAmount", data.TargetAmount, "fee", data.Fee)
 	}
 	if len(datas) == 0 {
 		// A TransferCrossChainAsset tx with no cross-chain output carries no
