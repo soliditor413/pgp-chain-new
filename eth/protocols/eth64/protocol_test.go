@@ -571,3 +571,63 @@ func TestSyncerInsertOutcomes(t *testing.T) {
 		})
 	}
 }
+
+// TestSyncerRefusalCooldown pins the expiry of a refusal latch.
+//
+// The latch exists so a block the client cannot execute is not re-fetched every
+// syncLoopInterval. It must not be permanent, because the usual reason a legacy
+// block is refused is a dependency that has not caught up yet: block 30115 needs
+// ELA recharge data from height 2,076,538, which a node syncing the ELA main
+// chain from 0 reaches hours after start-up. A permanent latch turned that into
+// "restart the node by hand" — observed in the field.
+func TestSyncerRefusalCooldown(t *testing.T) {
+	h := newHandler(nil, 860621)
+	defer h.Close()
+	s := newChainSyncer(h)
+	now := time.Now()
+
+	if !s.due(now) {
+		t.Fatal("a fresh syncer must be allowed to run")
+	}
+
+	// Latch it the way a refused block does.
+	s.latch(now)
+
+	if s.due(now) {
+		t.Fatal("a latched syncer ran again immediately; the latch is what stops the log spam")
+	}
+	if s.due(now.Add(refusedRetryCooldown - time.Second)) {
+		t.Fatal("the latch expired before the cooldown")
+	}
+	if !s.due(now.Add(refusedRetryCooldown)) {
+		t.Fatal("the latch never expires; the syncer would wait for a human restart")
+	}
+
+	// Reset releases it early and leaves no scheduled retry behind, so a later
+	// refusal starts a full cooldown again rather than inheriting an old one.
+	s.Reset()
+	if !s.due(now) {
+		t.Fatal("Reset did not release the latch")
+	}
+	if got := s.retryAt.Load(); got != 0 {
+		t.Fatalf("Reset left retryAt = %d, want 0", got)
+	}
+}
+
+// TestSyncerLatchWithoutRetryTimeStaysParked covers the defensive branch in due:
+// a latch set without a retry deadline must not be treated as expired, or a
+// future call site that forgets stopAtBoundary would reintroduce the 10 second
+// retry loop this latch was added to stop.
+func TestSyncerLatchWithoutRetryTimeStaysParked(t *testing.T) {
+	h := newHandler(nil, 860621)
+	defer h.Close()
+	s := newChainSyncer(h)
+
+	s.blocked.Store(true)
+	if s.due(time.Now()) {
+		t.Fatal("a latch with no retry time was treated as expired")
+	}
+	if s.due(time.Now().Add(24 * time.Hour)) {
+		t.Fatal("a latch with no retry time expired after a day")
+	}
+}

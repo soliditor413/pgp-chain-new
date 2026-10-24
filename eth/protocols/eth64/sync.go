@@ -32,6 +32,20 @@ const (
 	// maxSyncRounds bounds one sync attempt so a hostile peer cannot make the
 	// syncer loop forever.
 	maxSyncRounds = 4096
+
+	// refusedRetryCooldown is how long a refusal parks the syncer before it
+	// tries the same block again.
+	//
+	// The latch exists so a block the client genuinely cannot execute does not
+	// re-fetch and re-fail every syncLoopInterval (10s, i.e. 360 log lines an
+	// hour). It must not be permanent, because the most common reason a legacy
+	// block is refused is that its ELA dependency has not caught up yet: block
+	// 30115 of pgp mainnet needs recharge data from ELA height 2,076,538, and a
+	// node syncing the ELA main chain from 0 spends hours getting there. A
+	// permanent latch turns "wait for the dependency" into "restart the node by
+	// hand", which is exactly the failure this cooldown removes. Five minutes
+	// is short next to an ELA sync and long enough to keep the log readable.
+	refusedRetryCooldown = 5 * time.Minute
 )
 
 // chainSyncer pulls the canonical chain from one eth/64 peer at a time.
@@ -45,8 +59,10 @@ type chainSyncer struct {
 	// blocked latches once a block was refused by the chain. A refusal that
 	// makes no progress is a hard boundary (unsupported rule, unsupported
 	// precompile, state root mismatch), so retrying every 10 seconds would only
-	// spam the log with the same failure. Reset clears it.
+	// spam the log with the same failure. RetryAt carries when it may be
+	// retried anyway; see refusedRetryCooldown. Reset clears both.
 	blocked atomic.Bool
+	retryAt atomic.Int64 // unix nanoseconds; 0 means "no scheduled retry"
 }
 
 // newChainSyncer creates a syncer for the given handler.
@@ -74,12 +90,20 @@ func (s *chainSyncer) loop() {
 		case <-s.triggerCh:
 		case <-ticker.C:
 		}
-		if s.blocked.Load() {
-			continue
-		}
 		peer := s.h.peers.BestPeer()
 		if peer == nil {
 			continue
+		}
+		if !s.due(time.Now()) {
+			continue
+		}
+		if s.blocked.Load() {
+			// The cooldown expired. The most likely reason the block was
+			// refused was a dependency that has since caught up (see
+			// refusedRetryCooldown), so clear the latch and try once more.
+			peer.Log().Info("eth/64 download retrying after the refusal cooldown",
+				"cooldown", refusedRetryCooldown)
+			s.Reset()
 		}
 		s.syncToHead(peer)
 	}
@@ -285,8 +309,16 @@ func (s *chainSyncer) stopAtBoundary(peer *Peer, origin uint64, refused *types.H
 	}
 	boundaryStopMeter.Mark(1)
 	peer.Log().Warn("eth/64 download stopped: the chain refused this block and nothing was imported",
-		"origin", origin, "block", refused.Number, "hash", refused.Hash(), "err", err)
+		"origin", origin, "block", refused.Number, "hash", refused.Hash(), "err", err,
+		"retryIn", refusedRetryCooldown)
+	s.latch(time.Now())
+}
+
+// latch parks the syncer and records when it may try again. Split out of
+// stopAtBoundary so the cooldown can be tested without a live peer.
+func (s *chainSyncer) latch(now time.Time) {
 	s.blocked.Store(true)
+	s.retryAt.Store(now.Add(refusedRetryCooldown).UnixNano())
 }
 
 // Reset clears the hard-boundary latch and schedules a new sync round.
@@ -294,10 +326,26 @@ func (s *chainSyncer) stopAtBoundary(peer *Peer, origin uint64, refused *types.H
 // It is the intended entry point for anything that changes the client's ability
 // to execute legacy blocks at runtime (a new execution rule, a config change, a
 // restart of the ELA dependency): without a reset the syncer stays parked on the
-// first block it could not import, by design.
+// first block it could not import until refusedRetryCooldown expires.
 func (s *chainSyncer) Reset() {
+	s.retryAt.Store(0)
 	s.blocked.Store(false)
 	s.trigger()
+}
+
+// due reports whether the syncer may run a round at the given time.
+//
+// Not latched always means yes. Latched means yes only once the cooldown set by
+// stopAtBoundary has expired — and a latch with no retry time (only reachable if
+// something set blocked without going through stopAtBoundary) never expires, so
+// the safety property "a refusal cannot be retried every syncLoopInterval"
+// survives any future call site.
+func (s *chainSyncer) due(now time.Time) bool {
+	if !s.blocked.Load() {
+		return true
+	}
+	until := s.retryAt.Load()
+	return until != 0 && now.UnixNano() >= until
 }
 
 // fetchHeaders requests amount headers starting at origin and waits for them.

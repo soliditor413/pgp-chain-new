@@ -376,13 +376,21 @@ func geth(ctx *cli.Context) error {
 // it unlocks any requested accounts, and starts the RPC/IPC interfaces and the
 // miner.
 func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, isConsole bool) {
+	// Start the ELA main chain SPV service FIRST, before the node and therefore
+	// before the eth/64 syncer can execute a legacy block.
+	//
+	// The ordering is load-bearing. startSpv is what installs the recharge store
+	// (SpvDbInit -> SetRechargeStore) that every legacy block reads through the
+	// 0x3f1 precompile, and the eth/64 syncer starts pulling blocks the moment
+	// utils.StartNode returns. With the call below StartNode, a node whose peer
+	// delivers block 30115 within the first seconds of start-up was refused with
+	// "spv: recharge store is not initialised" — a state that has nothing to do
+	// with the block, only with the race. The syncer's cooldown makes such a
+	// refusal recoverable, but not causing it is better.
+	startSpv(stack, backend)
+
 	// Start up the node itself
 	utils.StartNode(ctx, stack, isConsole)
-
-	// Start the ELA main chain SPV service. It has to be up before any legacy
-	// block is executed, because every ELA read on the execution path (the 0x3f1
-	// recharge precompile today) answers from what this service has synced.
-	startSpv(stack, backend)
 
 	// Unlock any account specifically requested
 	unlockAccounts(ctx, stack)

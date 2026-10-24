@@ -17,8 +17,8 @@ import (
 // spvServiceHolder carries the running ELA SPV service across the two places
 // that need it: the node lifecycle, which has to be registered in makeFullNode
 // because RegisterLifecycle panics ("can't register lifecycle on running/stopped
-// node") once the node is up, and startSpv, which creates the service after the
-// node is up.
+// node") once the node is up, and startSpv, which creates the service before the
+// node starts.
 //
 // A package level holder is acceptable here for the same reason the client
 // identifier is: geth runs one node per process, and the SPV service is a
@@ -30,9 +30,10 @@ type spvServiceHolder struct {
 	svc *spv.Service
 }
 
-// Start is a no-op: startSpv starts the service itself, because it has to be
-// syncing before the first legacy block is executed and startNode may return
-// before the lifecycle start reaches us.
+// Start is a no-op: startSpv starts the service itself. It cannot be deferred to
+// the lifecycle, because the service has to be syncing — and, more importantly,
+// its recharge store has to be installed — before the eth/64 syncer executes the
+// first legacy block, which happens as soon as the node starts.
 func (h *spvServiceHolder) Start() error { return nil }
 
 // Stop is the part that matters. The SPV service owns two leveldb stores — the
