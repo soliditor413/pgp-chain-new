@@ -21,9 +21,20 @@ func (h *eth64Handler) Chain() eth64.ChainReader { return h.chain }
 // makeETH64Protocols returns the pgp-chain eth/64 protocol entry. It is only
 // registered for chains that carry the pgp legacy history, never for
 // BSC/Chapel/Rialto.
+//
+// The result is memoised because eth64.MakeProtocols is not a pure descriptor: it
+// allocates a peer set and starts a sync goroutine. Protocols() is called twice
+// per start - once to register (eth/backend.go:534) and once to name the protocols
+// for a metrics gauge (cmd/geth/config.go:345) - so creating the entry twice would
+// leave a second eth/64 syncer running with no peers for the life of the process,
+// and would point progress reporting at whichever handler happened to be built
+// last.
 func (s *Ethereum) makeETH64Protocols() []p2p.Protocol {
 	if s.blockchain == nil || s.blockchain.Config().Legacy == nil {
 		return nil
 	}
-	return eth64.MakeProtocols((*eth64Handler)(s.handler), s.networkID)
+	s.eth64ProtosOnce.Do(func() {
+		s.eth64Protos = eth64.MakeProtocols((*eth64Handler)(s.handler), s.networkID)
+	})
+	return s.eth64Protos
 }

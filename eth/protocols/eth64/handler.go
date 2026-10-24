@@ -12,6 +12,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
 	"github.com/ethereum/go-ethereum/params"
@@ -246,9 +247,12 @@ type SyncProgress struct {
 func Progress() (SyncProgress, bool) {
 	h := currentHandler.Load()
 	if h == nil || h.syncer == nil {
+		log.Debug("eth/64 progress: no syncer", "handler", h != nil)
 		return SyncProgress{}, false
 	}
-	return h.syncer.progress(), true
+	p := h.syncer.progress()
+	log.Debug("eth/64 progress", "current", p.Current, "highest", p.Highest, "start", p.Start)
+	return p, true
 }
 
 // progress takes a consistent-enough snapshot of the syncer's bookkeeping.

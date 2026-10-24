@@ -12,6 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/pgp"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/trie"
 )
@@ -301,6 +302,7 @@ func (s *chainSyncer) syncToHead(peer *Peer) {
 // highest == current, the caller's Done() comparison sees no gap, and the node
 // stops claiming to be syncing without anyone having to reset a flag.
 func (s *chainSyncer) catchUpFinished(head uint64) {
+	log.Debug("eth/64 progress: catch-up finished", "head", head)
 	s.target.Store(head)
 	s.start.Store(0)
 }
@@ -337,15 +339,23 @@ func (s *chainSyncer) localHeight() uint64 {
 func (s *chainSyncer) probeHeadHeight(peer *Peer, head common.Hash) (uint64, bool) {
 	headerReqMeter.Mark(1)
 	if err := peer.RequestHeadersByHash(head, 1, 0, false); err != nil {
+		peer.Log().Debug("eth/64 head height probe: request failed", "head", head, "err", err)
 		return 0, false
 	}
 	headers, err := peer.WaitHeaders(responseTimeout)
-	if err != nil || len(headers) == 0 {
+	if err != nil {
+		peer.Log().Debug("eth/64 head height probe: no response", "head", head, "err", err)
+		return 0, false
+	}
+	if len(headers) == 0 {
+		peer.Log().Debug("eth/64 head height probe: empty response", "head", head)
 		return 0, false
 	}
 	if headers[0].Hash() != head {
+		peer.Log().Debug("eth/64 head height probe: wrong header", "head", head, "got", headers[0].Hash())
 		return 0, false
 	}
+	peer.Log().Debug("eth/64 head height probe: ok", "head", head, "height", headers[0].Number)
 	return headers[0].Number.Uint64(), true
 }
 

@@ -156,6 +156,19 @@ type Ethereum struct {
 
 	votePool *vote.VotePool
 	stopCh   chan struct{}
+
+	// eth64Protos caches the pgp eth/64 protocol entry, and the Once guards it.
+	//
+	// Protocols() is not a pure description in this fork: makeETH64Protocols
+	// allocates a peer set and starts a sync goroutine, unlike the eth/68, eth/70
+	// and snap entries which are stateless descriptors. Protocols() is called more
+	// than once per start - eth/backend.go:534 registers it and cmd/geth/config.go:345
+	// calls it again just to name the protocols for a metrics gauge - so without
+	// this the node would run a second, unreachable eth/64 syncer for its whole
+	// life, and whichever handler was created last would be the one reporting
+	// progress to eth_syncing.
+	eth64ProtosOnce sync.Once
+	eth64Protos     []p2p.Protocol
 }
 
 // New creates a new Ethereum object (including the initialisation of the common Ethereum object),
