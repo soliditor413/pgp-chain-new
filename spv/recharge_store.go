@@ -707,7 +707,22 @@ func (s *RechargeStore) RechargeAny(elaHash string) (RechargeDatas, *big.Int, er
 		return nil, nil, err
 	}
 	if !ok {
-		return nil, nil, fmt.Errorf("%w: %s (no ELA height pin)", ErrRechargeUnavailable, elaHash)
+		// The covered height is part of the message on purpose. "No record" is
+		// ambiguous in a way that costs operators real time: a node whose ELA side
+		// has only reached height N answers exactly like a node whose ELA side
+		// reached the tip and genuinely never saw this deposit. Naming N is what
+		// tells them to wait for the sync rather than to go looking at the deposit
+		// address.
+		covered, advanced, cerr := s.coverage()
+		if cerr != nil {
+			return nil, nil, cerr
+		}
+		if !advanced {
+			return nil, nil, fmt.Errorf("%w: %s (no ELA height pin; the store has never been advanced)",
+				ErrRechargeUnavailable, elaHash)
+		}
+		return nil, nil, fmt.Errorf("%w: %s (no ELA height pin; the store has only been advanced to ELA height %d, "+
+			"so this says nothing about what the chain holds above it)", ErrRechargeUnavailable, elaHash, covered)
 	}
 	return decodeStoredRecharge(value, at, elaHash)
 }

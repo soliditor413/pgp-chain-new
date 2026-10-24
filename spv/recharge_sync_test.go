@@ -93,6 +93,29 @@ func TestApplyElaBlockFailedTxDoesNotAdvanceCoverage(t *testing.T) {
 	}
 }
 
+// TestApplyElaBlockNilTransactionDoesNotAdvanceCoverage closes the one hole the
+// decode-failure test leaves open.
+//
+// A nil entry looks harmless - there is no transaction there to lose - but the
+// coverage marker is irreversible and cannot be backfilled: once a height is
+// covered, every read at or below it is answered from this store forever. So
+// advancing past a nil is the one mistake with no recovery path, and it must be
+// as loud as an undecodable transaction, not skipped.
+func TestApplyElaBlockNilTransactionDoesNotAdvanceCoverage(t *testing.T) {
+	s := newTestStore()
+	if err := ApplyElaBlock(s, elaBlockAt(20)); err != nil {
+		t.Fatalf("ApplyElaBlock(20): %v", err)
+	}
+
+	if err := ApplyElaBlock(s, elaBlockAt(21, nil)); err == nil {
+		t.Fatal("ApplyElaBlock advanced coverage over a nil transaction")
+	}
+	if covered, _, _ := s.CoveredThrough(); covered != 20 {
+		t.Fatalf("coverage moved to %d after a block with a nil transaction, want it to stay at 20", covered)
+	}
+}
+
+// a plausible-looking zero address that the precompile would happily return.
 // TestNewRechargeDataValidatesAddress keeps a malformed esc address from becoming
 // a plausible-looking zero address that the precompile would happily return.
 func TestNewRechargeDataValidatesAddress(t *testing.T) {

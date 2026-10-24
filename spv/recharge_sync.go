@@ -39,6 +39,13 @@ import (
 // then fails every read at that height and stops, which is the intended
 // behaviour. It does not skip the tx and carry on, because a silently skipped
 // record is a wrong answer rather than a missing one.
+//
+// A nil transaction aborts for the same reason, even though it looks harmless.
+// The coverage marker cannot be walked back and cannot be backfilled - once a
+// height is marked covered, every read at or below it is answered from this
+// store forever - so the one mistake with no recovery path is advancing past a
+// hole. A false abort costs a stalled ELA sync that an operator sees immediately;
+// a false skip costs a re-sync of the whole ELA chain.
 func ApplyElaBlock(store *RechargeStore, block *util.Block) error {
 	if store == nil {
 		return ErrRechargeStoreNotInitialised
@@ -49,7 +56,7 @@ func ApplyElaBlock(store *RechargeStore, block *util.Block) error {
 	height := uint64(block.Height)
 	for i, t := range block.Transactions {
 		if t == nil {
-			continue
+			return fmt.Errorf("spv: ELA block %d carries a nil transaction at index %d", height, i)
 		}
 		tx, err := decodeElaTransaction(t)
 		if err != nil {

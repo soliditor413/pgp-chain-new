@@ -3,6 +3,7 @@ package spv
 import (
 	"errors"
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -118,6 +119,13 @@ func TestRechargeAnyAbsenceIsAnError(t *testing.T) {
 	_, _, err := s.RechargeAny("0x00000000000000000000000000000000000000000000000000000000000000ff")
 	if !errors.Is(err, ErrRechargeUnavailable) {
 		t.Fatalf("absent record: err = %v, want ErrRechargeUnavailable", err)
+	}
+	// The covered height has to be in the message. Without it a node whose ELA
+	// side stopped at 5,000 reads exactly like a node that reached the tip and
+	// genuinely never saw this deposit - one means "wait for the sync", the other
+	// means "the deposit is wrong", and an operator cannot tell them apart.
+	if !strings.Contains(err.Error(), "5000") {
+		t.Fatalf("absence error does not name the covered height: %v", err)
 	}
 }
 
