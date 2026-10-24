@@ -96,9 +96,44 @@ func TestProgressForgetsAStartAboveTheHead(t *testing.T) {
 	}
 }
 
-// TestCatchUpFinishedStopsReportingAGap is what turns eth_syncing off without
-// anyone resetting a flag: once the syncer decides it has caught up, Highest
-// collapses onto the head and the caller's Done() comparison sees no gap.
+// TestCatchUpFinishedLowersAStaleTarget covers the branch that makes the Store in
+// catchUpFinished load-bearing: the syncer was chasing a peer that announced
+// 10,011,885, then found nothing left at a shorter head - the `len(headers) == 0`
+// path passes localHeight(), not the peer's tip.
+//
+// Without the Store the taller target survives, Highest stays above Current, and
+// eth_syncing keeps claiming there is work left on a node that has nothing to
+// download. The test deliberately starts with target far above the head so that
+// the floor in progress() cannot stand in for the Store: a test where target and
+// head are set to the same number passes either way and proves nothing.
+func TestCatchUpFinishedLowersAStaleTarget(t *testing.T) {
+	s, _ := newProgressTestSyncer(t, 1_000_000)
+
+	s.target.Store(10_011_885)
+	s.start.Store(69_474)
+	if p, _ := Progress(); p.Highest <= p.Current {
+		t.Fatal("precondition: a stale taller target should be reported as a gap")
+	}
+
+	s.catchUpFinished(1_000_000)
+
+	p, _ := Progress()
+	if p.Current != 1_000_000 {
+		t.Fatalf("Current = %d, want the unchanged head", p.Current)
+	}
+	if p.Highest != 1_000_000 {
+		t.Fatalf("Highest = %d, want 1000000: the stale target must be lowered to the head, "+
+			"otherwise eth_syncing keeps reporting a gap that no longer exists", p.Highest)
+	}
+	if p.Start != 0 {
+		t.Fatalf("Start = %d, want 0 after catching up", p.Start)
+	}
+}
+
+// TestCatchUpFinishedStopsReportingAGap is the steady-state shape of the same
+// thing: target and head already agree when the syncer decides it is done. It
+// pins the Start clearing, not the target lowering - see
+// TestCatchUpFinishedLowersAStaleTarget for that.
 func TestCatchUpFinishedStopsReportingAGap(t *testing.T) {
 	s, chain := newProgressTestSyncer(t, 1_147_004)
 
