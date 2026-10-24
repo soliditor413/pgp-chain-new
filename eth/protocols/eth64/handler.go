@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"math/big"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -74,6 +75,10 @@ func newHandler(backend Backend, network uint64) *handler {
 func MakeProtocols(backend Backend, network uint64) []p2p.Protocol {
 	h := newHandler(backend, network)
 	h.start()
+	// Publish this handler so eth_syncing can ask the syncer how far behind it
+	// is. The eth package already imports this one (eth/handler_eth64.go), so
+	// this pointer is the one-way channel that avoids an import cycle.
+	currentHandler.Store(h)
 
 	return []p2p.Protocol{{
 		Name:    ProtocolName,
@@ -200,6 +205,69 @@ func (h *handler) dispatch(peer *Peer) error {
 			}
 		}
 	}
+}
+
+// currentHandler is the handler of the one eth/64 protocol set this process runs,
+// published by MakeProtocols so Progress can find it.
+//
+// A package-level pointer rather than a field on the eth backend because the two
+// packages are wired in one direction only: eth imports eth64
+// (eth/handler_eth64.go), and reaching back the other way would be a cycle. There
+// is at most one such handler per process - MakeProtocols is called once, from
+// Ethereum.Protocols - so "the current one" is exactly the right model.
+var currentHandler atomic.Pointer[handler]
+
+// SyncProgress is how far behind the eth/64 peer set the chain is.
+type SyncProgress struct {
+	// Current is our chain head.
+	Current uint64
+	// Highest is the head height the peer announced, or Current when it is not
+	// known. It is never lower than Current: a stale target must not make the
+	// node look like it is syncing backwards.
+	Highest uint64
+	// Start is the head height at which the current catch-up began, or 0 when
+	// the chain is not catching up.
+	Start uint64
+}
+
+// Progress reports the eth/64 syncer's view of the sync.
+//
+// It exists because eth_syncing is blind to this package. The RPC handler reads
+// ethereum.SyncProgress from the built-in downloader
+// (eth/api_backend.go:441-453), and that downloader only ever runs for the eth/68
+// and eth/70 protocols it registers peers for. The pgp network speaks eth/64, so
+// the downloader's HighestBlock stays 0 while this syncer imports millions of
+// blocks, SyncProgress.Done (interfaces.go:148-153) compares 0 against the real
+// head, and eth_syncing answers false throughout a full replay.
+//
+// ok is false when this process runs no eth/64 protocol set at all - a BSC,
+// Chapel or Rialto node - and the caller must then report nothing, because it has
+// no better answer than the downloader's.
+func Progress() (SyncProgress, bool) {
+	h := currentHandler.Load()
+	if h == nil || h.syncer == nil {
+		return SyncProgress{}, false
+	}
+	return h.syncer.progress(), true
+}
+
+// progress takes a consistent-enough snapshot of the syncer's bookkeeping.
+//
+// Current is read from the chain rather than remembered, so it advances during a
+// single long catch-up even though nothing in this struct is updated per batch.
+// Highest is floored at Current so a target left over from a peer that turned out
+// to be behind - or from a reorg - cannot report a gap that does not exist.
+func (s *chainSyncer) progress() SyncProgress {
+	current := s.localHeight()
+	highest := s.target.Load()
+	if highest < current {
+		highest = current
+	}
+	start := s.start.Load()
+	if start > current {
+		start = 0
+	}
+	return SyncProgress{Current: current, Highest: highest, Start: start}
 }
 
 // syncLoopInterval is how often the syncer retries when idle.

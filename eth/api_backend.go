@@ -40,6 +40,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/eth/downloader"
 	"github.com/ethereum/go-ethereum/eth/gasprice"
+	"github.com/ethereum/go-ethereum/eth/protocols/eth64"
 	"github.com/ethereum/go-ethereum/eth/tracers"
 	"github.com/ethereum/go-ethereum/ethdb"
 	"github.com/ethereum/go-ethereum/event"
@@ -448,6 +449,41 @@ func (b *EthAPIBackend) SyncProgress(ctx context.Context) ethereum.SyncProgress 
 	if err == nil {
 		prog.StateIndexRemaining = stateRemain
 		prog.TrienodeIndexRemaining = trienodeRemain
+	}
+	p, ok := eth64.Progress()
+	return mergeEth64Progress(prog, p, ok)
+}
+
+// mergeEth64Progress folds the eth/64 syncer's target into the downloader's
+// progress report.
+//
+// The downloader above is blind to this chain: it only syncs the protocols it
+// registers peers for (eth/68, eth/70), and the pgp network speaks eth/64, which
+// is driven by its own package. So its HighestBlock stays 0, SyncProgress.Done
+// compares 0 against the real head and answers "finished", and eth_syncing
+// returns false while the node is importing millions of blocks. Reporting the
+// eth/64 target instead is the only honest answer available.
+//
+// It never lowers HighestBlock: the two sources describe separate peer sets, and
+// whichever is further ahead is the one worth reporting. When no eth/64 protocol
+// is running (ok == false, i.e. a BSC/Chapel/Rialto node) the report is left
+// untouched so those chains behave exactly as before.
+func mergeEth64Progress(prog ethereum.SyncProgress, p eth64.SyncProgress, ok bool) ethereum.SyncProgress {
+	if !ok {
+		return prog
+	}
+	if p.Highest > prog.HighestBlock {
+		prog.HighestBlock = p.Highest
+		if prog.StartingBlock == 0 || prog.StartingBlock > p.Current {
+			// Start is 0 when the target was learned without a catch-up being
+			// recorded. Falling back to the current head keeps the reported
+			// three-tuple ordered instead of claiming a sync that began at 0.
+			start := p.Start
+			if start == 0 {
+				start = p.Current
+			}
+			prog.StartingBlock = start
+		}
 	}
 	return prog
 }

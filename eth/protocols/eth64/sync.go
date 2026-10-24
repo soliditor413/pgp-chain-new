@@ -63,6 +63,21 @@ type chainSyncer struct {
 	// retried anyway; see refusedRetryCooldown. Reset clears both.
 	blocked atomic.Bool
 	retryAt atomic.Int64 // unix nanoseconds; 0 means "no scheduled retry"
+
+	// target is the block number of the head the remote peer announced, i.e.
+	// the tip we are downloading towards. 0 means "never learned it".
+	//
+	// It exists only so eth_syncing can report a truthful highestBlock. The
+	// built-in downloader cannot supply one: the pgp peers speak eth/64, which
+	// that downloader never sees, so its own target stays 0 and SyncProgress.Done
+	// answers true while blocks are still being imported. See Progress.
+	target atomic.Uint64
+
+	// start is the local head height at which the current catch-up began, so
+	// eth_syncing can report a startingBlock and a caller can compute a real
+	// percentage. 0 means "not catching up" (either caught up or never started),
+	// which is also the only case where target is not ahead of the chain.
+	start atomic.Uint64
 }
 
 // newChainSyncer creates a syncer for the given handler.
@@ -120,7 +135,22 @@ func (s *chainSyncer) syncToHead(peer *Peer) {
 
 	peerHead, _ := peer.Head()
 	if peerHead == localHead.Hash() {
+		s.catchUpFinished(localHead.Number.Uint64())
 		return
+	}
+	// Learn how far away the tip actually is before pulling anything. One header
+	// by hash, once per sync attempt - not per batch - which is what makes an
+	// honest eth_syncing affordable here: eth/64's Status carries a head hash and
+	// a total difficulty but no height, so this request is the only way to get the
+	// number.
+	if height, ok := s.probeHeadHeight(peer, peerHead); ok {
+		s.target.Store(height)
+		if height > localHead.Number.Uint64() {
+			// Keep the first height we were behind at, so the reported
+			// startingBlock stays the start of this catch-up instead of drifting
+			// forward with every attempt.
+			s.start.CompareAndSwap(0, localHead.Number.Uint64())
+		}
 	}
 	ancestor, err := s.findAncestor(peer, localHead.Number.Uint64())
 	if err != nil {
@@ -147,6 +177,7 @@ func (s *chainSyncer) syncToHead(peer *Peer) {
 			return
 		}
 		if len(headers) == 0 {
+			s.catchUpFinished(s.localHeight())
 			return // caught up
 		}
 		// The batch must continue our canonical chain, otherwise re-anchor.
@@ -256,10 +287,66 @@ func (s *chainSyncer) syncToHead(peer *Peer) {
 		}
 		if len(headers) < maxHeaderFetch {
 			peer.Log().Info("eth/64 sync caught up with peer", "head", lastImported.Number, "hash", lastImported.Hash())
+			s.catchUpFinished(lastImported.Number.Uint64())
 			return
 		}
 	}
 	peer.Log().Warn("eth/64 sync round limit reached", "rounds", maxSyncRounds)
+}
+
+// catchUpFinished records that there is nothing left to download at head.
+//
+// Setting target to the local height (rather than leaving the peer's announced
+// tip in place) is what makes eth_syncing turn itself off: Progress reports
+// highest == current, the caller's Done() comparison sees no gap, and the node
+// stops claiming to be syncing without anyone having to reset a flag.
+func (s *chainSyncer) catchUpFinished(head uint64) {
+	s.target.Store(head)
+	s.start.Store(0)
+}
+
+// localHeight is our current chain head, or 0 if the chain cannot be read.
+func (s *chainSyncer) localHeight() uint64 {
+	if head := s.h.backend.Chain().CurrentBlock(); head != nil {
+		return head.Number.Uint64()
+	}
+	return 0
+}
+
+// probeHeadHeight asks the peer for the header it announced as its head and
+// returns that header's block number.
+//
+// WHY A REQUEST AND NOT A FIELD. eth/64's Status packet carries
+// {ProtocolVersion, NetworkID, TD, Head, Genesis, ForkID} - the block number was
+// dropped from the handshake back at eth/63 in favour of the total difficulty.
+// The peer set therefore knows a head hash and a TD, and there is no arithmetic
+// on TD that yields a trustworthy height (difficulty varies across the chain), so
+// the number has to be asked for. Requesting the announced hash is the cheapest
+// way: the peer either has that header or it does not, and the answer is one
+// header.
+//
+// The reply must match the hash we asked for. servePeer in the tests answers any
+// GetBlockHeaders by treating Origin.Number as the start, so a by-hash request
+// comes back carrying genesis; without this check the syncer would conclude the
+// peer is at height 0 and report a negative gap.
+//
+// A failure is not fatal: the caller keeps whatever target it had, and reporting
+// falls back to what it can prove. It is also not retried within the attempt -
+// syncToHead probes once per call, and one call walks up to maxSyncRounds
+// batches, so a peer that does not answer this costs one round trip per attempt.
+func (s *chainSyncer) probeHeadHeight(peer *Peer, head common.Hash) (uint64, bool) {
+	headerReqMeter.Mark(1)
+	if err := peer.RequestHeadersByHash(head, 1, 0, false); err != nil {
+		return 0, false
+	}
+	headers, err := peer.WaitHeaders(responseTimeout)
+	if err != nil || len(headers) == 0 {
+		return 0, false
+	}
+	if headers[0].Hash() != head {
+		return 0, false
+	}
+	return headers[0].Number.Uint64(), true
 }
 
 // errLegacyExecutionNotAligned is reported when consensus/pgp signals that the
