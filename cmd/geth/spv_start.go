@@ -1,7 +1,6 @@
 package main
 
 import (
-	"math"
 	"path/filepath"
 	"sync"
 
@@ -108,20 +107,32 @@ func startSpv(stack *node.Node, backend ethapi.Backend) {
 	spv.SpvDbInit(dir, "", [20]byte{}, nil)
 
 	// dynamicArbiterHeight is the ELA height from which the listener starts
-	// maintaining the next-turn DPOS arbiter set. That bookkeeping feeds the ELA
-	// dpos p2p / broadcast layer, which is a write path for a chain we only read
-	// and is not ported, so it is disabled by passing a height nothing reaches.
+	// maintaining the next-turn DPOS arbiter set. pgp-chain takes it from the
+	// chain config, which SetEthConfig filled in from --spv.arbiter.height
+	// (cmd/pgp/main.go:456-463); the mainnet value is 2075778.
 	//
-	// This does NOT disable the arbiters precompile at 0x3e8: that path calls
-	// SpvService.GetArbiters(height) directly and reads the arbiters database the
-	// sync manager fills in, so it keeps working.
+	// This used to be math.MaxUint64, i.e. "never", on the theory that the
+	// next-turn bookkeeping only feeds the ELA dpos p2p / broadcast write path
+	// and could therefore be skipped. That reasoning was wrong in one respect
+	// worth recording: the same gate also guards the POW->DPOS transition in
+	// onBlockHandled, so with MaxUint64 the listener reported
+	// "l.dynamicArbiterHeight = 18446744073709551615" on every live block and
+	// could never reach the code below it. The value is a mainnet constant, so
+	// it belongs in the chain config next to the fee split and the pass
+	// balance, not in the start-up path.
+	dynamicArbiterHeight := bc.Config().DynamicArbiterHeight()
+
 	svc, err := spv.NewService(&spv.Config{
 		DataDir:        dir,
 		GenesisAddress: depositAddress,
-	}, new(event.TypeMux), math.MaxUint64)
+	}, new(event.TypeMux), dynamicArbiterHeight)
 	if err != nil {
 		utils.Fatalf("SPV service init error: %v", err)
 	}
+
+	log.Info("Starting the ELA SPV listener",
+		"dynamicArbiterHeight", dynamicArbiterHeight,
+		"note", "next-turn DPOS bookkeeping starts at this ELA height")
 
 	spvHolder.set(svc)
 	svc.Start()

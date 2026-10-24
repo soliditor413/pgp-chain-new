@@ -65,6 +65,27 @@ type LegacyConfig struct {
 	// SPVDataDir points at the ELA SPV database that backs the legacy
 	// precompiled contracts (arbiters, main chain headers, cross chain data).
 	SPVDataDir string `json:"spvDataDir,omitempty"`
+
+	// DynamicArbiterHeight is the ELA main chain height from which the SPV
+	// listener stops treating the chain as proof-of-work and starts
+	// maintaining the next-turn DPOS producer set, i.e. the height from which a
+	// pgp node pre-connects to the arbiters that will produce under PBFT.
+	//
+	// pgp-chain does not keep this as a source constant either: it is the
+	// default of the --spv.arbiter.height flag
+	// (pgp-chain/cmd/utils/flags.go:808-812, mainnet 2075778, testnet 1496588
+	// applied at :1652-1654), which SetEthConfig stores on the chain config
+	// (pgp-chain/eth/backend.go:227-229) and cmd/pgp/main.go:456-463 reads back
+	// out of it before starting the SPV service.
+	//
+	// Scope: listener bookkeeping only. Nothing on the block execution path
+	// reads this value, so a wrong value cannot change a state root — it can
+	// only change whether the listener ever reports a consensus mode switch.
+	// That is exactly why leaving it at math.MaxUint64, as this port did while
+	// the listener was half-written, failed silently instead of loudly:
+	// InitNextTurnDposInfo returned early forever and the "turn to Dpos mode"
+	// transition could never fire.
+	DynamicArbiterHeight uint64 `json:"dynamicArbiterHeight,omitempty"`
 }
 
 // DefaultGasFeeRecipientRatio is the fee split used by pgp-chain mainnet since
@@ -81,6 +102,17 @@ var (
 	// flag (pgp-chain cmd/utils/flags.go:772-776), and that default is what the
 	// mainnet nodes run with.
 	DefaultPassBalance = uint64(1000000000000000000) // 1e18
+
+	// DefaultDynamicArbiterHeight is the mainnet value of pgp-chain's
+	// --spv.arbiter.height flag (pgp-chain cmd/utils/flags.go:808-812).
+	DefaultDynamicArbiterHeight = uint64(2075778)
+
+	// DefaultTestnetDynamicArbiterHeight is the value SetEthConfig substitutes
+	// for the testnet when the flag is not set explicitly
+	// (pgp-chain cmd/utils/flags.go:1652-1654). It is kept as documentation and
+	// for a future legacy testnet config; nothing in this tree uses it yet,
+	// because the only legacy chain here is mainnet.
+	DefaultTestnetDynamicArbiterHeight = uint64(1496588)
 
 	// PGPGenesisHash is the hash of the pgp-chain mainnet genesis block.
 	PGPGenesisHash = common.HexToHash("0xaab1ef4455d93b45f440a8aaed032f2c38da03a06a0843d6f9b059dbfdd2a5b5")
@@ -118,6 +150,7 @@ var (
 			GasFeeRecipient:      DefaultGasFeeRecipient,
 			GasFeeRecipientRatio: DefaultGasFeeRecipientRatio,
 			PassBalance:          DefaultPassBalance,
+			DynamicArbiterHeight: DefaultDynamicArbiterHeight,
 		},
 	}
 )
@@ -160,6 +193,27 @@ func (c *ChainConfig) PassBalance() uint64 {
 		return 0
 	}
 	return c.Legacy.PassBalance
+}
+
+// DynamicArbiterHeight returns the ELA height from which the SPV listener
+// maintains the next-turn DPOS producer set. It is the value the node hands to
+// spv.NewService.
+//
+// A zero in the chain config means "not configured", not "zero". Two ways to get
+// there: a datadir whose stored chain config was written by a build that predates
+// the field (core.SetupGenesisBlockWithOverride returns the *stored* config, so
+// the JSON on disk wins over the literal in this file), and a genesis built by
+// hand without a Legacy block. Zero is not a usable value — it would turn the
+// bookkeeping on at ELA height 0, which no real pgp node ever did — so it falls
+// back to the mainnet flag default instead.
+func (c *ChainConfig) DynamicArbiterHeight() uint64 {
+	if c == nil || c.Legacy == nil {
+		return 0
+	}
+	if c.Legacy.DynamicArbiterHeight == 0 {
+		return DefaultDynamicArbiterHeight
+	}
+	return c.Legacy.DynamicArbiterHeight
 }
 
 // ELA Minter (0x…64) entry points that the legacy state transition treats

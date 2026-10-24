@@ -165,6 +165,21 @@ var (
 		Usage:    "PGP mainnet",
 		Category: flags.EthCategory,
 	}
+	// SpvArbiterHeightFlag is pgp-chain's --spv.arbiter.height
+	// (pgp-chain/cmd/utils/flags.go:808-812). It is the ELA main chain height
+	// from which the SPV listener stops treating the chain as proof-of-work and
+	// starts maintaining the next-turn DPOS producer set, i.e. from which the
+	// node pre-connects to the arbiters that will produce under PBFT.
+	//
+	// It only reaches the listener: nothing on the block execution path reads
+	// it, so this flag cannot change a state root. See
+	// params.ChainConfig.DynamicArbiterHeight for where the value ends up.
+	SpvArbiterHeightFlag = &cli.Uint64Flag{
+		Name:     "spv.arbiter.height",
+		Usage:    "ELA main chain height from which the SPV listener pre-connects to switch to PBFT consensus",
+		Value:    params.DefaultDynamicArbiterHeight,
+		Category: flags.EthCategory,
+	}
 	ChapelFlag = &cli.BoolFlag{
 		Name:     "chapel",
 		Usage:    "Chapel network: pre-configured Proof-of-Stake-Authority BSC test network",
@@ -1402,7 +1417,10 @@ var (
 		ChapelFlag,
 	}
 	// NetworkFlags is the flag group of all built-in supported networks.
-	NetworkFlags = append([]cli.Flag{BSCMainnetFlag}, TestnetFlags...)
+	//
+	// SpvArbiterHeightFlag travels with them because it is a property of the
+	// legacy pgp chain that the network preset selects, not of the node.
+	NetworkFlags = append([]cli.Flag{BSCMainnetFlag, SpvArbiterHeightFlag}, TestnetFlags...)
 
 	// DatabaseFlags is the flag group of all database flags.
 	DatabaseFlags = []cli.Flag{
@@ -2398,12 +2416,28 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 			cfg.NetworkId = params.PGPChainConfig.ChainID.Uint64()
 		}
 		cfg.Genesis = core.DefaultPGPGenesisBlock()
+		// The genesis carries params.PGPChainConfig itself, so this write lands
+		// on the config NewBlockChain is about to persist. Doing it here rather
+		// than after start-up is the same ordering pgp-chain uses
+		// (pgp-chain/eth/backend.go:227-229 runs before SetupGenesisBlock), and
+		// it means a fresh datadir records the operator's value instead of
+		// silently falling back to the literal in params.
+		//
+		// An existing datadir keeps whatever it recorded; params
+		// .ChainConfig.DynamicArbiterHeight covers the case where that is
+		// nothing at all.
+		if ctx.IsSet(SpvArbiterHeightFlag.Name) {
+			if legacy := cfg.Genesis.Config.Legacy; legacy != nil {
+				legacy.DynamicArbiterHeight = ctx.Uint64(SpvArbiterHeightFlag.Name)
+			}
+		}
 		// pgp-chain has no DNS discovery tree yet, so this is a no-op until one
 		// is added to params/dnsdisc. It is kept so that the mainnet preset
 		// behaves the same way as the other built-in networks.
 		SetDNSDiscoveryDefaults(cfg, params.PGPGenesisHash)
 		log.Info("Using pgp-chain mainnet preset",
-			"networkid", cfg.NetworkId, "genesis", cfg.Genesis.ToBlock().Hash())
+			"networkid", cfg.NetworkId, "genesis", cfg.Genesis.ToBlock().Hash(),
+			"spvArbiterHeight", cfg.Genesis.Config.DynamicArbiterHeight())
 	case ctx.Bool(ChapelFlag.Name) || cfg.NetworkId == 97:
 		if !ctx.IsSet(NetworkIdFlag.Name) {
 			cfg.NetworkId = 97

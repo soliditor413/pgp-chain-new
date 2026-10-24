@@ -92,3 +92,37 @@ func TestSetupGenesisRejectsPGPConfigOnForeignDatadir(t *testing.T) {
 		t.Fatalf("want the explicit wrong-datadir error, have %v", err)
 	}
 }
+
+// TestDynamicArbiterHeightCannotMoveTheGenesisHash is the guard for the way
+// --spv.arbiter.height is applied: SetEthConfig writes the flag value into
+// cfg.Genesis.Config.Legacy, and cfg.Genesis.Config is params.PGPChainConfig
+// itself, i.e. the very pointer the genesis block was built from.
+//
+// That is only safe because Genesis.ToBlock() does not read Config, and this
+// test pins it. If a future change ever folds part of the chain config into the
+// genesis header, every node started with a non-default flag value would fork
+// itself off the network at block zero, and the symptom would look like a bad
+// bootnode rather than a bad flag.
+func TestDynamicArbiterHeightCannotMoveTheGenesisHash(t *testing.T) {
+	g := DefaultPGPGenesisBlock()
+	before := g.ToBlock().Hash()
+
+	cfg := *params.PGPChainConfig
+	legacy := *cfg.Legacy
+	legacy.DynamicArbiterHeight = 1 // as far from the default as possible
+	cfg.Legacy = &legacy
+	g.Config = &cfg
+
+	if after := g.ToBlock().Hash(); after != before {
+		t.Fatalf("changing DynamicArbiterHeight moved the genesis hash: %x -> %x", before, after)
+	}
+	if before != params.PGPGenesisHash {
+		t.Fatalf("genesis hash mismatch: have %x, want %x", before, params.PGPGenesisHash)
+	}
+	if got := cfg.DynamicArbiterHeight(); got != 1 {
+		t.Fatalf("override did not take: DynamicArbiterHeight() = %d, want 1", got)
+	}
+	if got := params.PGPChainConfig.DynamicArbiterHeight(); got != params.DefaultDynamicArbiterHeight {
+		t.Fatalf("the global config was modified: have %d, want %d", got, params.DefaultDynamicArbiterHeight)
+	}
+}
