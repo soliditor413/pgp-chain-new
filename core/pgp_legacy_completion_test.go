@@ -4,17 +4,14 @@
 package core
 
 import (
-	"errors"
 	"math/big"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/types"
-	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
-	"github.com/holiman/uint256"
 )
 
 // TestBlockContextCarriesELAHeight pins the one job vm.BlockContext.Nonce has
@@ -180,57 +177,102 @@ func TestLegacyRechargeAlreadyCompleted(t *testing.T) {
 	})
 }
 
-// TestLegacyRechargeRejectedByStateTransition drives the rule through the real
-// entry point. The test above proves what the guard answers; this one proves
-// execute() actually asks it. Without this, the guard could be perfect and never
-// called, and a Recharge pgp-chain rejected would be accepted on replay - a bad
-// block, not a rejected transaction.
+// TestLegacyRechargeRejectedByStateTransition drives the rule through the entry
+// point that actually enforces it.
 //
-// Both directions are asserted. The reject case is the one whose failure mode
-// silently forks the node away from the chain; the accept case is the control -
-// without it a guard that rejected every Recharge would satisfy the first
-// assertion. The accept case does not need to succeed end to end (this fixture
-// is not a funded account, so the transition stops somewhere after the guard),
-// only to not stop *at* the guard.
+// It used to call ApplyMessage, because the guard lived in the state
+// transition and fired per transaction. It does not live there any more: the
+// verdict is taken once per block against the pre-block state (see
+// legacySettledRecharges), so the unit under test is that function. What the old
+// test protected is preserved: a settled hash is rejected, an unsettled one is
+// not.
+//
+// The three cases that follow are the ones a per-transaction check gets wrong,
+// and every one of them is a block that exists on the network.
 func TestLegacyRechargeRejectedByStateTransition(t *testing.T) {
-	settled := common.HexToHash("0x1111111111111111111111111111111111111111111111111111111111111111")
-	elaMinter := params.ELAMINTER
-
-	header := &types.Header{
-		Number:     big.NewInt(1923),
-		Difficulty: big.NewInt(params.MinimumDifficulty.Int64()),
-		Time:       1762224252,
-		BaseFee:    big.NewInt(0),
-		Nonce:      types.EncodeNonce(483920),
-	}
-	// Guard against a fixture that quietly drifts off the legacy rules: if it
-	// did, legacyGasRefund would be false and the test would "pass" by never
-	// reaching the rule.
-	if rules := params.PGPChainConfig.Rules(header.Number, false, header.Time); !rules.IsPGPLegacy {
-		t.Fatalf("fixture problem: block %d is not on the legacy rules", header.Number)
+	var (
+		settled   = common.HexToHash("0x1111111111111111111111111111111111111111111111111111111111111111")
+		elaMinter = params.ELAMINTER
+		blockNum  = big.NewInt(616157)
+	)
+	rechargeTx := func(h common.Hash) *types.Transaction {
+		return types.NewTx(&types.LegacyTx{To: &elaMinter, Data: rechargeCalldata(h)})
 	}
 
-	blockCtx := NewEVMBlockContext(header, nil, new(common.Address))
-	evm := vm.NewEVM(blockCtx, legacyGuardState(t, settled), params.PGPChainConfig, vm.Config{})
+	// A settled hash is rejected; an unsettled one is not. This is the rule
+	// pgp-chain enforced and the control that keeps a "reject everything" guard
+	// from passing.
+	t.Run("settled is rejected, unsettled is not", func(t *testing.T) {
+		settledRejects := legacySettledRecharges(params.PGPChainConfig, blockNum,
+			legacyGuardState(t, settled), types.Transactions{rechargeTx(settled)})
+		if len(settledRejects) != 1 || !settledRejects[0] {
+			t.Fatalf("a Recharge whose ELA side is already completed must be rejected, got %v", settledRejects)
+		}
+		unsettledRejects := legacySettledRecharges(params.PGPChainConfig, blockNum,
+			legacyGuardState(t), types.Transactions{rechargeTx(settled)})
+		if len(unsettledRejects) != 1 || unsettledRejects[0] {
+			t.Fatalf("a Recharge whose slot is empty must be allowed, got %v", unsettledRejects)
+		}
+	})
 
-	msg := &Message{
-		From:      common.HexToAddress("0x00000000000000000000000000000000000000aa"),
-		To:        &elaMinter,
-		Data:      rechargeCalldata(settled),
-		GasLimit:  1_000_000,
-		GasPrice:  uint256.NewInt(1),
-		GasFeeCap: uint256.NewInt(1),
-		GasTipCap: uint256.NewInt(0),
-		Value:     uint256.NewInt(0),
-	}
-	if _, err := ApplyMessage(evm, msg, nil); !errors.Is(err, errLegacyTxAlreadyCompleted) {
-		t.Fatalf("a settled Recharge must be rejected by the state transition, got err=%v", err)
-	}
+	// THE REGRESSION. Block 616157 of pgp mainnet carries a Recharge of a hash
+	// that the same block had already recharged. Judged per transaction, the
+	// second one looks settled and the block is declared invalid - which is
+	// exactly what happened before this test existed. Judged against the
+	// pre-block state, both are unsettled, both run, and the contract decides
+	// what the duplicate does.
+	t.Run("duplicate inside one block is not rejected", func(t *testing.T) {
+		got := legacySettledRecharges(params.PGPChainConfig, blockNum,
+			legacyGuardState(t), types.Transactions{rechargeTx(settled), rechargeTx(settled)})
+		if len(got) != 2 {
+			t.Fatalf("settled slice = %v, want two entries", got)
+		}
+		if got[0] || got[1] {
+			t.Fatalf("a hash that the block itself recharges twice was judged settled before the block: %v", got)
+		}
+	})
 
-	// Same call against a state where nothing is settled: whatever happens next,
-	// the completion rule must not be what stops it.
-	evm = vm.NewEVM(blockCtx, legacyGuardState(t), params.PGPChainConfig, vm.Config{})
-	if _, err := ApplyMessage(evm, msg, nil); errors.Is(err, errLegacyTxAlreadyCompleted) {
-		t.Fatalf("an unsettled Recharge must not be rejected by the completion rule, got err=%v", err)
-	}
+	// The other direction: a hash settled by an earlier block is still rejected,
+	// including when the block also recharges a fresh one. Without this, the fix
+	// above would have to be "stop checking", which accepts history pgp-chain
+	// refused.
+	t.Run("settled by an earlier block is still rejected", func(t *testing.T) {
+		fresh := common.HexToHash("0x3333333333333333333333333333333333333333333333333333333333333333")
+		got := legacySettledRecharges(params.PGPChainConfig, blockNum,
+			legacyGuardState(t, settled),
+			types.Transactions{rechargeTx(fresh), rechargeTx(settled)})
+		if len(got) != 2 || got[0] || !got[1] {
+			t.Fatalf("settled slice = %v, want [false true]", got)
+		}
+	})
+
+	// Non-Recharge transactions must not be flagged, whatever they call. A block
+	// with no Recharge at all takes the "nothing to do" path and allocates
+	// nothing; one that mixes a Recharge with a refundWithdraw of the same hash
+	// must flag only the Recharge.
+	t.Run("other transactions are not flagged", func(t *testing.T) {
+		refund := types.NewTx(&types.LegacyTx{To: &elaMinter, Data: refundWithdrawCalldata(settled)})
+		plain := types.NewTx(&types.LegacyTx{To: &elaMinter})
+		if got := legacySettledRecharges(params.PGPChainConfig, blockNum,
+			legacyGuardState(t, settled), types.Transactions{refund, plain}); got != nil {
+			t.Fatalf("a block with no Recharge produced %v, want nil", got)
+		}
+
+		got := legacySettledRecharges(params.PGPChainConfig, blockNum,
+			legacyGuardState(t, settled), types.Transactions{refund, rechargeTx(settled)})
+		if len(got) != 2 || got[0] || !got[1] {
+			t.Fatalf("settled slice = %v, want [false true] (refund not flagged, recharge flagged)", got)
+		}
+	})
+
+	// Outside the legacy range the rule does not exist, and a block with no
+	// Recharge at all must not allocate.
+	t.Run("outside the legacy rules", func(t *testing.T) {
+		if got := legacySettledRecharges(params.PGPChainConfig, big.NewInt(0), legacyGuardState(t, settled), nil); got != nil {
+			t.Fatalf("empty block produced %v, want nil", got)
+		}
+		if got := legacySettledRecharges(nil, blockNum, legacyGuardState(t, settled), types.Transactions{rechargeTx(settled)}); got != nil {
+			t.Fatalf("nil config produced %v, want nil", got)
+		}
+	})
 }

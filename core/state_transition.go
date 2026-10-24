@@ -595,14 +595,11 @@ func (st *stateTransition) execute() (result *ExecutionResult, err error) {
 			(params.IsPGPRechargeTx(msg.Data, msg.To) || params.IsPGPRefundWithdrawTx(msg.Data, msg.To))
 	)
 	if legacyGasRefund {
-		// pgp-chain refuses a Recharge whose ELA side is already settled
-		// (pgp-chain/core/state_transition.go:256-261). The answer is a slot in
-		// ELAMinter's own storage, so it is read from the state being executed
-		// rather than from anything outside the block - see
-		// legacyRechargeAlreadyCompleted.
-		if legacyRechargeAlreadyCompleted(st.state, msg.Data, msg.To) {
-			return nil, errLegacyTxAlreadyCompleted
-		}
+		// The "already settled" verdict is NOT taken here. It is taken once per
+		// block against the pre-block state by legacySettledRecharges, because
+		// pgp-chain's eth_call with nil options answered from the parent block,
+		// not from the state this block had built so far. See that function.
+		//
 		// The borrow has to happen before preCheck/buyGas, otherwise the sender
 		// cannot pay for the gas of the gateway call (it has nothing to spend).
 		st.passSnapshot = st.borrowPassBalance()
@@ -896,18 +893,66 @@ func (st *stateTransition) payLegacyFee(fee *uint256.Int, gasRefunded bool) {
 	st.state.AddBalance(st.evm.Context.Coinbase, fee, tracing.BalanceIncreaseRewardTransactionFee)
 }
 
+// legacySettledRecharges answers, for every transaction in the block, whether
+// pgp-chain would have rejected it as a Recharge whose ELA side was already
+// settled. The slice is indexed by transaction position; entries are false for
+// everything that is not a Recharge.
+//
+// WHY ONCE PER BLOCK AND NOT PER TRANSACTION. This is subtle and it cost a real
+// block (616157 on mainnet) to learn, so the reasoning is spelled out.
+//
+// pgp-chain asked its own ELAMinter contract over eth_call with nil call options
+// (pgp-chain/spv/elaminter.go:113-134), and nil means "latest". During an
+// ordered import the node's latest committed block is the PARENT of the block
+// being executed, because the head does not move until the block is written. So
+// every transaction in block N was judged against the state of block N-1 -
+// including transactions that come after another Recharge of the same ELA hash
+// inside block N.
+//
+// Reading the executing state instead (which this package used to do, per
+// transaction) is wrong in exactly that case: the first Recharge of hash H in
+// block N sets completed[H], so the second one is rejected and the whole block
+// is declared invalid - while the reference accepted both, let the contract
+// revert the duplicate, and moved on. A block that reuses an ELA hash is
+// therefore valid on the network and unimportable here.
+//
+// Evaluating every Recharge against the pre-block state reproduces the
+// reference exactly: a duplicate inside the block is not rejected, and a hash
+// completed by an earlier block still is.
+func legacySettledRecharges(config *params.ChainConfig, blockNumber *big.Int, statedb vm.StateDB, txs types.Transactions) []bool {
+	if config == nil || !config.IsPGPLegacy(blockNumber) || len(txs) == 0 {
+		return nil
+	}
+	// Only pay for the scan when the block can trip the rule at all. Legacy
+	// blocks carry few transactions, but they are also the ones a replay runs
+	// millions of times.
+	var any bool
+	for _, tx := range txs {
+		if params.IsPGPRechargeTx(tx.Data(), tx.To()) {
+			any = true
+			break
+		}
+	}
+	if !any {
+		return nil
+	}
+	settled := make([]bool, len(txs))
+	for i, tx := range txs {
+		settled[i] = legacyRechargeAlreadyCompleted(statedb, tx.Data(), tx.To())
+	}
+	return settled
+}
+
 // legacyRechargeAlreadyCompleted reports whether the ELA Minter contract at
 // params.ELAMINTER has already settled the ELA transaction named by a Recharge
 // call, in which case the transaction has to be rejected with
 // errLegacyTxAlreadyCompleted (pgp-chain/core/state_transition.go:256-261).
 //
 // The answer is a single storage slot, so it is read straight from the state
-// being executed. pgp-chain instead ABI-packed a completed(bytes32) call and
-// issued it to itself with nil call options (pgp-chain/spv/elaminter.go:113-134);
-// nil call options mean "latest state of the node", which is not something a
-// replay can reproduce. Reading the slot from state removes the whole problem:
-// the state at block N is the state at block N, whenever it is replayed, and no
-// ELA SPV database is involved.
+// rather than by ABI-packing a completed(bytes32) call and issuing it to itself
+// with nil call options the way pgp-chain did. The state to read it from is the
+// one the BLOCK started with - callers must be legacySettledRecharges, not a
+// per-transaction check - for the reason documented there.
 //
 // Only Recharge is checked. pgp-chain's IsCompletedByTxInput matches the Recharge
 // method id and answers "not completed" for every other method, refundWithdraw

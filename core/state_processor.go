@@ -115,6 +115,12 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 		defer spv.UninstallHeightView()
 	}
 
+	// Settle the "is this ELA transaction already completed?" question once, for
+	// the whole block, against the state the block started from. See
+	// legacySettledRecharges for why the answer must not be re-read per
+	// transaction.
+	legacySettled := legacySettledRecharges(config, blockNumber, statedb, block.Transactions())
+
 	// Mutate the block and state according to any hard-fork specs
 	if config.DAOForkSupport && config.DAOForkBlock != nil && config.DAOForkBlock.Cmp(block.Number()) == 0 {
 		misc.ApplyDAOHardFork(tracingStateDB)
@@ -186,6 +192,15 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 		if err != nil {
 			bloomProcessors.Close()
 			return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), err)
+		}
+		// pgp-chain rejected a Recharge whose ELA side was already settled
+		// before block 30115 (pgp-chain/core/state_transition.go:256-261). The
+		// verdict is per block, not per transaction: see
+		// legacySettledRecharges, which returns a nil slice for every block that
+		// cannot trip the rule.
+		if i < len(legacySettled) && legacySettled[i] {
+			bloomProcessors.Close()
+			return nil, fmt.Errorf("could not apply tx %d [%v]: %w", i, tx.Hash().Hex(), errLegacyTxAlreadyCompleted)
 		}
 		laneType := lane.Classify(tx)
 		statedb.SetTxContext(tx.Hash(), i)
