@@ -25,6 +25,11 @@ const elaProgressInterval = 10000
 // between advancing blockNumber and recording the aux block. It is nil in
 // production.
 //
+// The hook must not call back into the listener — BlockHeight, StoreAuxBlock or
+// anything else that takes l.mu. l.mu is held at this point and sync.Mutex is
+// not reentrant, so such a callback is a hard deadlock whose symptom is a test
+// hanging until the 10 minute timeout rather than failing with a message.
+//
 // It exists because the torn (height, aux block) pair it guards against is only
 // reachable from a window two field writes wide, which the race detector finds
 // but a plain `go test ./spv/` does not: with the mutex removed,
