@@ -274,8 +274,12 @@ func (l *BlockListener) onBlockHandled(block interface{}) {
 	// The nil checks read a snapshot rather than testing the global directly,
 	// and InitNextTurnDposInfo is called outside any lock: it reads the same
 	// state through the same accessors and would self-deadlock if the lock were
-	// held here. Two concurrent passes both reaching InitNextTurnDposInfo is
-	// harmless — it is idempotent, isSameNexturnArbiters drops the second write.
+	// held here. Two concurrent passes both reaching InitNextTurnDposInfo are
+	// harmless because the work is idempotent — both compute the same producer
+	// set from GetNextArbiters and publish it. Do not rely on
+	// isSameNexturnArbiters to serialise them: both can pass that check before
+	// either publishes, so it drops the second write only when they happen to be
+	// ordered.
 	if nextTurnInfo() == nil {
 		InitNextTurnDposInfo()
 	} else if !isWorkingHeight {

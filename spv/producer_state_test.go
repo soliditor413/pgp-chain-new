@@ -93,6 +93,11 @@ func saveProducerState(t *testing.T) {
 // finish while the writer is parked; if someone drops the RLock it returns
 // immediately. The verdict does not depend on timing: with the lock the reader
 // blocks indefinitely, so waiting out a short window is always enough.
+//
+// DumpNextDposInfo is in the list but proves less than the others: its nil
+// branch publishes an empty set, so what blocks it here is the write lock, not a
+// read lock of its own. It stays because the non-nil path is worth covering, but
+// when it is the only entry point reported the read side may still be unlocked.
 func TestProducerStateReadersBlockOnAWriter(t *testing.T) {
 	saveProducerState(t)
 	captureLogs(t)

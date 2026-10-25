@@ -35,9 +35,15 @@ var (
 	// its fields after unlocking; the slices it points at are frozen at
 	// publication.
 	//
-	// Lock order: nothing here is held while calling into the block listener
-	// (BlockHeight takes l.mu) or into transactionDBMutex. Readers snapshot
-	// first and call out afterwards, which keeps producerStateMu a leaf lock.
+	// Lock order: producerStateMu is a leaf. Its four accessors only lock and
+	// read or write one pointer or one byte; the only thing any of them calls
+	// while the lock is held is testHookProducerStateWriteLocked, which is nil
+	// in production. Readers that need to call out snapshot first and call
+	// afterwards — SpvIsWorkingHeight releases the lock before BlockHeight,
+	// which takes BlockListener.mu — so the only lock edge in this package runs
+	// transactionDBMutex -> l.mu and there is no cycle. Anything added inside a
+	// critical section here has to preserve that; a call that takes l.mu (or
+	// producerStateMu again) turns this into a deadlock.
 	producerStateMu  sync.RWMutex
 	nextTurnDposInfo *NextTurnDPOSInfo
 	consensusMode    spv.ConsensusAlgorithm
