@@ -84,6 +84,16 @@ type LegacyConfig struct {
 	//
 	// The name deliberately does not end in "Block" or "Time"; see the warning
 	// on LegacyConfig.
+	//
+	// An empty list is a hard failure, not "no producers configured, so skip the
+	// check": every nonce-0 block becomes unverifiable and the sync stops. That
+	// cannot happen on pgp mainnet, because SetupGenesisBlockWithOverride
+	// resolves the genesis through chainConfigOrDefault, which returns
+	// PGPChainConfig itself once the genesis hash matches the built-in one, and
+	// then rewrites a differing stored config. It can happen on a custom genesis
+	// that reuses the legacy rules; such a chain must list its own producers
+	// rather than silently inheriting mainnet's, which is why there is no
+	// fallback to DefaultLegacyProducers anywhere.
 	Producers []string `json:"producers,omitempty"`
 
 	// SPVDataDir points at the ELA SPV database that backs the legacy
@@ -242,20 +252,6 @@ func (c *ChainConfig) PassBalance() uint64 {
 		return 0
 	}
 	return c.Legacy.PassBalance
-}
-
-// LegacyProducers returns the PBFT producer set used to verify the confirms of
-// legacy blocks whose header.Nonce is zero.
-//
-// A nil Legacy block, or an empty list inside it, falls back to the mainnet set.
-// The fallback is deliberate: an empty list is not "no producers", it is "this
-// config predates the field", and treating it as empty would make every nonce-0
-// block unverifiable instead of merely unconfigured.
-func (c *ChainConfig) LegacyProducers() []string {
-	if c == nil || c.Legacy == nil || len(c.Legacy.Producers) == 0 {
-		return DefaultLegacyProducers
-	}
-	return c.Legacy.Producers
 }
 
 // DynamicArbiterHeight returns the ELA height from which the SPV listener
