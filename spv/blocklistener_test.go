@@ -192,9 +192,15 @@ func TestNotifyBlockRunsTheCallbackOnlyAboveTheArbiterHeight(t *testing.T) {
 
 	// onBlockHandled reaches into the package-level SPV service once the
 	// arbiter height is reached, so both globals are parked for the duration.
-	previousService, previousInfo := SpvService, nextTurnDposInfo
-	SpvService, nextTurnDposInfo = nil, nil
-	t.Cleanup(func() { SpvService, nextTurnDposInfo = previousService, previousInfo })
+	// The producer state is behind producerStateMu now, so it is saved and
+	// restored through the accessors rather than by direct assignment.
+	previousService, previousInfo := SpvService, nextTurnInfo()
+	SpvService = nil
+	setNextTurnInfo(nil)
+	t.Cleanup(func() {
+		SpvService = previousService
+		setNextTurnInfo(previousInfo)
+	})
 
 	captureLogs(t)
 

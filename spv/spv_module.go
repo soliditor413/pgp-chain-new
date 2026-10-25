@@ -42,7 +42,9 @@ var (
 	// is the ELA height of the block being replayed, so both answers drifted with
 	// the node's head. RechargeStore.MarkFailedElaTx replaces them with a mark
 	// keyed by (ELA height, tx hash).
-	consensusMode spv.ConsensusAlgorithm
+	//
+	// consensusMode used to live here too; it moved to nextturn_dposinfo.go so it
+	// sits next to producerStateMu, the lock that guards it.
 
 	// PbftEngine is the legacy PBFT engine handle. pgp-chain declared it as
 	// consensus.IPbftEngine (pgp-chain/consensus/consensus.go:137); bsc has no

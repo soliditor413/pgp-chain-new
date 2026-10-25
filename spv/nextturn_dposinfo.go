@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"errors"
 	"sort"
+	"sync"
 
 	spv "github.com/elastos/Elastos.ELA.SPV/interface"
 	elacom "github.com/elastos/Elastos.ELA/common"
@@ -18,19 +19,91 @@ type NextTurnDPOSInfo struct {
 }
 
 var (
+	// producerStateMu guards nextTurnDposInfo and consensusMode below.
+	//
+	// Both are written by onBlockHandled / InitNextTurnDposInfo / IsNexturnBlock,
+	// which run on the Elastos SPV notification path. That path is not
+	// single-threaded: the peer code starts one block handler goroutine per peer
+	// (Elastos.ELA.SPV peer/peer.go, `go p.blockHandler()`), so two peers
+	// delivering blocks at once can run two of these concurrently. The same two
+	// variables are read by SpvIsWorkingHeight, GetWorkingHeight,
+	// MainChainIsPowMode and GetTotalProducersCount from those goroutines and,
+	// once the producer broadcast path is ported, from the peer set as well.
+	//
+	// nextTurnDposInfo is only ever published as a whole new struct and never
+	// mutated in place, so a reader may take the pointer under RLock and read
+	// its fields after unlocking; the slices it points at are frozen at
+	// publication.
+	//
+	// Lock order: nothing here is held while calling into the block listener
+	// (BlockHeight takes l.mu) or into transactionDBMutex. Readers snapshot
+	// first and call out afterwards, which keeps producerStateMu a leaf lock.
+	producerStateMu  sync.RWMutex
 	nextTurnDposInfo *NextTurnDPOSInfo
+	consensusMode    spv.ConsensusAlgorithm
 	zero             = common.Hex2Bytes("000000000000000000000000000000000000000000000000000000000000000000")
 )
+
+// testHookProducerStateWriteLocked is called by the writers of the state above
+// immediately after they take producerStateMu for writing. It is nil in
+// production.
+//
+// It exists so a test can park a writer inside the write lock and check that the
+// readers really do acquire the read lock: with the lock honoured they block,
+// without it they do not. A pure race-detector test cannot make that distinction
+// on a pointer and a byte, where the torn value is not observable.
+//
+// The hook must not touch anything that takes producerStateMu — a reader would
+// block forever, and the mutex is not reentrant — nor anything that takes
+// BlockListener.mu.
+var testHookProducerStateWriteLocked func()
+
+// nextTurnInfo returns the published producer set, or nil when none has been
+// published yet. The returned pointer is safe to read without the lock; see
+// producerStateMu.
+func nextTurnInfo() *NextTurnDPOSInfo {
+	producerStateMu.RLock()
+	defer producerStateMu.RUnlock()
+	return nextTurnDposInfo
+}
+
+// setNextTurnInfo publishes info as the current producer set.
+func setNextTurnInfo(info *NextTurnDPOSInfo) {
+	producerStateMu.Lock()
+	if hook := testHookProducerStateWriteLocked; hook != nil {
+		hook()
+	}
+	nextTurnDposInfo = info
+	producerStateMu.Unlock()
+}
+
+// currentConsensusMode returns the cached ELA consensus algorithm.
+func currentConsensusMode() spv.ConsensusAlgorithm {
+	producerStateMu.RLock()
+	defer producerStateMu.RUnlock()
+	return consensusMode
+}
+
+// setConsensusMode records the ELA consensus algorithm the listener last saw.
+func setConsensusMode(mode spv.ConsensusAlgorithm) {
+	producerStateMu.Lock()
+	if hook := testHookProducerStateWriteLocked; hook != nil {
+		hook()
+	}
+	consensusMode = mode
+	producerStateMu.Unlock()
+}
 
 const (
 	CURRENT_PRODUCERS = "current_producers"
 )
 
 func GetTotalProducersCount() int {
-	if nextTurnDposInfo == nil {
+	info := nextTurnInfo()
+	if info == nil {
 		return 0
 	}
-	count, err := SafeAdd(len(nextTurnDposInfo.CRPublicKeys), len(nextTurnDposInfo.DPOSPublicKeys))
+	count, err := SafeAdd(len(info.CRPublicKeys), len(info.DPOSPublicKeys))
 	if err != nil {
 		log.Error("SafeAdd error", "error", err)
 		return 0
@@ -44,14 +117,34 @@ func GetTotalProducersCount() int {
 // CONSENSUS-RISK: live-head read (BlockListener.BlockHeight()). It is only used
 // by the block listener's consensus mode switch, never by block execution.
 func SpvIsWorkingHeight() bool {
-	if nextTurnDposInfo != nil {
-		return SpvService.GetBlockListener().BlockHeight() > nextTurnDposInfo.WorkingHeight
+	info := nextTurnInfo()
+	if info == nil {
+		return false
 	}
-	return false
+	// The producer snapshot is taken above and released before this call, so
+	// producerStateMu is never held across BlockListener.mu.
+	return currentSpvBlockHeight() > info.WorkingHeight
+}
+
+// currentSpvBlockHeight reports the listener's live height, and 0 when the SPV
+// service has not been started.
+//
+// The nil guards are not decoration: SpvIsWorkingHeight reaches this with a
+// published producer set during start-up ordering, and pgp-chain dereferenced
+// SpvService unconditionally there.
+func currentSpvBlockHeight() uint32 {
+	if SpvService == nil {
+		return 0
+	}
+	listener := SpvService.GetBlockListener()
+	if listener == nil {
+		return 0
+	}
+	return listener.BlockHeight()
 }
 
 func MainChainIsPowMode() bool {
-	return consensusMode == spv.POW
+	return currentConsensusMode() == spv.POW
 }
 
 func GetCRCPublicKeys(elaHeight uint64) [][]byte {
@@ -153,8 +246,8 @@ func GetSpvHeight() uint64 {
 }
 
 func GetWorkingHeight() uint32 {
-	if nextTurnDposInfo != nil {
-		return nextTurnDposInfo.WorkingHeight
+	if info := nextTurnInfo(); info != nil {
+		return info.WorkingHeight
 	}
 	return 0
 }

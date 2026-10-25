@@ -271,7 +271,12 @@ func (l *BlockListener) handleFunc() func(block interface{}) error {
 func (l *BlockListener) onBlockHandled(block interface{}) {
 	isWorkingHeight := SpvIsWorkingHeight()
 	isNexturnBlock := IsNexturnBlock(block)
-	if nextTurnDposInfo == nil {
+	// The nil checks read a snapshot rather than testing the global directly,
+	// and InitNextTurnDposInfo is called outside any lock: it reads the same
+	// state through the same accessors and would self-deadlock if the lock were
+	// held here. Two concurrent passes both reaching InitNextTurnDposInfo is
+	// harmless — it is idempotent, isSameNexturnArbiters drops the second write.
+	if nextTurnInfo() == nil {
 		InitNextTurnDposInfo()
 	} else if !isWorkingHeight {
 		if isNexturnBlock {
@@ -282,16 +287,17 @@ func (l *BlockListener) onBlockHandled(block interface{}) {
 	}
 	// TODO(spv-porter): pgp-chain notified dpos.ETNextProducers with
 	// DumpNextDposInfo() here (blocklistener.go:100).
-	if nextTurnDposInfo == nil {
+	if nextTurnInfo() == nil {
 		return
 	}
 	nowConsensus := GetCurrentConsensusMode()
-	if consensusMode == spv.POW && nowConsensus == spv.DPOS {
+	previousMode := currentConsensusMode()
+	if previousMode == spv.POW && nowConsensus == spv.DPOS {
 		log.Info("----------turn to Dpos mode------------")
 		// TODO(spv-porter): SpvService.mux.Post(events.InitCurrentProducers{})
 		InitNextTurnDposInfo()
 		// TODO(spv-porter): notify dpos_msg.ETESCStateChanged with ChainState_DPOS.
-	} else if consensusMode == spv.DPOS && nowConsensus == spv.POW {
+	} else if previousMode == spv.DPOS && nowConsensus == spv.POW {
 		log.Info("----------turn to POW mode------------")
 		// TODO(spv-porter): SpvService.mux.Post(events.InitCurrentProducers{})
 		InitNextTurnDposInfo()
@@ -301,8 +307,8 @@ func (l *BlockListener) onBlockHandled(block interface{}) {
 	if isWorkingHeight && nowConsensus != spv.POW {
 		// TODO(spv-porter): SpvService.mux.Post(events.InitCurrentProducers{})
 	}
-	consensusMode = nowConsensus
-	log.Info("current consensus mode", "mode", consensusMode, "isNexturnBlock", isNexturnBlock, "isWorkingHeight", isWorkingHeight)
+	setConsensusMode(nowConsensus)
+	log.Info("current consensus mode", "mode", currentConsensusMode(), "isNexturnBlock", isNexturnBlock, "isWorkingHeight", isWorkingHeight)
 }
 
 func IsNexturnBlock(block interface{}) bool {
@@ -339,13 +345,13 @@ func IsNexturnBlock(block interface{}) bool {
 		payloadData.CRPublicKeys = make([][]byte, 0)
 	}
 
-	nextTurnDposInfo = &NextTurnDPOSInfo{
+	setNextTurnInfo(&NextTurnDPOSInfo{
 		&payload.NextTurnDPOSInfo{
 			WorkingHeight:  payloadData.WorkingHeight,
 			CRPublicKeys:   payloadData.CRPublicKeys,
 			DPOSPublicKeys: payloadData.DPOSPublicKeys,
 		},
-	}
+	})
 
 	return true
 }
@@ -376,9 +382,10 @@ func InitNextTurnDposInfo() {
 		crcArbiters = make([][]byte, 0)
 	}
 
+	mode := currentConsensusMode()
 	if GetCurrentConsensusMode() == spv.POW && len(crcArbiters) == 0 && len(normalArbiters) == 0 {
-		log.Info("current consensus is pow and next turn is pow", "consensusMode", consensusMode)
-		if consensusMode == spv.DPOS {
+		log.Info("current consensus is pow and next turn is pow", "consensusMode", mode)
+		if mode == spv.DPOS {
 			DumpNextDposInfo()
 		}
 		return
@@ -387,38 +394,39 @@ func InitNextTurnDposInfo() {
 	if isSameNexturnArbiters(workingHeight, crcArbiters, normalArbiters) {
 		return
 	}
-	nextTurnDposInfo = &NextTurnDPOSInfo{
+	setNextTurnInfo(&NextTurnDPOSInfo{
 		&payload.NextTurnDPOSInfo{
 			WorkingHeight:  workingHeight,
 			CRPublicKeys:   crcArbiters,
 			DPOSPublicKeys: normalArbiters,
 		},
-	}
+	})
 
 	// TODO(spv-porter): pgp-chain notified dpos.ETNextProducers here.
 	DumpNextDposInfo()
 }
 
 func isSameNexturnArbiters(workingHeight uint32, crcArbiters, normalArbiters [][]byte) bool {
-	if nextTurnDposInfo == nil {
+	info := nextTurnInfo()
+	if info == nil {
 		return false
 	}
-	if nextTurnDposInfo.WorkingHeight != workingHeight {
+	if info.WorkingHeight != workingHeight {
 		return false
 	}
-	if len(crcArbiters) != len(nextTurnDposInfo.CRPublicKeys) {
+	if len(crcArbiters) != len(info.CRPublicKeys) {
 		return false
 	}
-	if len(normalArbiters) != len(nextTurnDposInfo.DPOSPublicKeys) {
+	if len(normalArbiters) != len(info.DPOSPublicKeys) {
 		return false
 	}
 	for index, v := range crcArbiters {
-		if !bytes.Equal(v, nextTurnDposInfo.CRPublicKeys[index][:]) {
+		if !bytes.Equal(v, info.CRPublicKeys[index][:]) {
 			return false
 		}
 	}
 	for index, v := range normalArbiters {
-		if !bytes.Equal(v, nextTurnDposInfo.DPOSPublicKeys[index][:]) {
+		if !bytes.Equal(v, info.DPOSPublicKeys[index][:]) {
 			return false
 		}
 	}
@@ -450,17 +458,21 @@ func DumpNextDposInfo() []peer.PID {
 	log.Info("-------------------dump next turn aribiters---------------")
 	log.Info("-------------------CRPublicKeys---------------")
 	peers := make([]peer.PID, 0)
-	if nextTurnDposInfo == nil {
-		nextTurnDposInfo = &NextTurnDPOSInfo{
+	info := nextTurnInfo()
+	if info == nil {
+		// Not a dump so much as an initialisation, which is what pgp-chain did
+		// here too: publishing an empty set keeps later nil checks from
+		// re-entering InitNextTurnDposInfo on every block.
+		setNextTurnInfo(&NextTurnDPOSInfo{
 			&payload.NextTurnDPOSInfo{
 				WorkingHeight:  0,
 				CRPublicKeys:   make([][]byte, 0),
 				DPOSPublicKeys: make([][]byte, 0),
 			},
-		}
+		})
 		return peers
 	}
-	for _, arbiter := range nextTurnDposInfo.CRPublicKeys {
+	for _, arbiter := range info.CRPublicKeys {
 		if len(arbiter) > 0 {
 			var pid peer.PID
 			copy(pid[:], arbiter)
@@ -469,7 +481,7 @@ func DumpNextDposInfo() []peer.PID {
 		log.Info(common.Bytes2Hex(arbiter) + "\n")
 	}
 	log.Info("-------------------DPOSPublicKeys---------------")
-	for _, arbiter := range nextTurnDposInfo.DPOSPublicKeys {
+	for _, arbiter := range info.DPOSPublicKeys {
 		if len(arbiter) > 0 {
 			var pid peer.PID
 			copy(pid[:], arbiter)
@@ -478,23 +490,24 @@ func DumpNextDposInfo() []peer.PID {
 		log.Info(common.Bytes2Hex(arbiter) + "\n")
 	}
 
-	log.Info("work height", "height", nextTurnDposInfo.WorkingHeight, "activeCount", len(peers), "count", GetTotalProducersCount())
+	log.Info("work height", "height", info.WorkingHeight, "activeCount", len(peers), "count", GetTotalProducersCount())
 	return peers
 }
 
 func GetNextTurnPeers() []peer.PID {
 	peers := make([]peer.PID, 0)
-	if nextTurnDposInfo == nil {
+	info := nextTurnInfo()
+	if info == nil {
 		return peers
 	}
-	for _, arbiter := range nextTurnDposInfo.CRPublicKeys {
+	for _, arbiter := range info.CRPublicKeys {
 		if len(arbiter) > 0 {
 			var pid peer.PID
 			copy(pid[:], arbiter)
 			peers = append(peers, pid)
 		}
 	}
-	for _, arbiter := range nextTurnDposInfo.DPOSPublicKeys {
+	for _, arbiter := range info.DPOSPublicKeys {
 		if len(arbiter) > 0 {
 			var pid peer.PID
 			copy(pid[:], arbiter)
