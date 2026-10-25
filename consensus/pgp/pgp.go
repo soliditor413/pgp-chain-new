@@ -19,14 +19,18 @@
 // pgp-chain before the switch to Parlia.
 //
 // The engine never produces blocks: all sealing related methods return an
-// explicit error instead of silently succeeding. It only validates headers, and
-// only the parts that can be validated without the ELA SPV database (see
-// params.LegacyConfig.VerifySeal and params.LegacyConfig.SPVDataDir).
+// explicit error instead of silently succeeding. It validates headers, and
+// verifies the PBFT confirm embedded in header.Extra when
+// params.LegacyConfig.VerifySeal is on. Blocks whose header.Nonce is zero are
+// verified against the fixed producer set in params.LegacyConfig.Producers and
+// need no ELA SPV database; blocks with a non-zero nonce need it to resolve the
+// arbiter set for that ELA height (see params.LegacyConfig.SPVDataDir).
 package pgp
 
 import (
 	"errors"
 	"fmt"
+	"math"
 	"math/big"
 	"time"
 
@@ -51,13 +55,6 @@ const (
 	// headers whose timestamp is slightly in the future.
 	allowedFutureBlockTime = 15 * time.Second
 
-	// legacyVanitySize and legacySealSize describe the legacy extraData layout:
-	// 32 byte vanity prefix, a variable length producer payload and a 65 byte
-	// seal. Only the combined minimum length can be enforced here, because the
-	// producer payload of the legacy chain is an ELA specific blob.
-	legacyVanitySize = 32
-	legacySealSize   = 65
-
 	// maxGasLimit is the largest gas limit a header may declare (2^63-1).
 	maxGasLimit = uint64(0x7fffffffffffffff)
 )
@@ -79,11 +76,20 @@ var (
 	errInvalidTimestamp  = errors.New("invalid timestamp")
 	errInvalidExtra      = errors.New("invalid extra data")
 
-	// ErrSealNotImplemented is returned when seal verification is requested but
-	// the ELA SPV database needed to check the PBFT confirm signature is not
-	// available. It is deliberately an error: a missing seal check must never
-	// look like a passing one.
-	ErrSealNotImplemented = errors.New("pgp: seal verification not implemented (ELA SPV required)")
+	// ErrInvalidConfirm is returned when the PBFT confirm in header.Extra does
+	// not prove what it has to prove: it is not bound to this header, its
+	// proposal or a vote signature does not verify, a signer is not a producer,
+	// or too few distinct producers accepted it.
+	ErrInvalidConfirm = errors.New("pgp: invalid PBFT confirm")
+
+	// errChainForkBlock is returned for a block at an already confirmed height
+	// whose confirm carries a smaller view offset than the canonical one, i.e. a
+	// fork attempt aiming at double finality at that height.
+	errChainForkBlock = errors.New("pgp: chain fork block")
+
+	// errDoubleSignBlock is returned when the same height and view offset are
+	// confirmed by two different blocks.
+	errDoubleSignBlock = errors.New("pgp: double sign block")
 
 	// errProductionNotSupported is returned by every block production entry
 	// point. The legacy chain is read-only for this client.
@@ -169,7 +175,8 @@ func SealHash(header *types.Header) common.Hash {
 		header.GasUsed,
 		header.Time,
 		// header.Extra is intentionally omitted: pgp-chain comments it out in
-		// encodeSigHeader, the seal lives in the last 65 bytes instead.
+		// encodeSigHeader. Extra carries the PBFT confirm, i.e. the signatures
+		// over this very hash, so including it would be circular.
 		header.MixDigest,
 		header.Nonce,
 	})
@@ -237,10 +244,12 @@ func (e *Engine) verifyHeader(chain consensus.ChainHeaderReader, header *types.H
 	if header.Difficulty == nil || header.Difficulty.Cmp(diffInTurn) != 0 {
 		return fmt.Errorf("%w: have %v, want %v", errInvalidDifficulty, header.Difficulty, diffInTurn)
 	}
-	// The legacy extraData is an ELA payload: 32 byte vanity, a variable length
-	// producer blob and a 65 byte seal. Only the minimum size can be enforced.
-	if len(header.Extra) < legacyVanitySize+legacySealSize {
-		return fmt.Errorf("%w: have %d bytes, want at least %d", errInvalidExtra, len(header.Extra), legacyVanitySize+legacySealSize)
+	// header.Extra is the serialized PBFT payload.Confirm, and nothing else: the
+	// 1199 bytes of a mainnet legacy header are one proposal plus eight votes in
+	// ELA's own encoding, with no vanity prefix to skip. Only the floor can be
+	// checked here; the structure is validated in decodeConfirm.
+	if len(header.Extra) < legacyConfirmMinLen {
+		return fmt.Errorf("%w: have %d bytes, want at least %d", errInvalidExtra, len(header.Extra), legacyConfirmMinLen)
 	}
 
 	number := header.Number.Uint64()
@@ -256,10 +265,77 @@ func (e *Engine) verifyHeader(chain consensus.ChainHeaderReader, header *types.H
 	if parent.Time+legacyBlockPeriod > header.Time {
 		return fmt.Errorf("%w: have %d, parent %d, period %d", errInvalidTimestamp, header.Time, parent.Time, legacyBlockPeriod)
 	}
-	// The PBFT confirm signature lives in the ELA SPV database, which this
-	// client does not carry yet. Never pretend the seal was checked.
+	// The PBFT confirm in Extra is what proves a real producer set agreed on this
+	// block. Verifying it is opt-in (params.LegacyConfig.VerifySeal) only because
+	// it costs an SPV lookup per header; the check itself is implemented.
 	if e.config.VerifySeal {
-		return ErrSealNotImplemented
+		return e.verifySeal(chain, header)
+	}
+	return nil
+}
+
+// verifySeal checks the PBFT confirm attached to a header
+// (pgp-chain/consensus/pbft/pbft.go:489-548).
+//
+// It is drivable from nothing but the header and its Extra, so it can be pointed
+// at recorded mainnet blocks without a running chain.
+func (e *Engine) verifySeal(chain consensus.ChainHeaderReader, header *types.Header) error {
+	number := header.Number.Uint64()
+	if number == 0 {
+		return errUnknownBlock
+	}
+	confirm, err := decodeConfirm(header.Extra)
+	if err != nil {
+		return err
+	}
+
+	// Bind the confirm to this exact block. Everything else in the confirm is
+	// portable: without this check, any confirm captured from the network can be
+	// pasted onto an arbitrary forged header, and the signatures would still
+	// verify because they only ever commit to the proposal.
+	//
+	// The comparison is a plain array conversion, no byte reversal: SealHash
+	// produces the hash in ELA's byte order already, verified against mainnet
+	// block 30115 whose proposal carries exactly these 32 bytes.
+	if want := SealHash(header); common.Hash(confirm.Proposal.BlockHash) != want {
+		return fmt.Errorf("%w: proposal commits to block %x, seal hash is %x",
+			ErrInvalidConfirm, common.Hash(confirm.Proposal.BlockHash), want)
+	}
+
+	if err := e.verifyConfirm(confirm, header.Nonce.Uint64()); err != nil {
+		return err
+	}
+
+	oldHeader := chain.GetHeaderByNumber(number)
+	if oldHeader == nil {
+		return nil
+	}
+	oldConfirm, err := decodeConfirm(oldHeader.Extra)
+	if err != nil {
+		// Soft failure, copied deliberately. Historical headers are not all
+		// confirms — the genesis-adjacent blocks in particular — and turning a
+		// parse error on one of them into a verification error would stop the
+		// sync dead on a block the network considers canonical.
+		return nil
+	}
+	// The `number < current.Number` half is not an optimisation. Without it, an
+	// ordinary view change at the tip (same height, smaller view offset) would
+	// make the node reject its own canonical block.
+	current := chain.CurrentHeader()
+	if confirm.Proposal.ViewOffset < oldConfirm.Proposal.ViewOffset &&
+		current != nil && number < current.Number.Uint64() {
+		return fmt.Errorf("%w: view offset %d, canonical block has %d at height %d",
+			errChainForkBlock, confirm.Proposal.ViewOffset, oldConfirm.Proposal.ViewOffset, number)
+	}
+	if confirm.Proposal.ViewOffset == oldConfirm.Proposal.ViewOffset && oldHeader.Hash() != header.Hash() {
+		// A nonce of MaxUint64 means "the ELA height was unknown when this block
+		// was sealed", so two such blocks can legitimately differ. Mainnet only
+		// ever carries 0, 2076195 and 2076267, so this branch does not fire on
+		// the real history; it exists to keep the sentinel meaning what it says.
+		if oldHeader.Nonce.Uint64() != math.MaxUint64 && header.Nonce.Uint64() != math.MaxUint64 {
+			return fmt.Errorf("%w: height %d, view offset %d, canonical block %s, this block %s",
+				errDoubleSignBlock, number, confirm.Proposal.ViewOffset, oldHeader.Hash(), header.Hash())
+		}
 	}
 	return nil
 }

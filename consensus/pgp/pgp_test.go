@@ -22,12 +22,23 @@ import (
 
 // testChain is a minimal consensus.ChainHeaderReader that only knows about the
 // genesis header, which is all the legacy verification needs.
+//
+// current and byNumber are optional and exist for the seal tests, which need to
+// pretend that a canonical block already exists at some height. A nil byNumber
+// keeps the behaviour every other test relies on: only genesis is known.
 type testChain struct {
-	genesis *types.Header
+	genesis  *types.Header
+	current  *types.Header
+	byNumber map[uint64]*types.Header
 }
 
-func (c *testChain) Config() *params.ChainConfig             { return params.PGPChainConfig }
-func (c *testChain) CurrentHeader() *types.Header            { return c.genesis }
+func (c *testChain) Config() *params.ChainConfig { return params.PGPChainConfig }
+func (c *testChain) CurrentHeader() *types.Header {
+	if c.current != nil {
+		return c.current
+	}
+	return c.genesis
+}
 func (c *testChain) GenesisHeader() *types.Header            { return c.genesis }
 func (c *testChain) GetHighestVerifiedHeader() *types.Header { return c.genesis }
 func (c *testChain) GetVerifiedBlockByHash(common.Hash) *types.Header {
@@ -40,6 +51,9 @@ func (c *testChain) GetHeader(hash common.Hash, number uint64) *types.Header {
 	return nil
 }
 func (c *testChain) GetHeaderByNumber(number uint64) *types.Header {
+	if h, ok := c.byNumber[number]; ok {
+		return h
+	}
 	if number == 0 {
 		return c.genesis
 	}
@@ -76,7 +90,10 @@ func newTestHeader(parent *types.Header) *types.Header {
 		GasLimit:    30_000_000,
 		GasUsed:     0,
 		Time:        parent.Time + 3,
-		Extra:       make([]byte, 32+65),
+		// header.Extra is a serialized PBFT confirm and nothing else, so it can
+		// never be shorter than an empty one. The bytes are not a valid confirm;
+		// only the length floor is exercised by the header-rule tests.
+		Extra: make([]byte, legacyConfirmMinLen),
 	}
 }
 
@@ -231,10 +248,15 @@ func TestVerifyHeaderRejects(t *testing.T) {
 		{"mixdigest", nil, func(h *types.Header) { h.MixDigest = common.HexToHash("0x01") }, errInvalidMixDigest},
 		{"uncle-hash", nil, func(h *types.Header) { h.UncleHash = common.HexToHash("0x01") }, errInvalidUncleHash},
 		{"gas-used", nil, func(h *types.Header) { h.GasUsed = h.GasLimit + 1 }, errInvalidGasUsed},
-		{"short-extra", nil, func(h *types.Header) { h.Extra = make([]byte, 32+64) }, errInvalidExtra},
+		{"short-extra", nil, func(h *types.Header) { h.Extra = make([]byte, legacyConfirmMinLen-1) }, errInvalidExtra},
 		{"period", nil, func(h *types.Header) { h.Time = genesis.Time + 2 }, errInvalidTimestamp},
 		{"future", nil, func(h *types.Header) { h.Time = uint64(^uint64(0) >> 1) }, consensus.ErrFutureBlock},
-		{"seal", &params.LegacyConfig{VerifySeal: true}, func(h *types.Header) {}, ErrSealNotImplemented},
+		// A structurally valid confirm that commits to a different block. This is
+		// the case the old "seal not implemented" entry stood for, and it is the
+		// header-binding rule specifically: decodeConfirm succeeds, every length
+		// is right, and the only thing wrong is the 32 byte BlockHash.
+		{"seal-confirm-for-another-block", &params.LegacyConfig{VerifySeal: true},
+			func(h *types.Header) { h.Extra = zeroConfirmExtra(common.HexToHash("0xdead")) }, ErrInvalidConfirm},
 	}
 	for _, c := range cases {
 		header := newTestHeader(genesis)

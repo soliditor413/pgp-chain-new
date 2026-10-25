@@ -62,6 +62,22 @@ type LegacyConfig struct {
 	// debugging, never for production.
 	VerifySeal bool `json:"verifySeal,omitempty"`
 
+	// Producers is the PBFT producer set that signed every legacy block whose
+	// header.Nonce is zero, as compressed (33 byte) P256 public keys in hex.
+	//
+	// It is the pgp-chain Pbft.Producers list (pgp-chain/params/config.go:87-100).
+	// Blocks 1..16404 of mainnet carry nonce 0, i.e. they were produced before
+	// the ELA main chain had a height to anchor to, so their confirm signatures
+	// have to be checked against this fixed list instead of the SPV arbiters.
+	//
+	// This is NOT spv.MainnetProducers (spv/nextturn_dposinfo.go): that is the
+	// next-turn DPoS arbiter list, twelve different keys. Mixing them up makes
+	// every nonce-0 block fail verification.
+	//
+	// The name deliberately does not end in "Block" or "Time"; see the warning
+	// on LegacyConfig.
+	Producers []string `json:"producers,omitempty"`
+
 	// SPVDataDir points at the ELA SPV database that backs the legacy
 	// precompiled contracts (arbiters, main chain headers, cross chain data).
 	SPVDataDir string `json:"spvDataDir,omitempty"`
@@ -114,6 +130,29 @@ var (
 	// because the only legacy chain here is mainnet.
 	DefaultTestnetDynamicArbiterHeight = uint64(1496588)
 
+	// DefaultLegacyProducers is the PBFT producer set of pgp-chain mainnet,
+	// copied verbatim and in order from pgp-chain/params/config.go:87-100
+	// (Pbft.Producers). Twelve compressed P256 public keys, so a confirm needs
+	// int(12*2/3) = 8 of them to pass.
+	//
+	// Not to be confused with spv.MainnetProducers, the twelve next-turn DPoS
+	// arbiters, whose first key is 03244cbf…. The two lists are disjoint; using
+	// the wrong one makes every nonce-0 block unverifiable.
+	DefaultLegacyProducers = []string{
+		"02a91b4ccc0204e2964719fe5035c06af1d5141968eb1e5117f74feee625eac4d5",
+		"024d54af50167af60148ff4b0f05db6722791a1f83f7afa835b550697afa939e03",
+		"02829bacc672b100921547c85ea9540cd1c1678f2225e6190adab9acdd0dad5809",
+		"034aac70edd1721813c12264deb0acc89f316b30cf96d2c0a4c4acd481e458dba3",
+		"0328b23ba4b9f76d5128e112fd330c26d335b5851caeb46cdba2802c1a6dbdfdb1",
+		"03cbca407a573e6ca5111e596e797114631eee9acfb8fcb88675186af1f64fbc2f",
+		"030dd6df8a118dd40d33dc58a97982a9a47b1b9336f7e20381518907e0817d8422",
+		"02941df229c032d90153ef73b486fbdec83ae08835b5c40f42626bf1d1575fe8b1",
+		"02e85e1bf846063773e9325b718acb8b117a00ddf09e4666dc15d7ca689292ee3a",
+		"02c731d08da8500fe116f9b3e6d97e50dba4e04784433ea41e24a13d652768a8ae",
+		"03cef969f3d4abdd1669f0ac7b8ff5985b21e5ed3aaaabaf552046f81de0e40358",
+		"03f66f89112812ef12649e51192083a3787843d92efea0cccbc4c349e3fd6d6eb3",
+	}
+
 	// PGPGenesisHash is the hash of the pgp-chain mainnet genesis block.
 	PGPGenesisHash = common.HexToHash("0xaab1ef4455d93b45f440a8aaed032f2c38da03a06a0843d6f9b059dbfdd2a5b5")
 
@@ -151,6 +190,7 @@ var (
 			GasFeeRecipientRatio: DefaultGasFeeRecipientRatio,
 			PassBalance:          DefaultPassBalance,
 			DynamicArbiterHeight: DefaultDynamicArbiterHeight,
+			Producers:            DefaultLegacyProducers,
 		},
 	}
 )
@@ -193,6 +233,20 @@ func (c *ChainConfig) PassBalance() uint64 {
 		return 0
 	}
 	return c.Legacy.PassBalance
+}
+
+// LegacyProducers returns the PBFT producer set used to verify the confirms of
+// legacy blocks whose header.Nonce is zero.
+//
+// A nil Legacy block, or an empty list inside it, falls back to the mainnet set.
+// The fallback is deliberate: an empty list is not "no producers", it is "this
+// config predates the field", and treating it as empty would make every nonce-0
+// block unverifiable instead of merely unconfigured.
+func (c *ChainConfig) LegacyProducers() []string {
+	if c == nil || c.Legacy == nil || len(c.Legacy.Producers) == 0 {
+		return DefaultLegacyProducers
+	}
+	return c.Legacy.Producers
 }
 
 // DynamicArbiterHeight returns the ELA height from which the SPV listener
