@@ -279,6 +279,26 @@ func TestVerifyHeaderAccepts(t *testing.T) {
 	}
 }
 
+// TestMainnetConfigVerifiesSeals is the guard on the decision to verify seals by
+// default.
+//
+// The whole port is worthless if the switch ships off, because nothing then looks
+// at the PBFT confirm of any block. A test that only exercised an explicit
+// LegacyConfig{VerifySeal: true} would keep passing if someone flipped the mainnet
+// default back, so this one asserts the shipped configuration itself.
+func TestMainnetConfigVerifiesSeals(t *testing.T) {
+	if params.PGPChainConfig.Legacy == nil {
+		t.Fatal("the mainnet config has no Legacy section, the legacy rules cannot apply")
+	}
+	engine := New(params.PGPChainConfig.Legacy)
+	if !engine.config.VerifySeal {
+		t.Fatal("mainnet runs with VerifySeal off: every legacy header would be accepted without its PBFT confirm being checked")
+	}
+	if len(engine.config.Producers) == 0 {
+		t.Fatal("mainnet configures no PBFT producers, so every block with header.Nonce == 0 is unverifiable")
+	}
+}
+
 // TestVerifyHeaderRulesWithoutHappyPath covers the remaining legacy rules that
 // have no case in TestVerifyHeaderRejects. Every one of them would silently let
 // an invalid block through if the check were dropped, so each needs its own

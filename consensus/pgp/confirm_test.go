@@ -12,6 +12,7 @@ import (
 	"errors"
 	"math"
 	"math/big"
+	"strings"
 	"testing"
 	"time"
 
@@ -22,6 +23,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/params"
+	"github.com/ethereum/go-ethereum/spv"
 )
 
 // testProducer is one PBFT producer: the raw private key ELA signs with and the
@@ -443,6 +445,57 @@ func TestVerifySealAccepts(t *testing.T) {
 	bindConfirm(t, short, producers, 0, 7)
 	if err := engine.VerifyHeader(chain, short); !errors.Is(err, ErrInvalidConfirm) {
 		t.Fatalf("a 7-of-12 confirm returned %v, want %v", err, ErrInvalidConfirm)
+	}
+}
+
+// TestVerifyConfirmFailsClosedWithoutSPV pins the gate in front of the arbiter
+// lookup.
+//
+// A block with header.Nonce != 0 needs the ELA arbiters of that height to check
+// its confirm. When the SPV service cannot answer, the header must be rejected
+// with ErrSealSPVBehind rather than accepted: an unverifiable seal that passes
+// is worse than a block that has to be retried, because nothing downstream ever
+// looks again.
+//
+// The test drives verifyConfirm directly instead of verifyHeader: the point is
+// the producer-set resolution, and going through a full header would make the
+// assertion depend on the header rules too.
+func TestVerifyConfirmFailsClosedWithoutSPV(t *testing.T) {
+	const elaHeight = 2_076_267
+
+	// Fixture precondition. A fresh test process has no SPV service, so
+	// GetSpvHeight reports 0; assert that instead of skipping, because a
+	// non-zero height here would mean some other test started the service and
+	// this one would then be testing nothing.
+	if got := spv.GetSpvHeight(); got >= elaHeight {
+		t.Fatalf("fixture problem: the SPV service reports height %d, this test needs it below %d", got, elaHeight)
+	}
+
+	producers := newTestProducers(t, 12)
+	hexKeys := make([]string, len(producers))
+	for i := range producers {
+		hexKeys[i] = common.Bytes2Hex(producers[i].pub)
+	}
+	confirm := buildConfirm(t, producers, common.HexToHash("0xdead"), 0, 8)
+	engine := New(&params.LegacyConfig{VerifySeal: true, Producers: hexKeys})
+
+	err := engine.verifyConfirm(confirm, elaHeight)
+	if !errors.Is(err, ErrSealSPVBehind) {
+		t.Fatalf("error = %v, want %v: an unresolvable producer set must fail closed", err, ErrSealSPVBehind)
+	}
+	// The height gate and the GetProducers failure carry the same sentinel, so
+	// the sentinel alone cannot tell them apart. Pin the gate's own wording:
+	// without it the error comes back as "spv is not start" instead, and a mutant
+	// that deletes the gate leaves every assertion above green.
+	if !strings.Contains(err.Error(), "SPV is at") {
+		t.Fatalf("error = %v, want the height gate to be what rejected this header", err)
+	}
+
+	// The same confirm with header.Nonce == 0 must be checkable with no SPV at
+	// all, otherwise the first 16404 blocks become unsyncable on a node whose ELA
+	// side is still catching up.
+	if err := engine.verifyConfirm(buildConfirm(t, producers, common.HexToHash("0xdead"), 0, 1), 0); !errors.Is(err, ErrInvalidConfirm) {
+		t.Fatalf("height 0 returned %v, want a confirm verdict (%v) rather than an SPV error", err, ErrInvalidConfirm)
 	}
 }
 

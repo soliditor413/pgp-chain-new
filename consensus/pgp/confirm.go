@@ -57,12 +57,25 @@ const (
 )
 
 var (
-	// ErrSealProducerSet reports that the producer set needed to check a PBFT
-	// confirm could not be resolved, as opposed to the confirm being forged.
-	// The two are separated because they call for different operational
-	// responses: this one means "the SPV side is behind or down", the other
-	// means "this peer is lying".
-	ErrSealProducerSet = errors.New("pgp: cannot resolve the PBFT producer set")
+	// ErrSealSPVBehind is returned when the ELA SPV service cannot supply the
+	// arbiters a legacy confirm needs. It is deliberately separate from
+	// ErrInvalidConfirm: the block may be perfectly valid, we simply cannot tell
+	// yet, and an operator reading the log must be able to distinguish "waiting
+	// for ELA" from "the block is forged".
+	//
+	// core.BlockChain reports every header verification failure through
+	// reportBadBlock, so a block hitting this error is logged as "BAD BLOCK" and
+	// written to the diagnostic bad block store. That does NOT poison it:
+	// badBlockRecords is write-only in this tree and ReadBadBlocks has no caller,
+	// so re-delivering the block once the SPV has caught up imports it normally.
+	ErrSealSPVBehind = errors.New("pgp: ELA SPV is behind the height the confirm needs")
+
+	// errSealProducerConfig reports a producer set that cannot be used at all
+	// because the configuration itself is wrong (not hex, not a public key).
+	// It is kept separate from ErrSealSPVBehind on purpose: an operator who sees
+	// "SPV is behind" goes and checks the ELA sync, and that is the wrong place
+	// to look when the real problem is a typo in the configured keys.
+	errSealProducerConfig = errors.New("pgp: the configured PBFT producer set is unusable")
 
 	errConfirmTooShort  = errors.New("pgp: confirm is shorter than a proposal")
 	errConfirmTruncated = errors.New("pgp: confirm is truncated")
@@ -235,10 +248,10 @@ func decodeProducers(hexKeys []string) ([][]byte, error) {
 		}
 		raw, err := hex.DecodeString(strings.TrimPrefix(strings.TrimPrefix(key, "0x"), "0X"))
 		if err != nil {
-			return nil, fmt.Errorf("%w: producer %d is not hex: %v", ErrSealProducerSet, i, err)
+			return nil, fmt.Errorf("%w: producer %d is not hex: %v", errSealProducerConfig, i, err)
 		}
 		if _, err := elaCrypto.DecodePoint(raw); err != nil {
-			return nil, fmt.Errorf("%w: producer %d is not a valid public key: %v", ErrSealProducerSet, i, err)
+			return nil, fmt.Errorf("%w: producer %d is not a valid public key: %v", errSealProducerConfig, i, err)
 		}
 		out = append(out, raw)
 	}
@@ -356,27 +369,44 @@ func checkConfirm(confirm *payload.Confirm, producers [][]byte, minSignCount int
 // the arbiter set contains vacant seats, and using the smaller number would
 // accept a confirm with too few signatures.
 //
-// Failures are returned, never swallowed. If the SPV service is not running,
-// GetProducers reports it and the header is rejected: not being able to check a
-// signature is not the same as the signature being valid.
+// Failures are returned, never swallowed. Not being able to check a signature is
+// not the same as the signature being valid, so every "I cannot tell yet" path
+// rejects the header with ErrSealSPVBehind instead of guessing.
 func (e *Engine) verifyConfirm(confirm *payload.Confirm, elaHeight uint64) error {
 	var (
 		producers    [][]byte
 		minSignCount int
 	)
 	if elaHeight == 0 {
+		// No SPV gate here, deliberately: this branch never reads the database,
+		// so blocks 1..16404 stay verifiable on a node with no ELA sync at all.
 		list, err := decodeProducers(e.config.Producers)
 		if err != nil {
 			return err
 		}
 		if len(list) == 0 {
-			return fmt.Errorf("%w: no configured producer set for elaHeight 0", ErrSealProducerSet)
+			return fmt.Errorf("%w: no configured producer set for elaHeight 0", errSealProducerConfig)
 		}
 		producers, minSignCount = list, legacyMajorityCount(len(list))
 	} else {
+		// The arbiters for an ELA height only exist once the SPV listener has
+		// applied blocks up to that height, and HeaderStore().GetBest() is never
+		// behind an applied block (headers are synced before bodies). So this
+		// gate can only reject a block we genuinely cannot verify yet - it never
+		// rejects one we could have verified.
+		//
+		// Rejecting is safe: the block is retried and imported normally once the
+		// SPV catches up. See ErrSealSPVBehind for why the BAD BLOCK log line it
+		// causes is diagnostic only.
+		if spvHeight := spv.GetSpvHeight(); spvHeight < elaHeight {
+			return fmt.Errorf("%w: need ELA height %d, SPV is at %d", ErrSealSPVBehind, elaHeight, spvHeight)
+		}
 		list, total, err := spv.GetProducers(elaHeight)
 		if err != nil {
-			return fmt.Errorf("%w: ela height %d: %v", ErrSealProducerSet, elaHeight, err)
+			// Same sentinel: the only realistic cause is SPV data that is not
+			// there yet. Failing closed is the point - a missing seal check must
+			// never look like a passing one.
+			return fmt.Errorf("%w: ela height %d: %v", ErrSealSPVBehind, elaHeight, err)
 		}
 		producers, minSignCount = list, legacyMajorityCount(total)
 	}

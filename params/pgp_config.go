@@ -58,8 +58,16 @@ type LegacyConfig struct {
 	PassBalance uint64 `json:"passBalance,omitempty"`
 
 	// VerifySeal enables PBFT confirm signature verification while replaying the
-	// legacy history. Disabling it only checks hash linkage and is meant for
-	// debugging, never for production.
+	// legacy history. It is ON for mainnet: verifying the blocks is the point,
+	// and an implementation that is only reachable by an operator flag verifies
+	// nothing in practice. Turning it off is a debugging measure, never a
+	// production setting, because it leaves every legacy header unauthenticated.
+	//
+	// The switch also applies to datadirs created before the field existed:
+	// SetupGenesisBlockWithOverride resolves the genesis through
+	// chainConfigOrDefault, which returns PGPChainConfig itself when the hash
+	// matches the built-in pgp genesis, so a stale JSON on disk cannot pin this
+	// back to false.
 	VerifySeal bool `json:"verifySeal,omitempty"`
 
 	// Producers is the PBFT producer set that signed every legacy block whose
@@ -191,6 +199,7 @@ var (
 			PassBalance:          DefaultPassBalance,
 			DynamicArbiterHeight: DefaultDynamicArbiterHeight,
 			Producers:            DefaultLegacyProducers,
+			VerifySeal:           true,
 		},
 	}
 )
