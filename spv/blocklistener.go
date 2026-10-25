@@ -21,6 +21,15 @@ import (
 // still advancing. See the log line for why it exists at all.
 const elaProgressInterval = 10000
 
+// elaUncommittedLogEvery rate limits the report for a block the SPV refused.
+//
+// The first one is always logged, because a single rejection is already the
+// whole diagnosis. After that the line repeats every elaUncommittedLogEvery
+// rejections: a stuck sync can produce one per attempted block indefinitely, and
+// an unbounded warning would bury every other log line at exactly the moment an
+// operator needs to read them.
+const elaUncommittedLogEvery = 1000
+
 // testHookBeforeAuxBlockStore is called inside NotifyBlock's critical section,
 // between advancing blockNumber and recording the aux block. It is nil in
 // production.
@@ -70,6 +79,12 @@ type BlockListener struct {
 	// installed by transactionListener actually matches something.
 	txsSeen           atomic.Uint64
 	crossChainTxsSeen atomic.Uint64
+
+	// uncommittedElaBlocks counts blocks the SPV refused but notified anyway.
+	// See reportUncommittedElaBlock; it is a counter rather than a flag because
+	// the count itself is the signal that the sync is not merely stalled but
+	// retrying something that will never be accepted.
+	uncommittedElaBlocks atomic.Uint64
 }
 
 func (l *BlockListener) GetDynamicArbiterHeight() uint64 {
@@ -121,7 +136,22 @@ func countCrossChainTxs(block *util.Block) uint64 {
 // block anchored on that ELA height will fail loudly with
 // ErrRechargeHeightNotCovered when it is executed, which is the behaviour we
 // want.
+//
+// A block at height zero is rejected outright, before anything above runs. The
+// sdk notifies for blocks it never committed, and ApplyElaBlock treats the height
+// on the block as authoritative, so accepting one would both index pre-reorg data
+// under height 0 and print a "sync progress" line that says the chain is at
+// height 0. See reportUncommittedElaBlock for the whole mechanism.
 func (l *BlockListener) NotifyBlock(block *util.Block, isCurrent bool) {
+	// This has to be the very first thing: the isCurrent branch below would
+	// record the height and log a misleading "BlockListener handle block", and
+	// the counters above would count transactions of a block that is not on the
+	// chain at all.
+	if block != nil && block.Height == 0 {
+		l.reportUncommittedElaBlock(block)
+		return
+	}
+
 	if block != nil {
 		txs := uint64(len(block.Transactions))
 		crossChainTxs := countCrossChainTxs(block)
@@ -216,6 +246,63 @@ func (l *BlockListener) NotifyBlock(block *util.Block, isCurrent bool) {
 
 	// pgp-chain also broadcast dpos.ETOnSPVHeight here (blocklistener.go:65).
 	// That event bus is not ported yet; see the TODO in onBlockHandled.
+}
+
+// reportUncommittedElaBlock handles a notification for a block the SPV never
+// committed, i.e. one that arrived with height zero.
+//
+// ELA's genesis block is written straight into the header store by blockchain.New
+// ($SPV/blockchain/blockchain.go:32-38) and never travels through CommitBlock, so
+// any block that reaches NotifyBlock through a successful commit has a height of
+// at least 1. Height zero therefore means one of CommitBlock's early returns
+// fired: an unknown previous block (orphan), a header that failed validation, or
+// a duplicate of the current tip.
+//
+// This is reachable at all because of an upstream coupling: the sdk calls
+// StateNotifier.BlockCommitted unconditionally after queueing the block, whether
+// or not the commit succeeded ($SPV/sdk/service.go:414-425), and CommitBlock only
+// assigns header.Height and header.TotalWork at the very end
+// ($SPV/blockchain/blockchain.go:95-96). Every early return leaves Height at
+// zero. The rejected-proof-of-work path is the nastiest of the three because
+// upstream logs it at Debug only (blockchain.go:135), so at a Warn level the
+// entire failure is silent — which is exactly what this function fixes.
+func (l *BlockListener) reportUncommittedElaBlock(block *util.Block) {
+	hash := elaBlockHash(block)
+
+	// A repeat of the tip is the benign case: the block is already in the header
+	// store, so the commit failed only because there was nothing left to do.
+	// Staying silent here keeps a healthy node's log clean.
+	if bestHash, ok := elaBestBlockHash(); ok && bestHash == hash {
+		return
+	}
+
+	// Everything else is a real failure: the SPV refused a block, so the ELA
+	// chain is not advancing. Log the first one immediately and then one per
+	// elaUncommittedLogEvery, with the cumulative count so a reader can tell a
+	// one-off from a stuck node.
+	if seen := l.uncommittedElaBlocks.Add(1); seen == 1 || seen%elaUncommittedLogEvery == 0 {
+		log.Warn("SPV reported an ELA block it never committed, so the ELA chain is not "+
+			"advancing; this is normally a header rejected during validation or an orphan block, "+
+			"and the upstream proof-of-work check in particular only logs at Debug, so raising "+
+			"--spv.ela.loglevel to debug is what makes it visible",
+			"elaHeight", block.Height, "blockHash", hash,
+			"spvHeight", GetSpvHeight(), "rejected", seen)
+	}
+}
+
+// elaBestBlockHash returns the hash of the SPV head, or false when there is no
+// head to compare against yet (the service is not up, or its header store is
+// empty).
+//
+// The nil checks are not defensive padding: GetHeaderBest returns an error rather
+// than a panic when the service has not started, and util.Header.Hash promotes
+// from an embedded interface that is nil until a header is deserialised.
+func elaBestBlockHash() (common.Hash, bool) {
+	best, err := GetHeaderBest()
+	if err != nil || best == nil || best.BlockHeader == nil {
+		return common.Hash{}, false
+	}
+	return common.BytesToHash(best.Hash().Bytes()), true
 }
 
 func (l *BlockListener) BlockHeight() uint32 {

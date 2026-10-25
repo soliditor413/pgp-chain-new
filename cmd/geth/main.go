@@ -200,6 +200,7 @@ var (
 		// utils.BeaconCheckpointFlag,
 		// utils.BeaconCheckpointFileFlag,
 		utils.LogSlowBlockFlag,
+		utils.SpvElaLogLevelFlag,
 	}, utils.NetworkFlags, utils.DatabaseFlags)
 
 	rpcFlags = []cli.Flag{
@@ -387,7 +388,7 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, isCon
 	// "spv: recharge store is not initialised" — a state that has nothing to do
 	// with the block, only with the race. The syncer's cooldown makes such a
 	// refusal recoverable, but not causing it is better.
-	startSpv(stack, backend)
+	startSpv(stack, backend, elaLogLevel(ctx))
 
 	// Start up the node itself
 	utils.StartNode(ctx, stack, isConsole)

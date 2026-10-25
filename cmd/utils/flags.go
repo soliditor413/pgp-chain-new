@@ -180,6 +180,24 @@ var (
 		Value:    params.DefaultDynamicArbiterHeight,
 		Category: flags.EthCategory,
 	}
+	// SpvElaLogLevelFlag controls how much the ELA SPV sub-packages log, which is
+	// where an ELA sync that is not advancing explains itself.
+	//
+	// The default is warn, the volume a healthy node wants; at that level the
+	// packages say nothing at all about a block they refuse. Raising it to info
+	// is the first debugging step: it surfaces the per-block trace and the
+	// "Headers X and Y don't link" style messages that separate an orphan from a
+	// rejected header. The proof-of-work rejection is the one case info does not
+	// cover, because upstream logs that at Debug only
+	// (Elastos.ELA.SPV/blockchain/blockchain.go:135) — see
+	// spv.BlockListener.reportUncommittedElaBlock for the summary line that does
+	// not depend on the upstream level.
+	SpvElaLogLevelFlag = &cli.StringFlag{
+		Name:     "spv.ela.loglevel",
+		Usage:    "Log level of the ELA SPV sub-packages: debug, info, warn or error",
+		Value:    "warn",
+		Category: flags.EthCategory,
+	}
 	ChapelFlag = &cli.BoolFlag{
 		Name:     "chapel",
 		Usage:    "Chapel network: pre-configured Proof-of-Stake-Authority BSC test network",

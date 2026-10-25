@@ -5,6 +5,7 @@ import (
 	"sync"
 
 	elalog "github.com/elastos/Elastos.ELA/utils/elalog"
+	"github.com/urfave/cli/v2"
 
 	"github.com/ethereum/go-ethereum/cmd/utils"
 	"github.com/ethereum/go-ethereum/event"
@@ -58,6 +59,22 @@ func (h *spvServiceHolder) set(svc *spv.Service) {
 	h.mu.Unlock()
 }
 
+// elaLogLevel parses --spv.ela.loglevel.
+//
+// A bad value is fatal rather than silently replaced by the default: this flag is
+// the one switch that makes the ELA library talk, and an operator who mistyped it
+// would otherwise sit in front of exactly the silent stall they were trying to
+// diagnose, believing they had turned the logging on.
+func elaLogLevel(ctx *cli.Context) elalog.Level {
+	raw := ctx.String(utils.SpvElaLogLevelFlag.Name)
+	level, ok := elalog.LevelFromString(raw)
+	if !ok {
+		utils.Fatalf("Invalid %s %q: want one of debug, info, warn, error",
+			utils.SpvElaLogLevelFlag.Name, raw)
+	}
+	return level
+}
+
 // startSpv starts the ELA main chain SPV service, which is where every piece of
 // ELA data used during execution comes from.
 //
@@ -80,7 +97,7 @@ func (h *spvServiceHolder) set(svc *spv.Service) {
 //
 // Only a pgp-chain has an ELA side to follow, so a node running any other chain
 // config skips this entirely.
-func startSpv(stack *node.Node, backend ethapi.Backend) {
+func startSpv(stack *node.Node, backend ethapi.Backend, elaLevel elalog.Level) {
 	bc := backend.Chain()
 	if bc == nil || !bc.Config().IsPGPLegacy(nil) {
 		return
@@ -101,9 +118,10 @@ func startSpv(stack *node.Node, backend ethapi.Backend) {
 	log.Info("Starting the ELA SPV service",
 		"dataDir", dir, "genesis", genesis.Hash(), "elaDepositAddress", depositAddress)
 
-	// The ELA sub-packages log nothing until a logger is attached, and attaching
-	// at Info would emit one line per main chain block; see spv.AttachElaLogs.
-	spv.AttachElaLogs(elalog.LevelWarn)
+	// The ELA sub-packages log nothing until a logger is attached, and the level
+	// is what decides whether a refused block explains itself; see
+	// spv.AttachElaLogs and --spv.ela.loglevel.
+	spv.AttachElaLogs(elaLevel)
 
 	spv.SpvDbInit(dir, "", [20]byte{}, nil)
 
