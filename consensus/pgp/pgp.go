@@ -266,8 +266,9 @@ func (e *Engine) verifyHeader(chain consensus.ChainHeaderReader, header *types.H
 		return fmt.Errorf("%w: have %d, parent %d, period %d", errInvalidTimestamp, header.Time, parent.Time, legacyBlockPeriod)
 	}
 	// The PBFT confirm in Extra is what proves a real producer set agreed on this
-	// block. Verifying it is opt-in (params.LegacyConfig.VerifySeal) only because
-	// it costs an SPV lookup per header; the check itself is implemented.
+	// block. params.PGPChainConfig turns the check on, so mainnet runs it; the
+	// switch exists for chains that reuse these rules with a different producer
+	// set, and to make the cost measurable by turning it off in a build.
 	if e.config.VerifySeal {
 		return e.verifySeal(chain, header)
 	}
