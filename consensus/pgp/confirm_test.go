@@ -265,25 +265,72 @@ func TestDecodeConfirmRejectsTrailingBytes(t *testing.T) {
 // Without it, the same confirm has several legal encodings and therefore several
 // different header hashes.
 func TestDecodeConfirmRejectsNonCanonicalLength(t *testing.T) {
-	// A 33 byte sponsor written with the 0xfd discriminant, which is only legal
-	// for values >= 0xfd.
-	nonCanonical := []byte{0xfd, 0x21, 0x00}
-	nonCanonical = append(nonCanonical, make([]byte, 33+32+4)...)
-	nonCanonical = append(nonCanonical, 0x40)
-	nonCanonical = append(nonCanonical, make([]byte, 64+8)...)
-	// Padding keeps the buffer above the minimum length, so the canonicality
-	// check is what fails and not the size floor.
-	nonCanonical = append(nonCanonical, make([]byte, 64)...)
+	// A confirm whose sponsor length is written with a wider discriminant than
+	// the value needs. Bitcoin's CompactSize allows exactly one encoding per
+	// value and ELA inherits that, so all three of these are non-canonical even
+	// though each one decodes to the real sponsor length of 33 bytes.
+	//
+	// All three discriminants are covered because they are three separate
+	// branches in readCompactSize, each with its own threshold. Leaving two of
+	// them untested let a `<` become `<=` on those branches without any test
+	// noticing.
+	cases := []struct {
+		name   string
+		prefix []byte
+	}{
+		{"0xfd for a value that fits in one byte", []byte{0xfd, 0x21, 0x00}},
+		{"0xfe for a value that fits in one byte", []byte{0xfe, 0x21, 0x00, 0x00, 0x00}},
+		{"0xff for a value that fits in one byte", []byte{0xff, 0x21, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			nonCanonical := append([]byte{}, tc.prefix...)
+			nonCanonical = append(nonCanonical, make([]byte, 33+32+4)...)
+			nonCanonical = append(nonCanonical, 0x40)
+			nonCanonical = append(nonCanonical, make([]byte, 64+8)...)
+			// Padding keeps the buffer above the minimum length, so the
+			// canonicality check is what fails and not the size floor.
+			nonCanonical = append(nonCanonical, make([]byte, 64)...)
 
-	_, err := decodeConfirm(nonCanonical)
-	if !errors.Is(err, errCompactNonCanon) {
-		t.Fatalf("error = %v, want %v", err, errCompactNonCanon)
+			if len(nonCanonical) < legacyConfirmMinLen {
+				t.Fatalf("the fixture is %d bytes, below the %d byte floor, so it would "+
+					"fail on length before reaching the canonicality check",
+					len(nonCanonical), legacyConfirmMinLen)
+			}
+			_, err := decodeConfirm(nonCanonical)
+			if !errors.Is(err, errCompactNonCanon) {
+				t.Fatalf("error = %v, want %v", err, errCompactNonCanon)
+			}
+		})
 	}
 
 	// The same value written the canonical way must be walked successfully; the
-	// point of the case above is the encoding, not the length itself.
+	// point of the cases above is the encoding, not the length itself.
 	if _, err := proposalWireLen(append([]byte{0x21}, make([]byte, 33+32+4+1+64)...)); err != nil {
 		t.Fatalf("canonical encoding was rejected: %v", err)
+	}
+
+	// Canonicality and the 33 byte sponsor ceiling are two independent gates,
+	// and this is the case that proves it: 0xfe00010000 is a perfectly legal
+	// 0xfe encoding of 65536, so readCompactSize returns it happily, and only
+	// the ceiling check in proposalWireLen can reject it. If the canonicality
+	// branch ever swallowed values above its own threshold, this would report
+	// errCompactNonCanon instead.
+	//
+	// The second entry is the same argument for the 0xff branch. Both are load
+	// bearing for a second reason: 0x10000 and 0x100000000 are exactly the
+	// thresholds those branches compare against, so these two values are the
+	// only inputs that can tell `<` from `<=` there. Anything smaller is
+	// rejected by both and the mutation survives.
+	for _, enc := range [][]byte{
+		{0xfe, 0x00, 0x00, 0x01, 0x00},                         // 65536
+		{0xff, 0x00, 0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00}, // 4294967296
+	} {
+		if _, err := proposalWireLen(enc); !errors.Is(err, errSponsorTooLong) {
+			t.Fatalf("%x: a canonically encoded length sitting exactly on the "+
+				"discriminant's threshold must be accepted by readCompactSize and then "+
+				"rejected by the sponsor ceiling, got %v", enc, err)
+		}
 	}
 
 	// Truncation inside a multi byte length must be an error, never a panic.
@@ -630,4 +677,145 @@ func TestVerifySealForkAndDoubleSign(t *testing.T) {
 			t.Fatalf("MaxUint64 nonce must exempt the double sign rule: %v", err)
 		}
 	})
+}
+
+// TestVerifySealForkAndDoubleSignOnRealBytes drives the two history guards with
+// mainnet headers instead of synthetic ones.
+//
+// The test above proves the guards fire, but every byte in it is invented,
+// including the seal hashes and the signatures. These cases keep the real header
+// and change exactly one field inside its confirm, so the isolation is honest:
+// SealHash covers fourteen fields and Extra is not one of them, which means the
+// header binding at the top of verifySeal still passes and the guard under test
+// is the only thing left that can reject.
+//
+// Block 1 is the only recorded block that can carry these cases. It has to reach
+// the guards, and that means it has to survive verifyConfirm first, which for a
+// non-zero header.Nonce needs the ELA SPV service (see the note on the
+// non-zero-nonce case below). Block 1 has nonce 0 - it was sealed before the ELA
+// chain had a height - so it is checked against the configured producer set and
+// needs no SPV at all. It is also one of only two recorded blocks with a
+// non-zero view offset, which is what makes a real fork comparison possible.
+func TestVerifySealForkAndDoubleSignOnRealBytes(t *testing.T) {
+	engine := New(&params.LegacyConfig{VerifySeal: true, Producers: params.DefaultLegacyProducers})
+
+	byNumber := map[uint64]goldenVector{}
+	for _, v := range loadGoldenVectors(t) {
+		byNumber[v.Number] = v
+	}
+	blockOne, ok := byNumber[1]
+	if !ok {
+		t.Fatal("the vectors carry no block 1, so nothing here can run")
+	}
+
+	// canonicalNear rebuilds a recorded header with one field of its confirm
+	// changed and every other byte left as the chain produced it.
+	canonicalNear := func(t *testing.T, v goldenVector, mutate func(*payload.Confirm)) *types.Header {
+		t.Helper()
+
+		real := v.header(t)
+		confirm := v.decodeGoldenConfirm(t, real)
+		mutate(confirm)
+
+		// A value copy is enough: types.Header has no hash cache in this tree,
+		// Hash() re-encodes every call. Copying a cached digest here would make
+		// the "hashes differ" assertions below pass for the wrong reason.
+		altered := *real
+		altered.Extra = serializeConfirm(t, confirm)
+		if altered.Hash() == real.Hash() {
+			t.Fatalf("block %d: the fixture failed to produce a different header", v.Number)
+		}
+		// verifySeal soft-fails (returns nil) when it cannot decode the canonical
+		// header's Extra, so an unparseable mutant would silently pass the test.
+		decoded, err := decodeConfirm(altered.Extra)
+		if err != nil {
+			t.Fatalf("block %d: the altered canonical header no longer decodes, so "+
+				"verifySeal would soft-fail instead of exercising the guard: %v", v.Number, err)
+		}
+		if decoded.Proposal.ViewOffset != confirm.Proposal.ViewOffset {
+			t.Fatalf("block %d: the altered confirm re-decoded to a different view offset", v.Number)
+		}
+		return &altered
+	}
+
+	// chainWith returns a chain whose canonical block at height v.Number is the
+	// supplied header, with the head above it so the `number < current.Number`
+	// half of the fork guard is satisfied.
+	chainWith := func(v goldenVector, canonical *types.Header, tip uint64) *testChain {
+		return &testChain{
+			genesis:  &types.Header{Number: common.Big0, Time: 1761657649},
+			current:  &types.Header{Number: new(big.Int).SetUint64(tip)},
+			byNumber: map[uint64]*types.Header{v.Number: canonical},
+		}
+	}
+
+	t.Run("real block 1 loses to a canonical block one view later", func(t *testing.T) {
+		real := blockOne.header(t)
+		if got := blockOne.decodeGoldenConfirm(t, real).Proposal.ViewOffset; got != 1 {
+			t.Fatalf("block 1 carries view offset %d, want 1; the vector file changed", got)
+		}
+		// The canonical block is the same real header, one view later: exactly
+		// what a fork looks like when the other branch won the view change.
+		canonical := canonicalNear(t, blockOne, func(c *payload.Confirm) { c.Proposal.ViewOffset = 2 })
+		if got := decodeConfirmMust(t, canonical).Proposal.ViewOffset; got != 2 {
+			t.Fatalf("the canonical fixture carries view offset %d, want 2", got)
+		}
+
+		err := engine.verifySeal(chainWith(blockOne, canonical, 2), real)
+		if !errors.Is(err, errChainForkBlock) {
+			t.Fatalf("error = %v, want %v", err, errChainForkBlock)
+		}
+	})
+
+	t.Run("real block 1 double signed at the same view", func(t *testing.T) {
+		real := blockOne.header(t)
+		// Same view offset, different confirm, therefore a different header at
+		// the same height: the double sign shape. Flipping a byte in the
+		// proposal signature is the cheapest way to move the header hash without
+		// touching anything verifySeal parses, so the canonical header still
+		// decodes and the fork guard cannot fire first.
+		canonical := canonicalNear(t, blockOne, func(c *payload.Confirm) { c.Proposal.Sign[0] ^= 0xff })
+		if got := decodeConfirmMust(t, canonical).Proposal.ViewOffset; got != 1 {
+			t.Fatalf("the canonical fixture carries view offset %d, want 1", got)
+		}
+
+		err := engine.verifySeal(chainWith(blockOne, canonical, 2), real)
+		if !errors.Is(err, errDoubleSignBlock) {
+			t.Fatalf("error = %v, want %v", err, errDoubleSignBlock)
+		}
+	})
+
+	t.Run("a real non-zero-nonce block stops before the guards", func(t *testing.T) {
+		v, ok := byNumber[16405]
+		if !ok {
+			t.Fatal("the vectors carry no block 16405")
+		}
+		real := v.header(t)
+		canonical := canonicalNear(t, v, func(c *payload.Confirm) { c.Proposal.ViewOffset = 3 })
+
+		err := engine.verifySeal(chainWith(v, canonical, 20000), real)
+		// Deliberately not errChainForkBlock. verifyConfirm runs before the two
+		// history guards, and a non-zero header.Nonce resolves its producer set
+		// through the ELA SPV service, which a test process does not have, so
+		// this block never reaches the fork comparison. That makes the case a
+		// pin on the *order* of the checks rather than on the guard itself - and
+		// the order is worth pinning, because comparing the view offset of a
+		// header whose confirm has not been authenticated yet would be comparing
+		// a number the attacker chose.
+		if !errors.Is(err, ErrSealSPVBehind) {
+			t.Fatalf("error = %v, want %v; the history guards must not run before the "+
+				"confirm has been authenticated", err, ErrSealSPVBehind)
+		}
+	})
+}
+
+// decodeConfirmMust decodes a header's Extra or fails the test.
+func decodeConfirmMust(t *testing.T, header *types.Header) *payload.Confirm {
+	t.Helper()
+
+	confirm, err := decodeConfirm(header.Extra)
+	if err != nil {
+		t.Fatalf("decodeConfirm rejected the fixture's Extra: %v", err)
+	}
+	return confirm
 }
