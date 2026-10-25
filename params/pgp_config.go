@@ -63,6 +63,11 @@ type LegacyConfig struct {
 	// nothing in practice. Turning it off is a debugging measure, never a
 	// production setting, because it leaves every legacy header unauthenticated.
 	//
+	// On mainnet it cannot be turned off through configuration at all: the
+	// value that reaches the engine is PGPChainConfig itself (see below), so
+	// switching it off means editing this file and rebuilding. A JSON on disk
+	// that says false is overwritten, not honoured.
+	//
 	// The switch also applies to datadirs created before the field existed:
 	// SetupGenesisBlockWithOverride resolves the genesis through
 	// chainConfigOrDefault, which returns PGPChainConfig itself when the hash
@@ -78,9 +83,17 @@ type LegacyConfig struct {
 	// the ELA main chain had a height to anchor to, so their confirm signatures
 	// have to be checked against this fixed list instead of the SPV arbiters.
 	//
-	// This is NOT spv.MainnetProducers (spv/nextturn_dposinfo.go): that is the
-	// next-turn DPoS arbiter list, twelve different keys. Mixing them up makes
-	// every nonce-0 block fail verification.
+	// This is NOT the next-turn DPoS arbiter list. pgp-chain keeps one in
+	// spv/nextturn_dposinfo.go:17 (spv.MainnetProducers, first key 03244cbf…);
+	// it is not ported here, because nothing in this tree reads it, and it is
+	// disjoint from the twelve keys below — all twelve recorded mainnet
+	// confirms in consensus/pgp/testdata/seal_vectors.json, nonce-0 and
+	// non-zero alike, are signed by keys from this list and none from that one.
+	// Substituting it would make every nonce-0 block fail verification.
+	//
+	// Non-zero-nonce blocks are not checked against this list at runtime; they
+	// use spv.GetProducers(elaHeight), the ELA arbiter set the SPV database
+	// reports for the height in header.Nonce.
 	//
 	// The name deliberately does not end in "Block" or "Time"; see the warning
 	// on LegacyConfig.
@@ -153,9 +166,13 @@ var (
 	// (Pbft.Producers). Twelve compressed P256 public keys, so a confirm needs
 	// int(12*2/3) = 8 of them to pass.
 	//
-	// Not to be confused with spv.MainnetProducers, the twelve next-turn DPoS
-	// arbiters, whose first key is 03244cbf…. The two lists are disjoint; using
-	// the wrong one makes every nonce-0 block unverifiable.
+	// pgp-chain also carries a next-turn DPoS arbiter list
+	// (spv/nextturn_dposinfo.go:17, spv.MainnetProducers, first key
+	// 03244cbf…). It is disjoint from the keys below and is deliberately not
+	// ported: no mainnet confirm recorded in
+	// consensus/pgp/testdata/seal_vectors.json is signed by any key from it,
+	// including the non-zero-nonce ones. Do not substitute it for this list —
+	// every nonce-0 block would become unverifiable.
 	DefaultLegacyProducers = []string{
 		"02a91b4ccc0204e2964719fe5035c06af1d5141968eb1e5117f74feee625eac4d5",
 		"024d54af50167af60148ff4b0f05db6722791a1f83f7afa835b550697afa939e03",
