@@ -42,14 +42,20 @@ func TestMainnetCarriesTheFlagDefaultDynamicArbiterHeight(t *testing.T) {
 	}
 }
 
-// TestDynamicArbiterHeightFallback covers the three inputs the accessor can see.
+// TestDynamicArbiterHeightFallback covers the four inputs the accessor can see.
 //
-// The fallback is not cosmetic. core.SetupGenesisBlockWithOverride returns the
-// chain config it finds in the database, not the literal in this package, so a
-// datadir created before the field existed deserialises to zero no matter what
-// params says. Passing that zero through to the listener would enable the
-// bookkeeping from ELA height 0 — a state no pgp node was ever in — which is a
-// different failure from the MaxUint64 one and just as silent.
+// The fallback is not cosmetic. A Legacy block whose DynamicArbiterHeight is
+// zero would otherwise hand zero to the listener, which means "switch to DPOS at
+// ELA height 0" — a state no pgp node was ever in. That is a different failure
+// from the MaxUint64 one and just as silent.
+//
+// What this test is NOT about: a datadir created before the field existed. For
+// the pgp genesis hash the stored config is never read back, because
+// chainConfigOrDefault asks params.GetBuiltInChainConfig first and that returns
+// PGPChainConfig itself (core/genesis.go:443, :543-552,
+// params/config.go:603-616). An old datadir therefore picks the value up from
+// this package on its own, and the zero this test feeds in comes from a
+// hand-written config instead.
 func TestDynamicArbiterHeightFallback(t *testing.T) {
 	tests := []struct {
 		name string
@@ -67,7 +73,7 @@ func TestDynamicArbiterHeightFallback(t *testing.T) {
 			want: 0,
 		},
 		{
-			name: "legacy chain written before the field existed",
+			name: "legacy block present but the field is zero",
 			cfg:  &ChainConfig{ChainID: big.NewInt(1), Legacy: &LegacyConfig{}},
 			want: DefaultDynamicArbiterHeight,
 		},
