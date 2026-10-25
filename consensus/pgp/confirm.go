@@ -63,6 +63,14 @@ var (
 	// yet, and an operator reading the log must be able to distinguish "waiting
 	// for ELA" from "the block is forged".
 	//
+	// "Behind" is the only failure mode a running pgp node can hit. startNode
+	// always calls startSpv before utils.StartNode (cmd/geth/main.go:390 vs
+	// :393), and startSpv only skips a chain that does not run the legacy rules
+	// at all (cmd/geth/spv_start.go:85). So the service exists before the first
+	// legacy header is verified, and a nonce != 0 rejection here means the
+	// listener has not reached that ELA height yet — never that it was never
+	// started.
+	//
 	// core.BlockChain reports every header verification failure through
 	// reportBadBlock, so a block hitting this error is logged as "BAD BLOCK" and
 	// written to the diagnostic bad block store. That does NOT poison it:
@@ -183,6 +191,13 @@ func proposalWireLen(extra []byte) (int, error) {
 // remaining/132 cannot be honoured by any buffer of this size. That leaves the
 // allocation at most len(extra)/132 entries.
 //
+// The count is a fixed 8 byte little endian word (common.WriteUint64), NOT a
+// CompactSize like the length prefixes around it, which is the second trap here.
+// Parsing it as a varint consumes 7 bytes too few and the damage does not show up
+// at the parse site: Deserialize reads the first vote's bytes as the vote array,
+// everything after it shifts, and the failure surfaces much later as a bogus
+// "vote commits to another proposal" on a block that is perfectly valid.
+//
 // Trailing bytes are rejected too. Deserialize stops after the last vote and
 // never checks that it consumed the whole reader, which would let an attacker
 // append arbitrary bytes: the header hash and Extra both change, every signature
@@ -198,6 +213,8 @@ func decodeConfirm(extra []byte) (*payload.Confirm, error) {
 	if len(extra)-countOffset < 8 {
 		return nil, fmt.Errorf("%w: no room for the vote count", errConfirmTruncated)
 	}
+	// Fixed 8 byte little endian, not a CompactSize; see the doc comment for the
+	// symptom of reading it as one.
 	count := binary.LittleEndian.Uint64(extra[countOffset:])
 	remaining := uint64(len(extra) - countOffset - 8)
 	if count > remaining/legacyVoteWireLen {
@@ -227,6 +244,13 @@ func decodeConfirm(extra []byte) (*payload.Confirm, error) {
 // is the reference behaviour, so it is reproduced rather than fixed: mainnet has
 // twelve producers and never reaches the case, and "fixing" it would reject
 // confirms the chain actually accepted.
+//
+// The argument is the *total* signer count, not the number of producers that
+// survived filtering. Upstream reaches this same expression through
+// GetCRMajorityCount (dpos/producers.go:184), which passes defaultCRCSignerNumber
+// — 12 as declared, overwritten with len(producers) when the set is loaded
+// (dpos/producers.go:18, :38). That equivalence is why the elaHeight == 0 branch
+// can call legacyMajorityCount(len(list)) and still match the reference exactly.
 func legacyMajorityCount(totalSigner int) int {
 	return int(float64(totalSigner) * 2 / 3)
 }
@@ -328,6 +352,13 @@ func checkConfirm(confirm *payload.Confirm, producers [][]byte, minSignCount int
 	proposalHash := confirm.Proposal.Hash()
 	signed := make(map[string]struct{}, len(confirm.Votes))
 	validVotes := 0
+	// The sponsor's own vote is inside this loop and counts towards
+	// minSignCount, by construction rather than by luck: StartProposal and
+	// StartVote both identify the actor with ac.PublicKeyBytes()
+	// (pgp-chain/dpos/proposal.go:18, dpos/proposalvote.go:22), so the sealer
+	// that signed the proposal is always one of the signers. That is what makes
+	// 8-of-12 reachable — treat the sponsor as "extra" and a valid mainnet
+	// confirm would count 7 and be rejected.
 	for i := range confirm.Votes {
 		vote := &confirm.Votes[i]
 		if !vote.Accept {

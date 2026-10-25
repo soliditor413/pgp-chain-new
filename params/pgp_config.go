@@ -258,13 +258,27 @@ func (c *ChainConfig) PassBalance() uint64 {
 // maintains the next-turn DPOS producer set. It is the value the node hands to
 // spv.NewService.
 //
-// A zero in the chain config means "not configured", not "zero". Two ways to get
-// there: a datadir whose stored chain config was written by a build that predates
-// the field (core.SetupGenesisBlockWithOverride returns the *stored* config, so
-// the JSON on disk wins over the literal in this file), and a genesis built by
-// hand without a Legacy block. Zero is not a usable value — it would turn the
-// bookkeeping on at ELA height 0, which no real pgp node ever did — so it falls
-// back to the mainnet flag default instead.
+// A zero inside a Legacy block means "not configured", not "zero". Zero is not a
+// usable value — it would turn the bookkeeping on at ELA height 0, which no real
+// pgp node ever did — so it falls back to the mainnet flag default instead.
+//
+// That fallback is unreachable on pgp mainnet, and the reason is worth spelling
+// out because the opposite is easy to assume: SetupGenesisBlockWithOverride
+// resolves the config through chainConfigOrDefault (core/genesis.go:443), whose
+// first question is params.GetBuiltInChainConfig(ghash)
+// (params/config.go:603-616). For the pgp genesis hash that returns
+// PGPChainConfig itself, so the JSON on disk is never consulted and the literal
+// in this file always wins; a differing stored copy is then rewritten
+// (core/genesis.go:469-471), and even if that write were skipped, newCfg — the
+// config the node runs with — is already PGPChainConfig. A datadir created
+// before this field existed therefore picks up the value on its own, with no
+// migration step.
+//
+// What can actually reach zero is a config that is not one of the built-in ones,
+// e.g. a hand-written custom genesis carrying a Legacy block without the field.
+// A nil Legacy block is a separate case: it returns 0, not the default, because
+// a chain that does not run the legacy rules has no arbiter height to be wrong
+// about.
 func (c *ChainConfig) DynamicArbiterHeight() uint64 {
 	if c == nil || c.Legacy == nil {
 		return 0
