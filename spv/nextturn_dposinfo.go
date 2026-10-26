@@ -179,7 +179,7 @@ func GetProducers(elaHeight uint64) ([][]byte, int, error) {
 		// CONSENSUS-RISK: GetCurrentProducers reads the spvTransactiondb KV
 		// store, which is external state fed by the SPV listener and therefore
 		// not reproducible from the block alone.
-		producers = GetCurrentProducers()
+		producers = GetCurrentProducers(uint32(elaHeight))
 		sort.Slice(producers, func(i, j int) bool {
 			return bytes.Compare(producers[i], producers[j]) < 0
 		})
@@ -299,7 +299,7 @@ func SetCurrentProducers(producers [][]byte) {
 // notification path (SetCurrentProducers), not by block execution. Replaying
 // the same block on a node with a different SPV sync history can return a
 // different set. Do not use it as the source of truth on the execution path.
-func GetCurrentProducers() [][]byte {
+func GetCurrentProducers(spvHeight uint32) [][]byte {
 	if spvTransactiondb == nil {
 		return nil
 	}
@@ -308,9 +308,14 @@ func GetCurrentProducers() [][]byte {
 	b, err := spvTransactiondb.Get([]byte(CURRENT_PRODUCERS))
 	if err != nil {
 		// CONSENSUS-RISK: falls back to the live SPV head via GetSpvHeight().
-		spvHeight := GetSpvHeight()
-		crcArbiters, normalArbitrs, err := SpvService.GetArbiters(uint32(spvHeight))
-		log.Error("[GetCurrentCRProducers] read db error", "error", err)
+		if spvHeight == 0 {
+			spvHeight = uint32(GetSpvHeight())
+		}
+		crcArbiters, normalArbitrs, err := SpvService.GetArbiters(spvHeight)
+		if err != nil {
+			log.Error("[GetCurrentCRProducers] get arbiters error", "error", err)
+			return nil
+		}
 		if IsOnlyCRConsensus {
 			return crcArbiters
 		} else {
