@@ -87,16 +87,32 @@ cannot() { printf '   CANNOT %s\n' "$*" >&2; exit 2; }
 
 # grep's own failure must never be read as "no match": -c exits 1 for no match
 # and >1 for a real error, and only the second one is a broken gate.
+#
+# It returns 2 instead of exiting: it is always called as n=$(count ...), and an
+# exit inside a command substitution only ends the subshell -- the caller would
+# carry on with an empty value. Callers must write:  n=$(count ...) || cannot ...
 count() {
     _p=$1; _f=$2; _l=$3
     if grep -cF -- "$_p" "$_f" >"$TMP/c" 2>"$TMP/e"; then
         :
     else
         _rc=$?
-        [ "$_rc" -eq 1 ] || cannot "grep exited $_rc while counting $_l"
+        [ "$_rc" -eq 1 ] || {
+            printf 'grep exited %s while counting %s: %s\n' "$_rc" "$_l" "$(head -1 "$TMP/e")" >&2
+            return 2
+        }
         printf '0\n' >"$TMP/c"
     fi
     tr -d ' \n' <"$TMP/c"
+}
+
+# Guards a value that came out of a command substitution before it reaches a
+# numeric test. An empty or non-numeric value here means the number was not
+# read, which is a broken gate, not a zero.
+need_num() {
+    case ${2:-} in
+        ''|*[!0-9]*) printf '   CANNOT %s is not a number: [%s]\n' "$1" "${2:-}" >&2; exit 2 ;;
+    esac
 }
 
 # Fixed-string grep into a file; the caller then works on the file, so no
@@ -120,20 +136,24 @@ cmt "test -s $SNAP"
 if [ -r "$LOG" ] && [ -s "$LOG" ]; then ok "log readable and non-empty"; else cannot "cannot read a non-empty $LOG"; fi
 if [ -r "$SNAP" ] && [ -s "$SNAP" ]; then ok "chain-head snapshot readable and non-empty"; else cannot "cannot read a non-empty $SNAP"; fi
 LOG_LINES=$(wc -l <"$LOG" | tr -d ' ')
+need_num "log line count" "$LOG_LINES"
 info "log lines: $LOG_LINES"
 [ "$LOG_LINES" -gt 0 ] || cannot "log is empty"
 
 sec "G1 this is a geth log and the run ended, not a fragment"
 cmt "grep -cF 'INFO [' $LOG"
 cmt "grep -cF '$SHUTDOWN_PAT' $LOG"
-N_INFO=$(count 'INFO [' "$LOG" 'INFO lines')
+N_INFO=$(count 'INFO [' "$LOG" 'INFO lines') || cannot "could not count INFO lines"
+need_num "INFO line count" "$N_INFO"
 if [ "$N_INFO" -gt 0 ]; then ok "log carries $N_INFO geth log lines"; else bad "no 'INFO [' lines: this is not a geth log, or a different format"; fi
-N_SHUT=$(count "$SHUTDOWN_PAT" "$LOG" 'shutdown marker')
+N_SHUT=$(count "$SHUTDOWN_PAT" "$LOG" 'shutdown marker') || cannot "could not count the shutdown marker"
+need_num "shutdown marker count" "$N_SHUT"
 if [ "$N_SHUT" -gt 0 ]; then ok "run ended: '$SHUTDOWN_PAT' seen"; else bad "no '$SHUTDOWN_PAT': the log is a fragment, the node was killed, or the file was truncated"; fi
 
 sec "G2 seal accounting (the denominator)"
 keep "$SEAL_PAT" "$LOG" "$TMP/seal.txt"
 SEALED=$(wc -l <"$TMP/seal.txt" | tr -d ' ')
+need_num "sealed block count" "$SEALED"
 sed -n 's/.*number=\([0-9][0-9,]*\).*/\1/p' "$TMP/seal.txt" | tr -d ',' >"$TMP/seal_h.txt"
 cmt "grep -F '$SEAL_PAT' $LOG | wc -l"
 cmt "sed -n 's/.*number=\\([0-9][0-9,]*\\).*/\\1/p'  （取高度）"
@@ -147,6 +167,9 @@ if [ "$SEALED" -gt 0 ]; then
     if [ "$FIRST" = "1" ]; then ok "run starts at genesis (first sealed block is 1)"; else bad "INVALID RUN: first sealed block is $FIRST, not 1 -- counts describe a partial run and must not be compared with another"; fi
     if [ "$LAST" = "$SEALED" ]; then ok "highest block ($LAST) equals the count ($SEALED), so the count is the whole run"; else bad "highest block $LAST != count $SEALED: blocks are missing or the counter is wrong"; fi
     GAPS=$(awk 'NR > 1 && $1 != prev + 1 { n++ } { prev = $1 } END { print n + 0 }' "$TMP/seal_h.txt")
+    need_num "gap count" "$GAPS"
+    need_num "first sealed block" "$FIRST"
+    need_num "highest sealed block" "$LAST"
     if [ "$GAPS" -eq 0 ]; then ok "block numbers are contiguous"; else bad "$GAPS gap(s) in the sealed sequence"; fi
     SNAP_HEAD=$(sed -n 's/.*eth_blockNumber = 0x[0-9a-f][0-9a-f]* (\([0-9][0-9]*\)).*/\1/p' "$SNAP" | head -1)
     cmt "sed -n 's/.*eth_blockNumber = 0x[0-9a-f]* (\\([0-9]*\\)).*/\\1/p' $SNAP"
@@ -161,7 +184,8 @@ fi
 sec "G3 failure markers (each must be 0)"
 cmt "grep -cF '<marker>' $LOG   （逐个）"
 for marker in 'DATA RACE' 'fatal error' 'panic:' 'concurrent map' 'seal timed out' 'ERROR'; do
-    n=$(count "$marker" "$LOG" "$marker")
+    n=$(count "$marker" "$LOG" "$marker") || cannot "could not count marker '$marker'"
+    need_num "count of '$marker'" "$n"
     if [ "$n" -eq 0 ]; then ok "'$marker' -> 0"; else bad "'$marker' -> $n line(s)"; fi
 done
 info "one-sided: each of these reads 0 when nothing matches, so a typo in a"
@@ -171,6 +195,7 @@ info "pins the literals -- see README, 'gate.sh: judging a run'."
 sec "G4 FinishedProposal 1:1 against sealed blocks"
 keep "$FORK_PAT" "$LOG" "$TMP/fork.txt"
 FORK=$(wc -l <"$TMP/fork.txt" | tr -d ' ')
+need_num "fork line count" "$FORK"
 grep -oE 'fork block ?height ?[0-9]+' "$TMP/fork.txt" 2>/dev/null | awk '{ gsub(/[^0-9]/, ""); print }' >"$TMP/fork_h.txt"
 cmt "grep -cF '$FORK_PAT' $LOG"
 cmt "grep -oE 'fork block ?height ?[0-9]+' | awk '{gsub(/[^0-9]/,\"\"); print}'"
@@ -258,13 +283,16 @@ sec "G7 WARN accounting: every warning is classified, and the parts add up"
 cmt "grep -F 'WARN' $LOG | awk '{sub(/^WARN \\[[^]]*\\] /,\"\"); gsub(/[0-9][0-9,]*/,\"N\"); print}' | sort | uniq -c | sort -rn"
 keep 'WARN' "$LOG" "$TMP/warn.txt"
 WARNS=$(wc -l <"$TMP/warn.txt" | tr -d ' ')
+need_num "WARN line count" "$WARNS"
 awk '{ sub(/^WARN \[[^]]*\] /, ""); gsub(/[0-9][0-9,]*/, "N"); print }' "$TMP/warn.txt" >"$TMP/warn_t.txt"
 awk '{ c[$0]++ } END { for (k in c) printf "%d\t%s\n", c[k], k }' "$TMP/warn_t.txt" | sort -rn >"$TMP/warn_c.txt"
 awk '{ s = substr($0, index($0, "\t") + 1); printf "   ..    %6d  %s\n", $1, substr(s, 1, 72) }' "$TMP/warn_c.txt"
 WSUM=$(awk '{ s += $1 } END { print s + 0 }' "$TMP/warn_c.txt")
+need_num "classified WARN total" "$WSUM"
 info "WARN lines: $WARNS   classified total: $WSUM"
 if [ "$WARNS" -eq "$WSUM" ]; then ok "every WARN line falls into a printed template"; else bad "classified $WSUM of $WARNS WARN lines: the breakdown dropped some"; fi
 WFORK=$(awk '$2 == "FinishedProposal" { s += $1 } END { print s + 0 }' "$TMP/warn_c.txt")
+need_num "fork-template WARN count" "$WFORK"
 info "fork-template WARNs: $WFORK   fork lines from G4: $FORK"
 if [ "$WFORK" -eq "$FORK" ]; then ok "fork WARN count matches G4"; else bad "fork WARN count $WFORK differs from G4's $FORK"; fi
 NONFORK=$((WARNS - WFORK))
@@ -291,7 +319,8 @@ if [ -n "$BINARY" ]; then
         fi
         if command -v strings >/dev/null 2>&1; then
             strings -a "$BINARY" >"$TMP/str.txt" 2>/dev/null || cannot "strings failed on $BINARY"
-            NRACE=$(count 'WARNING: DATA RACE' "$TMP/str.txt" 'race detector string')
+            NRACE=$(count 'WARNING: DATA RACE' "$TMP/str.txt" 'race detector string') || cannot "could not read the detector string out of $BINARY"
+            need_num "race detector string count" "$NRACE"
             if [ "$NRACE" -gt 0 ]; then ok "binary contains the race detector"; else
                 if [ "$EXPECT_RACE" -eq 1 ]; then bad "--expect-race but the binary has no race detector: a run called '-race' was not one"; else na "binary has no race detector, and --expect-race was not given"; fi
             fi
