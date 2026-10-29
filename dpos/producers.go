@@ -87,8 +87,49 @@ func (p *Producers) ChangeCurrentProducers(changeHeight uint64, spvHeight uint64
 
 }
 
+// SetWorkingHeight must NOT take p.mtx, and the reason is reentrancy rather than
+// lock order: ChangeCurrentProducers calls it while already holding that same
+// mutex, so a lock here stops that call on its own goroutine forever. sync.Mutex
+// is not reentrant and a self-deadlock is not a race, so -race reports nothing at
+// all -- the goroutine just stops. Do not merge this rule with the one on
+// ConsensusView.UpdateProducers: that one is an ordering cycle, this one is not.
+//
+// The price is that workingHeight has two writers that do not share a lock: this
+// function (called from ChangeCurrentProducers with p.mtx held, and from
+// ConsensusView.RecoverFromStatus with only viewMu held) and their running
+// concurrently is not prevented by anything. Both call sites are unreachable
+// today -- ChangeCurrentProducers has no caller before M3 -- which is why the
+// ticket leaves this line alone; GetWorkingHeight below therefore does not make
+// the field safe, it only stops the reader from being the one that adds a second
+// unsynchronised access. Closing it properly means giving ChangeCurrentProducers
+// a Locked twin and letting this function take the lock, which changes the call
+// graph and is a separate decision.
 func (p *Producers) SetWorkingHeight(changeHeight uint64) {
 	p.workingHeight = changeHeight
+}
+
+func (p *Producers) GetWorkingHeight() uint64 {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+	return p.workingHeight
+}
+
+func (p *Producers) GetTotalProducers() int {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+	return p.totalProducers
+}
+
+func (p *Producers) GetSpvHeight() uint64 {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+	return p.spvHeight
+}
+
+func (p *Producers) GetDutyIndex() uint32 {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+	return p.dutyIndex
 }
 
 func (p *Producers) UpdateNextProducers(producers []peer.PID, totalCount int) error {

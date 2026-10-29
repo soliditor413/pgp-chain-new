@@ -322,7 +322,7 @@ func (d *Dispatcher) ResetConsensus(height uint64) {
 		Info("[resetConsensus] reset view")
 		d.consensusView.SetReady()
 		d.CleanProposals(false)
-		d.consensusView.resetViewOffset()
+		d.consensusView.ResetViewOffset()
 		d.consensusView.UpdateDutyIndex(height)
 		d.consensusView.ChangeView(d.timeSource.AdjustedTime(), true, uint64(d.timeSource.AdjustedTime().Unix()))
 	}
@@ -337,7 +337,7 @@ func (d *Dispatcher) ResetConsensusForEpochTransition(height uint64, parentTime 
 
 	d.consensusView.SetReady()
 	d.CleanProposals(false)
-	d.consensusView.resetViewOffset()
+	d.consensusView.ResetViewOffset()
 	d.consensusView.UpdateDutyIndex(height)
 	d.consensusView.ChangeView(d.timeSource.AdjustedTime(), true, parentTime)
 
@@ -583,9 +583,10 @@ func (d *Dispatcher) HelpToRecoverAbnormal(id peer.PID, height uint64, currentHe
 		return nil
 	}
 	status := &dmsg.ConsensusStatus{}
-	status.ConsensusStatus = d.consensusView.consensusStatus
-	status.ViewOffset = d.consensusView.viewOffset
-	status.ViewStartTime = d.consensusView.GetViewStartTime()
+	// One snapshot, not three getters: a status, an offset and a start time read
+	// separately can come from three different views, and the receiving peer
+	// would resume at a turn that never existed.
+	status.ConsensusStatus, status.ViewOffset, status.ViewStartTime = d.consensusView.GetViewState()
 
 	// The vote and proposal payloads are deliberately not shipped: a recovering
 	// peer only needs the view, the working height and the duty index to resume
@@ -595,7 +596,7 @@ func (d *Dispatcher) HelpToRecoverAbnormal(id peer.PID, height uint64, currentHe
 	status.RejectedVotes = make([]payload.DPOSProposalVote, 0, len(d.rejectedVotes))
 	status.PendingProposals = make([]payload.DPOSProposal, 0, 1)
 	status.PendingVotes = make([]payload.DPOSProposalVote, 0, len(d.pendingVotes))
-	status.WorkingHeight = d.consensusView.producers.workingHeight
+	status.WorkingHeight = d.consensusView.GetWorkingHeight()
 	return status
 
 }
@@ -616,19 +617,17 @@ func (d *Dispatcher) RecoverAbnormal(status *dmsg.ConsensusStatus, medianTime in
 
 func (d *Dispatcher) RecoverFromConsensusStatus(status *dmsg.ConsensusStatus) error {
 	Info("RecoverFromConsensusStatus", "status", status.ConsensusStatus, "viewOffset", status.ViewOffset, "viewStartTime", status.ViewStartTime)
-	d.consensusView.consensusStatus = status.ConsensusStatus
 	d.acceptVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
 	d.rejectedVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
 	d.setProcessingProsalNil()
 	d.pendingVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
 
-	d.consensusView.viewOffset = status.ViewOffset
-	d.consensusView.ResetView(uint64(status.ViewStartTime.Unix()))
-	d.consensusView.isDposOnDuty = d.consensusView.ProducerIsOnDuty(d.consensusView.publicKey)
-	d.consensusView.SetWorkingHeight(status.WorkingHeight)
-	if finished := d.GetFinishedHeight(); finished > 0 {
-		d.consensusView.UpdateDutyIndex(finished)
-	}
+	// One call, one critical section. Doing this through the exported setters
+	// would release the view lock between the offset and the start time, and a
+	// reader in that gap sees the recovered offset against the pre-recovery
+	// start time -- a deadline computed from a pair that never existed.
+	d.consensusView.RecoverFromStatus(status.ConsensusStatus, status.ViewOffset,
+		status.ViewStartTime, status.WorkingHeight, d.GetFinishedHeight())
 	Info("-------[End RecoverFromConsensusStatus]--------", "startTime", d.consensusView.GetViewStartTime(), "WorkingHeight", status.WorkingHeight, "dutyIndex", d.GetConsensusView().GetDutyIndex(), "d.finishedHeight", d.GetFinishedHeight(), "status.ViewOffset", status.ViewOffset)
 	d.consensusView.DumpInfo()
 	return nil

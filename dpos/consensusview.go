@@ -9,6 +9,7 @@ package dpos
 import (
 	"bytes"
 	"sort"
+	"sync"
 	"time"
 
 	elacom "github.com/elastos/Elastos.ELA/common"
@@ -32,7 +33,44 @@ const (
 // re-derived on restart from the parent block's timestamp
 // (SetChangViewTime), which is why a restarted node rejoins at the right view
 // without an explicit record.
+//
+// # Locking
+//
+// mu guards the five mutable fields listed under it below. They have three
+// writers in three different goroutines -- the view loop (TryChangeView ->
+// ChangeView), the miner (Prepare's startView, which calls ResetView and
+// SetChangViewTime) and the chain head (FinishedProposal's tail, which calls
+// SetReady, UpdateDutyIndex and ChangeView) -- and readers in Seal, which
+// computes its deadline from GetChangeViewTime. The fields are plain words and
+// time.Time values, so the failure mode is not a graceful error: a torn
+// viewChangeTime produces a deadline in the past or far future, and a torn
+// viewOffset assigns the round to the wrong producer. Neither is caught by the
+// Go runtime; only -race sees it.
+//
+// Three consequences, all of which are easy to undo by tidying up:
+//
+//   - Nothing inside this file may call an exported accessor while holding mu.
+//     sync.RWMutex is not reentrant, so ChangeView -> ResetView -> SetChangViewTime
+//     would deadlock on its own goroutine at the second lock, and taking the read
+//     lock from inside dumpInfoLocked while holding the write lock would do the
+//     same. That is why every entry point below has a Locked twin and the
+//     composites call only the twins.
+//   - Nothing reached from inside mu may call back into the Dispatcher. The one
+//     callback that does leave this file, listener.OnViewChanged, is therefore
+//     invoked after the unlock, not inside it.
+//   - The lock order is mu -> viewMu -> producers.mtx, declared in full on
+//     Dispatcher. viewMu -> mu is forbidden, and it holds today only because the
+//     far end of the callback chain is non-blocking (miner/worker.go's
+//     requestNewWork uses a select with a default); if that ever becomes a
+//     blocking send, this edge appears and the ban starts to matter.
 type ConsensusView struct {
+	// mu guards exactly the five fields below. publicKey and signTolerance are
+	// set at construction and never written again (which is why they are not
+	// "missing a lock"); producers owns its own mutex and must be reached
+	// through its accessors, not protected from here; listener is set once by
+	// the constructor.
+	mu sync.RWMutex
+
 	consensusStatus uint32
 	viewOffset      uint32
 	publicKey       []byte
@@ -45,50 +83,142 @@ type ConsensusView struct {
 	listener ViewListener
 }
 
-func (v *ConsensusView) resetViewOffset() {
-	v.viewOffset = 0
-}
+// The Locked functions below assume mu is already held by the caller. They are
+// not exported and must not grow a lock of their own: that is the exact mistake
+// that turns ChangeView into a self-deadlock, and it is invisible to -race.
 
-func (v *ConsensusView) SetRunning() {
+func (v *ConsensusView) setRunningLocked() {
 	v.consensusStatus = ConsensusRunning
 }
 
-func (v *ConsensusView) SetReady() {
+func (v *ConsensusView) setReadyLocked() {
 	v.consensusStatus = ConsensusReady
 }
 
-func (v *ConsensusView) IsRunning() bool {
+func (v *ConsensusView) isRunningLocked() bool {
 	return v.consensusStatus == ConsensusRunning
 }
 
-func (v *ConsensusView) IsReady() bool {
+func (v *ConsensusView) isReadyLocked() bool {
 	return v.consensusStatus == ConsensusReady
 }
 
-func (v *ConsensusView) TryChangeView(now time.Time) {
-	if v.IsRunning() && now.After(v.viewChangeTime) {
-		Info("[TryChangeView] succeed", "now", now.String(), "changeTime", v.viewChangeTime.String())
-		parentTime := float64(v.viewChangeTime.Unix()) - v.signTolerance.Seconds()
-		v.ChangeView(now, false, uint64(parentTime))
+func (v *ConsensusView) resetViewOffsetLocked() {
+	v.viewOffset = 0
+}
+
+func (v *ConsensusView) setChangViewTimeLocked(parentTime uint64) {
+	headerTime := time.Unix(int64(parentTime), 0)
+	v.viewChangeTime = headerTime.Add(v.signTolerance)
+	v.viewStartTime = headerTime
+}
+
+// dumpInfoLocked builds the duty listing. It takes onDuty as an argument instead
+// of looking it up, because every caller inside a critical section has already
+// asked Producers for it: asking twice would be two p.mtx acquisitions for one
+// answer, and the two answers could differ.
+func (v *ConsensusView) dumpInfoLocked(onDuty []byte) string {
+	str := "\n"
+	for _, signer := range v.producers.GetProducers() {
+		if bytes.Equal(onDuty, signer) {
+			str = str + elacom.BytesToHexString(signer) + " onDuty \n"
+		} else {
+			str = str + elacom.BytesToHexString(signer) + " not onDuty \n"
+		}
 	}
+	return str
+}
+
+// producerIsOnDutyLocked mirrors ProducerIsOnDuty for callers that already hold
+// the lock. It nests viewMu -> producers.mtx, which is the allowed direction.
+func (v *ConsensusView) producerIsOnDutyLocked(account []byte) bool {
+	producer := v.producers.GetNextOnDutyProducer(v.viewOffset)
+	return bytes.Equal(producer, account)
+}
+
+func (v *ConsensusView) updateDutyIndexLocked(height uint64) {
+	v.producers.UpdateDutyIndex(height)
+
+	currentProducer := v.producers.GetNextOnDutyProducer(v.viewOffset)
+	v.isDposOnDuty = bytes.Equal(currentProducer, v.publicKey)
+}
+
+// SetRunning and SetReady are the two places the chain head publishes consensus
+// progress; they take the write lock because the status is read by Seal and by
+// Prepare on other goroutines.
+func (v *ConsensusView) SetRunning() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.setRunningLocked()
+}
+
+func (v *ConsensusView) SetReady() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.setReadyLocked()
+}
+
+func (v *ConsensusView) IsRunning() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.isRunningLocked()
+}
+
+func (v *ConsensusView) IsReady() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.isReadyLocked()
+}
+
+// TryChangeView advances the view if the deadline has passed.
+//
+// The read of the two fields and the call to ChangeView are two separate
+// critical sections, so the decision can be based on a view that has already
+// moved when ChangeView runs; the result is a redundant or skipped offset, never
+// a torn read. Closing that window is another ticket, because it changes how
+// often the view advances, and the frequency is a consensus parameter.
+func (v *ConsensusView) TryChangeView(now time.Time) {
+	v.mu.RLock()
+	running := v.isRunningLocked()
+	changeTime := v.viewChangeTime
+	v.mu.RUnlock()
+
+	if !running || !now.After(changeTime) {
+		return
+	}
+	Info("[TryChangeView] succeed", "now", now.String(), "changeTime", changeTime.String())
+	parentTime := float64(changeTime.Unix()) - v.signTolerance.Seconds()
+	v.ChangeView(now, false, uint64(parentTime))
 }
 
 func (v *ConsensusView) GetProducers() [][]byte {
 	return v.producers.GetProducers()
 }
 
+// The four getters below used to read the Producers fields directly, which no
+// view lock can cover: they are the other struct's state, and the only lock that
+// can serialise them is p.mtx. See ticket item 8.
 func (v *ConsensusView) GetTotalArbiterCount() int {
-	return v.producers.totalProducers
+	return v.producers.GetTotalProducers()
 }
 
 func (v *ConsensusView) GetSpvHeight() uint64 {
-	return v.producers.spvHeight
+	return v.producers.GetSpvHeight()
 }
 
 func (v *ConsensusView) GetTotalProducersCount() int {
-	return v.producers.totalProducers
+	return v.producers.GetTotalProducers()
 }
 
+func (v *ConsensusView) GetDutyIndex() uint32 {
+	return v.producers.GetDutyIndex()
+}
+
+// UpdateProducers, ChangeCurrentProducers and UpdateNextProducers must NOT take
+// mu. They touch only Producers, which has its own lock, and the view lock adds
+// nothing but a way to get the order wrong: Producers is not a leaf (the view
+// reaches it from inside mu), so taking mu here would create the reverse edge
+// producers.mtx -> viewMu, and an ABBA cycle against ChangeView.
 func (v *ConsensusView) UpdateProducers(producers [][]byte, totalCount int, spvHeight uint64) {
 	sort.Slice(producers, func(i, j int) bool {
 		return bytes.Compare(producers[i], producers[j]) < 0
@@ -100,6 +230,10 @@ func (v *ConsensusView) ChangeCurrentProducers(changeHeight uint64, spvHeight ui
 	v.producers.ChangeCurrentProducers(changeHeight, spvHeight)
 }
 
+func (v *ConsensusView) UpdateNextProducers(producers []peer.PID, totalCount int) {
+	v.producers.UpdateNextProducers(producers, totalCount)
+}
+
 func (v *ConsensusView) ProducerIndex(signer []byte) int {
 	if len(signer) <= 0 {
 		return -1
@@ -107,8 +241,14 @@ func (v *ConsensusView) ProducerIndex(signer []byte) int {
 	return v.producers.ProducerIndex(signer)
 }
 
+// SetWorkingHeight delegates to Producers.SetWorkingHeight, which is deliberately
+// unlocked; see the comment there before adding a lock to either half.
 func (v *ConsensusView) SetWorkingHeight(workingHeight uint64) {
 	v.producers.SetWorkingHeight(workingHeight)
+}
+
+func (v *ConsensusView) GetWorkingHeight() uint64 {
+	return v.producers.GetWorkingHeight()
 }
 
 func (v *ConsensusView) getCurrentNeedConnectArbiters() []peer.PID {
@@ -117,10 +257,6 @@ func (v *ConsensusView) getCurrentNeedConnectArbiters() []peer.PID {
 
 func (v *ConsensusView) GetNextNeedConnectArbiters() []peer.PID {
 	return v.producers.GetNextNeedConnectArbiters()
-}
-
-func (v *ConsensusView) UpdateNextProducers(producers []peer.PID, totalCount int) {
-	v.producers.UpdateNextProducers(producers, totalCount)
 }
 
 func (v *ConsensusView) IsSameProducers(curProducers [][]byte) bool {
@@ -172,6 +308,8 @@ func (v *ConsensusView) IsCurrentProducers(curProducers [][]byte) bool {
 	return true
 }
 
+// calculateOffsetTime only reads signTolerance, which is immutable after
+// construction, so it needs no lock and is safe to call from either side of mu.
 func (v *ConsensusView) calculateOffsetTime(startTime time.Time,
 	now time.Time) (uint32, time.Duration) {
 	duration := now.Sub(startTime)
@@ -181,50 +319,88 @@ func (v *ConsensusView) calculateOffsetTime(startTime time.Time,
 	return uint32(offset), offsetTime
 }
 
+// UpdateDutyIndex is one composite state transition: it moves the duty index and
+// recomputes whether this node is on duty, and the two must not be observed
+// apart. Hence one lock for both, and the Locked twin for callers that already
+// hold it (RecoverFromStatus).
 func (v *ConsensusView) UpdateDutyIndex(height uint64) {
-	v.producers.UpdateDutyIndex(height)
-
-	currentProducer := v.producers.GetNextOnDutyProducer(v.viewOffset)
-	v.isDposOnDuty = bytes.Equal(currentProducer, v.publicKey)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.updateDutyIndexLocked(height)
 }
 
+// ChangeView moves the view forward, and it is the deepest composite in this
+// file: ResetView forwards to SetChangViewTime, resetViewOffset writes the
+// offset, and DumpInfo walks Producers. All of it happens under one write lock
+// because halfway through, the view is internally inconsistent (new start time,
+// old offset), and a reader that saw that pair would compute a deadline against
+// the wrong start. The logging and the listener call are moved outside the lock:
+// logging can block on I/O, and the listener runs into the miner.
 func (v *ConsensusView) ChangeView(now time.Time, force bool, parentTime uint64) {
-	offset, offsetTime := v.calculateOffsetTime(v.viewStartTime, now)
+	var (
+		offset, effective     uint32
+		offsetTime            time.Duration
+		startTime, changeTime time.Time
+		dutyIndex, viewOffset uint32
+		onDuty                bool
+		dump                  string
+		changed               bool
+	)
+
+	v.mu.Lock()
+	offset, offsetTime = v.calculateOffsetTime(v.viewStartTime, now)
 	if offset > 0 {
 		v.viewStartTime = now.Add(-offsetTime)
-		v.ResetView(uint64(v.viewStartTime.Unix()))
+		// Forwarder, not leaf: SetChangViewTime writes the two times.
+		v.setChangViewTimeLocked(uint64(v.viewStartTime.Unix()))
 	}
 	v.viewOffset += offset
 	if force {
 		offset = 1
-		v.resetViewOffset()
-		v.ResetView(parentTime)
+		v.resetViewOffsetLocked()
+		// Same forwarder, second call site.
+		v.setChangViewTimeLocked(parentTime)
 	}
 
 	if offset > 0 {
-		Info("\n\n\n--------------------Change View---------------------")
-		Info("viewStartTime:", v.viewStartTime, "changeViewTime", v.viewChangeTime, "nowTime:", now, "offset:", offset, "offsetTime:", offsetTime, "force:", force,
-			"viewOffset", v.viewOffset, "dutyIndex", v.producers.dutyIndex)
-		currentProducer := v.producers.GetNextOnDutyProducer(v.viewOffset)
-		v.isDposOnDuty = bytes.Equal(currentProducer, v.publicKey)
-		v.DumpInfo()
-		Info("\n\n\n")
-		if v.listener != nil {
-			v.listener.OnViewChanged(v.isDposOnDuty, force)
-		}
+		changed = true
+		effective = offset
+		startTime = v.viewStartTime
+		changeTime = v.viewChangeTime
+		viewOffset = v.viewOffset
+		dutyIndex = v.producers.GetDutyIndex()
+		onDutyProducer := v.producers.GetNextOnDutyProducer(v.viewOffset)
+		v.isDposOnDuty = bytes.Equal(onDutyProducer, v.publicKey)
+		onDuty = v.isDposOnDuty
+		dump = v.dumpInfoLocked(onDutyProducer)
+	}
+	v.mu.Unlock()
+
+	if !changed {
+		return
+	}
+	Info("\n\n\n--------------------Change View---------------------")
+	Info("viewStartTime:", startTime, "changeViewTime", changeTime, "nowTime:", now, "offset:", effective, "offsetTime:", offsetTime, "force:", force,
+		"viewOffset", viewOffset, "dutyIndex", dutyIndex)
+	Info(dump)
+	Info("\n\n\n")
+	// Outside the lock, and dependent on a property it cannot see: the listener
+	// reaches miner.RequestNewWork, which is non-blocking (miner/worker.go's
+	// requestNewWork, select with default). This is the reason viewMu -> mu does
+	// not exist today; see the note on Dispatcher.
+	if v.listener != nil {
+		v.listener.OnViewChanged(onDuty, force)
 	}
 }
 
+// DumpInfo builds the whole listing under one read lock and prints it after the
+// unlock. Taking a lock per producer instead would give the caller a mixture of
+// snapshots that never existed at one instant, and printing inside the lock
+// would hold viewMu across a write to the log sink.
 func (v *ConsensusView) DumpInfo() {
-	str := "\n"
-	for _, signer := range v.producers.producers {
-		if v.ProducerIsOnDuty(signer) {
-			duty := elacom.BytesToHexString(signer) + " onDuty \n"
-			str = str + duty
-		} else {
-			str = str + elacom.BytesToHexString(signer) + " not onDuty \n"
-		}
-	}
+	v.mu.RLock()
+	str := v.dumpInfoLocked(v.producers.GetNextOnDutyProducer(v.viewOffset))
+	v.mu.RUnlock()
 	Info(str)
 }
 
@@ -233,29 +409,80 @@ func (v *ConsensusView) GetViewInterval() time.Duration {
 }
 
 func (v *ConsensusView) GetViewStartTime() time.Time {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	return v.viewStartTime
 }
 
 func (v *ConsensusView) GetChangeViewTime() time.Time {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	return v.viewChangeTime
 }
 
-func (v *ConsensusView) GetDutyIndex() uint32 {
-	return v.producers.dutyIndex
-}
-
 func (v *ConsensusView) GetViewOffset() uint32 {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	return v.viewOffset
 }
 
+func (v *ConsensusView) GetConsensusStatus() uint32 {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.consensusStatus
+}
+
+// GetViewState returns the three fields a recovering peer needs as one snapshot.
+// Asking three getters would return a status, an offset and a start time that
+// never belonged to the same view.
+func (v *ConsensusView) GetViewState() (status uint32, viewOffset uint32, viewStartTime time.Time) {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.consensusStatus, v.viewOffset, v.viewStartTime
+}
+
+// ResetViewOffset is the exported form of the reset the Dispatcher uses when it
+// restarts a round outside of a ChangeView.
+func (v *ConsensusView) ResetViewOffset() {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.resetViewOffsetLocked()
+}
+
+// ResetView is a forwarder, not a leaf: its body is one call to
+// SetChangViewTime. It takes the lock on its own only because it is exported;
+// ChangeView calls the Locked twin directly, because taking this lock from
+// inside ChangeView's write lock would deadlock on the same goroutine.
 func (v *ConsensusView) ResetView(parentTime uint64) {
-	v.SetChangViewTime(parentTime)
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.setChangViewTimeLocked(parentTime)
 }
 
 func (v *ConsensusView) SetChangViewTime(parentTime uint64) {
-	headerTime := time.Unix(int64(parentTime), 0)
-	v.viewChangeTime = headerTime.Add(v.signTolerance)
-	v.viewStartTime = headerTime
+	v.mu.Lock()
+	defer v.mu.Unlock()
+	v.setChangViewTimeLocked(parentTime)
+}
+
+// RecoverFromStatus applies a recovered view state under one lock. It exists
+// because RecoverFromConsensusStatus needs to set four fields and then recompute
+// the duty flag from them; going through the exported setters would release the
+// lock in between, and another goroutine could read the recovered offset with
+// the pre-recovery start time.
+func (v *ConsensusView) RecoverFromStatus(status uint32, viewOffset uint32, viewStartTime time.Time, workingHeight uint64, finishedHeight uint64) {
+	v.mu.Lock()
+	defer v.mu.Unlock()
+
+	v.consensusStatus = status
+	v.viewOffset = viewOffset
+	v.setChangViewTimeLocked(uint64(viewStartTime.Unix()))
+	// SetWorkingHeight is intentionally unlocked; see Producers.
+	v.producers.SetWorkingHeight(workingHeight)
+	v.isDposOnDuty = v.producerIsOnDutyLocked(v.publicKey)
+	if finishedHeight > 0 {
+		v.updateDutyIndexLocked(finishedHeight)
+	}
 }
 
 func (v *ConsensusView) IsProducers(account []byte) bool {
@@ -263,11 +490,16 @@ func (v *ConsensusView) IsProducers(account []byte) bool {
 }
 
 func (v *ConsensusView) IsOnduty() bool {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
 	return v.isDposOnDuty
 }
 
 func (v *ConsensusView) ProducerIsOnDuty(account []byte) bool {
-	producer := v.producers.GetNextOnDutyProducer(v.viewOffset)
+	v.mu.RLock()
+	offset := v.viewOffset
+	v.mu.RUnlock()
+	producer := v.producers.GetNextOnDutyProducer(offset)
 	return bytes.Equal(producer, account)
 }
 
