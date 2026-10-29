@@ -353,9 +353,35 @@ rc=1
    死锁的指纹之一。所以 `gate.sh` 判的是**这一份日志**能不能当证据，不是"这套代码没有并发问题"。
 4. **它看不到没接线的路径。** 生产者集变更（epoch 边界）在本树里没有调用者，
    再跑一百轮也覆盖不到。这不是量不够，是那条路根本没接上。
-5. **被 SIGKILL 时 `/tmp/pgp-gate.*` 会残留。** 脚本用 `trap ... EXIT` 清临时目录，
-   但 `SIGKILL` 无法捕获。这不是泄漏，是"临时目录里有一份上次崩溃现场的符文"——
-   下次排查看到它，先确认它属于哪个 run，不要当成这次 run 的产物。
+5. **被 SIGKILL 时临时目录会残留——而且不在 `/tmp`。** 实测两次，两个独立成因：
+
+   ```
+   $ echo "$TMPDIR"
+   /var/folders/h2/.../T
+   $ ls -d "${TMPDIR:-/tmp}"/pgp-gate.*
+   .../T/pgp-gate.gq02XM      ← 20:48  我 kill -9 掉的
+   .../T/pgp-gate.kkNRwu      ← 20:11  沙箱自己 SIGKILL 掉的（exit 137）
+   $ ls .../T/pgp-gate.gq02XM/
+   c  e  seal.txt  seal_h.txt  slots.txt
+   ```
+
+   临时目录是 `mktemp -d "${TMPDIR:-/tmp}/pgp-gate.XXXXXX"`，所以**在设了 `TMPDIR` 的机器上它不在 `/tmp`**
+   （macOS 默认就设）。找残留得用 `"${TMPDIR:-/tmp}"/pgp-gate.*`，写死 `/tmp` 会得出
+   "没有残留"这个**假结论**——我第一次就是这么验的，`after: 0`。
+   残留里是这次 run 的中间产物（`seal.txt`、`warn.txt` 之类），所以它既是"上次崩溃现场的符文"，
+   也是**一份日志片段**：下次排查看到它，先确认它属于哪个 run，别当成这次 run 的产物。
+   `trap 'rm -rf "$TMP"' EXIT` 对 `SIGKILL` 无效（信号无法捕获），这是设计边界不是 bug。
+   清理：`rm -rf "${TMPDIR:-/tmp}"/pgp-gate.*`。
+
+   打一次 SIGKILL 只要一条（macOS 没有 `timeout(1)`，用后台 + `kill`）：
+
+   ```
+   $ sh -c 'sh scripts/pbft-devnet/gate.sh .tmp-gate-run & p=$!; sleep 2; kill -9 $p'
+   $ ls -d "${TMPDIR:-/tmp}"/pgp-gate.*
+   ```
+
+   为什么这条值得实测而不是照着 `trap` 推：**推出来的版本说"在 `/tmp` 里"，而它在 `$TMPDIR` 里**。
+   而验证错路径给出的答案是"没有残留"，和"这个 bug 不存在"长得一模一样。
 6. **`exit 2` 的时候没有账目。** G0 读不到输入、或任何 `cannot` 分支触发时，
    脚本在吐判定之前就退出了，所以末行不会有 `gates accounted for`。
    这是有意的：`exit 2` 的含义是**没有产生判定**，不是"产生了零条判定"。
