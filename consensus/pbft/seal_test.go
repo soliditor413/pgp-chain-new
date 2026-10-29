@@ -819,8 +819,25 @@ func TestSingleProducerSealsInOneRound(t *testing.T) {
 				start := time.Now()
 				err := engine.Seal(chain, types.NewBlockWithHeader(header), results, stop)
 				elapsed := time.Since(start)
+				// Deliberately names no root cause. This branch has been reached by
+				// several unrelated defects, and pinning it to whichever one was
+				// current when it was written turns the message into a false lead:
+				//
+				//   - the drain sitting after the self-vote, which ate the round's
+				//     own confirm (the n<=2 permanent stall, R17);
+				//   - a stale isSealOver==1 left by the previous round, so onConfirm
+				//     refused this round's confirm at seal.go's "seal already
+				//     finished" check;
+				//   - a confirm carrying another block's seal hash, which Seal drops
+				//     as stale instead of attaching;
+				//   - the proposal never being registered with the dispatcher, so no
+				//     vote is ever counted (R16).
+				//
+				// The message says what is observed -- the round ended without a
+				// confirm it could attach -- because guessing which of those it is
+				// cost more time than reading the list.
 				if err != nil {
-					t.Fatalf("height %d: Seal failed after %v: %v (ErrRoundAborted here is the drain-after-self-vote regression)",
+					t.Fatalf("height %d: Seal failed after %v: %v (the round did not end with a confirm it could attach; the comment above lists what has caused this before)",
 						height, elapsed.Round(time.Millisecond), err)
 				}
 				// The confirm is produced synchronously, so the round must finish in
