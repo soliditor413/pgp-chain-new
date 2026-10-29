@@ -68,12 +68,26 @@ import (
 // so sleeping less changes nothing about what any verifier accepts -- a verifier
 // accepts or rejects against its own clock alone.
 //
-// A peer that is handed a header dated in its own future does not discard it:
-// 1.9.7 queues it (pgp-chain/core/blockchain.go:1664 -> addFutureBlock:1491,
-// retried every 5s at :2223) and only refuses outright once the gap exceeds
-// maxTimeFutureBlocks, 30s (:88). The real cost of releasing early is therefore
-// the wait, not the loss: the block sits in that peer's queue until header.Time,
-// and for that whole window no node can produce a block on top of that height.
+// A peer that is handed a header dated in its own future does not lose it, but
+// what happens to it depends on how far ahead it is and on which binary the peer
+// runs:
+//
+//   - a peer running this binary takes up to 15s of lead outright, no queue and
+//     no wait (consensus/pgp/pgp.go:227, against allowedFutureBlockTime at :56);
+//     past 15s it is queued and retried every 5s (core/blockchain.go:2404 ->
+//     addFutureBlock:2224, updateFutureBlocks:3356-3357), and refused without
+//     queueing once the gap passes maxTimeFutureBlocks, 30s
+//     (core/blockchain.go:188, applied at :2225);
+//   - a 1.9.7 peer is zero-tolerant in its verifier
+//     (pgp-chain/consensus/pbft/pbft.go:395, :421) and defers through its own
+//     queue instead: pgp-chain/core/blockchain.go:1664 -> addFutureBlock:1491,
+//     retried every 5s at :2223, refused beyond 30s at :88.
+//
+// The real cost of releasing early is therefore the wait, not the loss. The
+// first 15s of lead cost a peer running this binary nothing at all; past that
+// the block sits in a queue until header.Time, and for that whole window no node
+// can produce a block on top of that height. Losing it for good takes more than
+// 30s of lead, which is the case R18 covers.
 //
 // Clamping the pre-delay to a budget B would buy no verification margin at all,
 // for that same reason: the accepted window is set by header.Time, which this

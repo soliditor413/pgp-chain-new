@@ -88,8 +88,15 @@ func (e *Engine) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 		return consensus.ErrUnknownAncestor
 	}
 
-	// The remaining gates cannot move above the rewrite: they depend on the parent
-	// header or on the view this round is about to open.
+	// These four gates depend on engine state only -- recovery status, the finished
+	// height, whether a round is already in flight for this height, and whether this
+	// node is a producer. None of them depends on anything the rewrite above
+	// changes (difficulty, extra, mix digest, uncle hash, nonce), nor on the view
+	// this round would open; they sit here only because the parent lookup does. When
+	// R12 adds its parent-time gate, the lookup and these gates move above the
+	// rewrite together, so that a refused Prepare has not touched the header at all
+	// -- the D6 invariant stated in this file's header, guarded by
+	// TestPrepareIsSideEffectFreeWhenRefused.
 	if atomic.LoadInt32(&e.recovered) == 0 {
 		return ErrWaitRecoverStatus
 	}

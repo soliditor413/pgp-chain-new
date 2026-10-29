@@ -128,9 +128,10 @@ func TestSealForkedWithoutPoSA(t *testing.T) {
 	}
 }
 
-// TestDelayNeverReturnsNil guards miner/worker.go:1418: a nil delay makes the
-// miner warn and stop collecting transactions until the next block, so the
-// router must never pass one through.
+// TestDelayNeverReturnsNil guards the miner against a nil *time.Duration: it
+// dereferences the value at miner/worker.go:1548-1550 without a check, so a nil
+// answer panics on the next transaction arrival. Delay's own comment carries the
+// full chain.
 func TestDelayNeverReturnsNil(t *testing.T) {
 	r := New(&fakeEngine{}, nil, 10)
 

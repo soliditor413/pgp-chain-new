@@ -310,11 +310,16 @@ func (e *Engine) CalcDifficulty(chain consensus.ChainHeaderReader, time uint64, 
 
 // Delay implements consensus.Engine.
 //
-// A nil return is not a valid answer: miner treats it as "something is wrong",
-// warns and stops collecting transactions until the next block
-// (miner/worker.go:1418). When the owning engine cannot be resolved the answer is
-// therefore "no delay", which keeps the miner working on the next block instead
-// of silently starving it of transactions for the rest of this one.
+// A nil return is not a valid answer. The miner reads it as "something is
+// wrong": it logs a warning and clears its stop timer at
+// miner/worker.go:1466-1467, then keeps looping. The fatal part comes later --
+// the next transaction arrival re-derives the delay at miner/worker.go:1547 and
+// passes it to log.Debug as delay.String() at :1548-1550, with no nil check, and
+// time.Duration.String is a value-receiver method, so a nil *time.Duration
+// panics there. That panic does not depend on the log level: arguments are
+// evaluated before the call. When the owning engine cannot be resolved the
+// answer is therefore "no delay", which keeps the miner working on the next
+// block instead of crashing on it.
 func (e *Engine) Delay(chain consensus.ChainReader, header *types.Header, leftOver *time.Duration) *time.Duration {
 	engine, err := e.engineFor(header)
 	if err != nil {
