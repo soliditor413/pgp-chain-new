@@ -445,13 +445,55 @@ rc=1
                                           # criterion's name
    ```
 
-   **能红的是最后那一行；前两行只是给人看的。** 两侧都实测过：
+   **能红的是带 `[ "$after" -eq 0 ]` 的那一行；其余几行只是给人看和留上下文。**
+   两侧都实测过，下面是从上面那组命令逐字跑出来的输出：
 
    ```
    residue: 2 -> 1
-   FAIL cleanup left 1 behind (was 2)     ← 部分删除，判据必须红
-   residue: 2 -> 0                         ← 真清干净，判据通过
+   FAIL cleanup left 1 behind
+   was 2 before the delete
+   residue: 2 -> 0
    ```
+
+   注意`FAIL`那行**没有** `(was 2)`：上下文是单独一行打出来的，**不进判据的名字**。
+   写进名字里，下一个人会以为 `2` 这个值和红不红有关，然后去构造一个
+   "before 必须是 2" 的用例。**判据的名字只写它判的那个东西。**
+
+   **`gate.sh` 自己的退出路径现在也判这一格**——`gate.sh` 里那两条 `trap ... EXIT` / `trap ... INT TERM`
+   （不写行号：这段注释自己就把行号往下推了），但用的是另一套词汇：
+
+   ```
+   $ trap 'rc=$?; rm -rf "$TMP"; if [ -e "$TMP" ]; then printf "\nLEAK cleanup left %s ...\n" "$TMP" >&2; fi; exit "$rc"' EXIT
+   ```
+
+   三件事：
+
+   - **先把 `$?` 存进 `rc` 再跑 `rm`**，否则 `rm` 的返回码会覆盖掉真正的判定结果。
+   - **打 `LEAK`，不打 `FAIL`。** 退出码的契约是"这份日志能不能当证据"，而残留
+     **不改变这个答案**。把 0 改成 1 会让调用方丢掉一份本来可用的日志；叫它 `FAIL`
+     会让读者去找"第几道闸门红了"——**没有那道闸门**。所以它是一条观测，
+     词汇必须和闸门用语分开。
+   - **这里不需要 `before/after`**：`$TMP` 是单元素集，地址就是脚本自己刚写的那个变量，
+     所有权、地址、元素数三者已知。`before/after` 那套是给"任意来源的残留"准备的，
+     也就是上面说的未实施项。
+
+   **它管不到 `SIGKILL`**（trap 根本不执行），那一条只能靠外部计数——这是辖区，不是洞。
+
+   实测是注入出来的，不是照 `trap` 推的：把 `chmod 500 "$TMP"` 注进两个 trap 里
+   `rm` 之前，三条退出路径各跑一次——
+
+   ```
+   .tmp-gate-run   want_rc=0 got_rc=0  LEAK_lines=1  rc unchanged
+   /tmp/a_trunc    want_rc=1 got_rc=1  LEAK_lines=1  rc unchanged
+   /tmp/a_empty    want_rc=2 got_rc=2  LEAK_lines=1  rc unchanged
+   ```
+
+   **第一次注入点选错了**：`chmod 500` 放在 `mktemp` 之后，连闸门写 `$TMP` 的权限
+   一起掐掉了，于是脚本在 G1 就失败——**测的变成"目录不可写"，不是"清理失败"**。
+   注入点必须在 trap 里。
+   另外这个测试自己也抓到一处真缺陷：`rm` 的错误输出**没有结尾换行**，于是
+   `LEAK` 被粘在它后面（`... Operation not permittedLEAK cleanup left ...`），
+   而测试用 `^LEAK` 锚定，**报了 0 行而 LEAK 其实一直在打**。消息现在以换行开头。
 
    **它只覆盖当前 `TMPDIR`。** 在别的 `TMPDIR` 下产生的残留（另一个 shell、`sudo`、
    `launchd`、别的用户、容器）对这一整段**不可见**，既数不到也删不掉——上面那个例子

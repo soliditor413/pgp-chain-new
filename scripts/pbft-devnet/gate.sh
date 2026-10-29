@@ -74,8 +74,31 @@ done
 [ -d "$RUN_DIR" ] || { printf 'CANNOT %s is not a directory\n' "$RUN_DIR" >&2; exit 2; }
 
 TMP=$(mktemp -d "${TMPDIR:-/tmp}/pgp-gate.XXXXXX") || { printf 'CANNOT mktemp\n' >&2; exit 2; }
-trap 'rm -rf "$TMP"' EXIT
-trap 'rm -rf "$TMP"; exit 2' INT TERM
+# The cleanup is checked, not assumed. `rm -rf` returns 0 whether or not it removed
+# anything, so "cleanup succeeded" and "nothing was deleted" are the same output.
+# $TMP is a single element whose address is the variable right above, so the check is
+# simply "does it still exist" -- no before/after counting is needed here. That
+# counting form is for residue from any source, which this script cannot know about.
+#
+# Four things this depends on:
+#   1. $? is saved into rc BEFORE rm runs, otherwise rm's status overwrites the
+#      verdict the script actually reached.
+#   2. The message says LEAK, not FAIL. The exit status contract is "is this log
+#      usable as evidence", and leftover temp files do not change that answer.
+#      Turning 0 into 1 here would make a caller discard a perfectly good log, and
+#      calling it FAIL would send the reader looking for the gate that went red --
+#      there is none. It is an observation, and the vocabulary has to separate it.
+#   3. The message starts with a newline, because rm's own error message does not end
+#      with one. Without it the output reads
+#        rm: /path: Operation not permittedLEAK cleanup left /path
+#      and a reader -- or a grep anchored at ^ -- sees the LEAK text as the tail of
+#      rm's error. Found by the test written for this very feature: it anchored its
+#      grep at ^LEAK and reported zero LEAK lines while they were being printed.
+#   4. This cannot cover SIGKILL: the trap never runs, so the directory stays. That
+#      path is covered by counting from outside, and it is a scope decision, not a
+#      gap -- see README, "the residue is not in /tmp".
+trap 'rc=$?; rm -rf "$TMP"; if [ -e "$TMP" ]; then printf "\nLEAK cleanup left %s (the verdict above is unaffected)\n" "$TMP" >&2; fi; exit "$rc"' EXIT
+trap 'rc=$?; rm -rf "$TMP"; if [ -e "$TMP" ]; then printf "\nLEAK cleanup left %s\n" "$TMP" >&2; fi; exit 2' INT TERM
 
 FAILED=0
 PASSED=0
