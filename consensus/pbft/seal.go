@@ -63,14 +63,25 @@ import (
 // NOT fixed by shortening either wait below.
 //
 // Neither wait is clamped, deliberately, and the block is never released before
-// header.Time. pgp-chain's verifier is zero tolerance on this
-// (consensus/pbft/pbft.go:395 and :421 in 1.9.7 -- any header whose time is in the
-// future is ErrFutureBlock, with no allowedFutureBlockTime-style window), so a
-// block broadcast early is rejected outright by every node that has not upgraded.
-// Clamping the pre-delay to a smaller budget B would trade that interop guarantee
-// for shutdown latency: it would leave this chain tolerating only B - period of
-// clock skew (3s at B=6s), so a verifier whose clock is 4s slow would reject our
-// blocks. The way to shrink the 21s is to refuse to start a round on a
+// header.Time. What that means, exactly: it is a statement about this function,
+// not a claim that an early block would be lost. header.Time is fixed in Prepare,
+// so sleeping less changes nothing about what any verifier accepts -- a verifier
+// accepts or rejects against its own clock alone.
+//
+// A peer that is handed a header dated in its own future does not discard it:
+// 1.9.7 queues it (pgp-chain/core/blockchain.go:1664 -> addFutureBlock:1491,
+// retried every 5s at :2223) and only refuses outright once the gap exceeds
+// maxTimeFutureBlocks, 30s (:88). The real cost of releasing early is therefore
+// the wait, not the loss: the block sits in that peer's queue until header.Time,
+// and for that whole window no node can produce a block on top of that height.
+//
+// Clamping the pre-delay to a budget B would buy no verification margin at all,
+// for that same reason: the accepted window is set by header.Time, which this
+// function cannot move. (The clamp that used to live in this function never
+// clamped the pre-delay -- it limited the vote deadline -- so the argument that
+// stood here had the wrong subject; it is deleted rather than rewritten, because
+// correcting it would still leave a paragraph about a modification nobody was
+// making.) The way to shrink the 21s is to refuse to start a round on a
 // future-dated parent in Prepare, i.e. to gate it at the source; that is M3+ work
 // (R12), not a change to the waits in this function.
 func (e *Engine) Seal(chain consensus.ChainHeaderReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
@@ -197,8 +208,12 @@ func (e *Engine) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 
 	header := block.Header()
 
-	// Wait until the block's own timestamp before asking for the votes: a block
-	// sealed into the future is rejected by allowFutureBlockTime on every peer.
+	// Wait until the block's own timestamp before asking for the votes. Not
+	// because an early block would be thrown away -- a peer queues it until
+	// header.Time -- but because until that moment no node can extend this
+	// height, so releasing it early only moves the same stall somewhere this
+	// process cannot see or bound. See the function comment for why this is not
+	// clamped.
 	delay := time.Unix(int64(header.Time), 0).Sub(e.dispatcher.GetNowTime())
 	if delay > 0 {
 		select {
