@@ -283,6 +283,16 @@ func (v *ConsensusView) IsSameProducers(curProducers [][]byte) bool {
 	return true
 }
 
+// IsCurrentProducers compares the current set with curProducers. Do not delete it
+// for having no caller here: upstream calls it from six sites on the producer-set
+// change path (pgp-chain consensus/pbft/network.go:222/:253/:463/:483/:1132,
+// eth/backend.go:476, and Pbft.IsCurrentProducers forwards to it), so M3 revives
+// it. Note what the sort does: it reorders the shared slice in place, and
+// dutyIndex is an index into that slice -- so the ordering is not cosmetic, it
+// decides who is on duty next, and it is only correct while every node produces
+// the same order. That is why this is left exactly as it is: an in-place sort
+// under p.mtx is the ported behaviour, and "tidying" it into a copy would change
+// which producer a node selects.
 func (v *ConsensusView) IsCurrentProducers(curProducers [][]byte) bool {
 	v.producers.mtx.Lock()
 	defer v.producers.mtx.Unlock()
