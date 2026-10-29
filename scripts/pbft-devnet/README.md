@@ -3,10 +3,10 @@
 这个目录是给 `--pbft.enable` 用的**可执行启动件**：Elastos 格式的 arbiter keystore、
 `legacy.producers` 指向自己公钥的 genesis、以及一键 init/start/stop/status 的脚本。
 
-> **当前状态：能启动、能进到"出块轮次"，但出不了块。**
-> 原因不是配置，是 `consensus/pbft/seal.go` 里的一处顺序问题，见下面
-> [已知阻塞](#已知阻塞必须改代码不是配置问题)。本目录的所有件都已实测跑通到
-> "PBFT 轮次真的跑起来"这一步，卡的最后一环在代码里。
+> **当前状态：单节点 devnet 能稳定出块（每 3 秒一个，已实测到 tip 130）。**
+> 曾经挡住出块的那处 `seal.go` 顺序问题已经修好，证据与验收方法见后面的
+> 「已验证：单节点 devnet 能连续出块（原「已知阻塞」已修复）」一节。
+> 那个旧的"出不了块"叙述保留在该节的"历史形状"里作为排查样本，不再代表现状。
 
 ---
 
@@ -43,6 +43,27 @@ export PGP_DEVNET_PASSWORD='换成你自己的密码'
 
 `geth` 二进制不存在时会自动 `go build -o build/bin/geth ./cmd/geth`。
 **不会**动仓库根目录那个历史遗留的 `geth`。
+
+⚠️ `clean` 删的是**整个 `$PGP_DEVNET_HOME`**，包括 `keys/` 里的 arbiter keystore ——
+不是只清链数据。密钥删了只能重新 `init` 生成一套新的（`legacy.producers` 会跟着变，
+旧链数据也就对不上了）。它需要交互确认；非交互环境（CI、脚本）里必须先给
+`CONFIRM_CLEAN=yes`，否则它会 `aborted; nothing was deleted`。
+
+**顺序陷阱（一定会踩，写死在这里）**：`clean` 之后正确的顺序是
+
+```
+clean → init → verify-keys → start
+```
+
+`verify-keys` 必须在 `init` **之后**。反过来（`clean` 完直接 `verify-keys`）必然失败：
+
+```
+ERROR: no keystores at /Users/you/.pgp-devnet/keys
+```
+
+因为 `verify-keys` 做的事是"用生产代码路径 `dpos.GetDposAccount` 把磁盘上已有的 keystore
+读回来校验"，它**不生成**密钥。`init` 才生成。所以验证顺序错不会证明密钥坏了，
+只会证明还没生成——看到这条报错先看是不是顺序问题，别急着怀疑密码或文件权限。
 
 主要环境变量：
 
@@ -145,9 +166,43 @@ point --datadir at a pgp-chain data directory or wipe this one with 'geth remove
 所以模板里写 `8606211`。它只影响交易签名域，不改变任何 legacy 规则
 （`IsInBSC()` 看的是 `Parlia != nil`，不看 chain id）。
 
-## 已知阻塞（必须改代码，不是配置问题）
+## 已验证：单节点 devnet 能连续出块（原「已知阻塞」已修复）
 
-**症状**：节点能起、能进轮次、日志里出现
+**结论：能出块，已实测。** 曾经挡住高度 1 的那处 `seal.go` 顺序问题已经修好，
+本文这一段从"已知阻塞"改写为"已验证"，下面同时保留它的历史形状，因为它是最好的排查样本。
+
+### 实测数据
+
+采证基线：`seal.go = 50912286a2ca25e05f6164508f276262439778b1`
+（= `b5861d7b4` 的版本）；二进制单独构建在 `build/bin/geth-aqs`，构建前后源码哈希逐字节一致。
+
+| 判据 | 实测 |
+|---|---|
+| 高度连涨 | 同一进程内 1→6 连续，之后每次采样都在涨；本次采证最高 **tip 130** |
+| 块间隔 | 相邻块 `ts` 差全为 **3.000s**（`status` 同步打印 `interval=3s (expected 3)`） |
+| `extra` 长度 | **0x113 = 275 字节** = `143 + 132×1`，全样本一致，`votes=1` |
+| `seal timed out waiting for a confirm` | **0** |
+| `height already has a confirm`（`ErrAlreadyConfirmedBlock`） | **0** |
+| `confirm channel busy` | **0** |
+| 封块总数 | 164 次（跨 8 次启动、6389 行日志），无一次超时 |
+| 单进程最长连续出块 | **45 块** |
+| `status` 分支 | 走到 "≥1 block" 并打印 `PASS: the chain is advancing` |
+| 优雅关停 | 日志 `Blockchain stopped`，`stopped in 4~5s` |
+
+### 修复位（现在的代码长这样）
+
+`consensus/pbft/seal.go` 里 `drainRoundChannels()` + `atomic.StoreInt32(&e.isSealOver, 0)`
+被提到了本轮**任何能产出 confirm 的语句之前**：`ProcessProposal` 之后、`AcceptProposal`
+（自投票）之前。要守住的不变量一句话：
+
+> drain 必须在所有能为本轮产出 confirm 的语句之上，`BroadcastProposal` 必须在它之下。
+
+把广播提到 drain 之前就会复现原 bug：对端可以在 `isSealing=1` 到 drain 之间确认，
+那份 confirm 会被 drain 吃掉。`Seal` 全程只有两处 drain（这里和 `finishRound`）。
+
+### 历史形状（排查样本，不是现状）
+
+当时的现象是节点能起、能进轮次，日志里出现
 
 ```
 INFO  Collect majority signs. Proposal confirmed.       <- confirm 造出来了
@@ -156,34 +211,41 @@ WARN  PBFT: seal timed out waiting for a confirm height=1   <- 6 秒后
 WARN  PBFT: height already has a confirm, refusing to propose height=1
 ```
 
-然后 `eth_blockNumber` 永远是 0。
+然后 `eth_blockNumber` 永远是 0。重启没用：block pool 是内存态，重启后仍卡在同一处。
 
-重启没有用：block pool 是内存态，重启后节点会重新尝试高度 1，仍然在同一处超时。
-44 秒、66 秒的两次观测都是 `seal timed out`，而 4 生产者形状下更糟——6 秒后 view
-轮转到下一个（不存在的）生产者，本节点连提议权都没了。
+旧根因（行号是**修复前**的，只作对照）：
 
-**根因**（`consensus/pbft/seal.go`，行号对当前工作树）：
+1. `:123` `Seal` 先投出自己那一票并同步走 `dispatcher.ProcessVote`；单/双生产者阈值 ≤ 1，
+   这一票当场触发 `onConfirm` → `trySendConfirm` → confirm 进 `confirmCh`（缓冲 1）。
+2. `:165` 的 `drainRoundChannels()` 在这之后才执行，把刚放进来的、属于本轮的 confirm 一起倒掉。
+3. `:168` 的 `select` 永远等不到，6 秒后超时。
+4. 而 `onConfirm` 早已 `blockPool.AppendConfirm` 记下该高度，重试时 `GetConfirmByHeight`
+   命中并返回 `ErrAlreadyConfirmedBlock`，高度 1 永久卡死。
 
-1. `:123` `Seal` 先投出自己那一票，并同步走 `dispatcher.ProcessVote`；
-   单/双生产者时阈值 ≤ 1，这一票当场就触发 `onConfirm` → `trySendConfirm`
-   → 把 confirm 放进 `confirmCh`（缓冲 1）。
-2. `:165` 的 `e.drainRoundChannels()` 在**这之后**才执行，它的职责是清掉上一轮的残留，
-   但它会**把刚放进去的、属于这一轮的 confirm 一起倒掉**。
-3. `:168` 的 `select` 于是永远等不到 confirm，6 秒后超时。
-4. 而 `onConfirm` 早先已经 `blockPool.AppendConfirm` 把这个高度的 confirm 记下了，
-   所以重试时 `:74` 的 `GetConfirmByHeight` 命中，返回 `ErrAlreadyConfirmedBlock`——
-   高度 1 被永久卡住。
+这个 bug 之所以没被测出来：`seal_test.go` 原有用例全是 12 生产者 + 对端投票，
+绕开了"自己那一票就够"的路径。修完之后补的 `TestSingleProducerSealsInOneRound`
+（`producers=1` / `producers=2` 两个子用例）就是钉这条路径的。
 
-**最小修复方向（本次没有改，留给代码负责人）**：把 `:165` 的
-`drainRoundChannels()` + `atomic.StoreInt32(&e.isSealOver, 0)` 提到本轮
-**任何投票之前**（例如 `:88` `blockPool.AddToBlockMap` 之前，或 `:59` 进门处），
-语义不变（跨轮残留照样被清；`select` 前还有 `:177` 的 seal hash 比对兜底），
-但不会再吞掉本轮的 confirm。
+### 但有一件事要跟"链是不是好的"分开看：SIGKILL 之后的回退
 
-**修复后怎么验收**：`PRODUCERS=1 ./run.sh init && ./run.sh start`，
-`./run.sh status` 应在 3 秒内看到 `block 1 ... extra=275B votes=1`，
-之后每 3 秒一个块。建议同时加一个 `consensus/pbft` 内的单生产者单测——现有
-`seal_test.go` 全部用 12 生产者 + 对端投票，绕开了这条路径，所以这个 bug 才没被测出来。
+我采证时所在的执行环境会在几十秒后**硬杀进程（SIGKILL）**，于是观测到一个现象：
+重启后 head 回退到上一个落盘高度，同一高度被**重新产出、哈希不同**。实测片段：
+
+```
+每次启动加载的 head：0 → 13 → 13 → 13 → 45 → 62 → 62 → 107
+高度 14 的 4 次 seal，4 个不同 hash（ca82f3/103466/d50391/717daf）
+```
+
+**这不是共识分叉，也不是出块能力有问题**，是 R12 那条"关机不能中断进行中的 Seal"
+在本 devnet 上的可观测形态：进程被 SIGKILL 时，最后几个块还没落盘，重启就从未落盘处继续，
+于是同样的高度会被合法地再产一次。
+
+由此得出两条使用纪律：
+
+1. **验"连涨 ≥3 高度"必须在同一次不间断运行里采。** 跨重启把数字拼起来会看到重复高度，
+   很容易误判成"链在回滚"。
+2. **要停就 `./run.sh stop`（SIGTERM），别 `kill -9`。** 优雅关停会干净落盘，
+   `stop` 在 4~5 秒内返回；硬杀则会丢最后几个块并触发上面的重复高度。
 
 ## 关停可能要多等几秒（不是挂死）
 
@@ -193,6 +255,38 @@ WARN  PBFT: height already has a confirm, refusing to propose height=1
 实测：出一轮中 `stop` → `stopped in 5s`；不在轮次里 → `stopped in 2s`。
 `./run.sh stop` 默认最多等 30 秒（`STOP_TIMEOUT`）再报"还活着"。
 **不要**在这 6 秒内 `kill -9`，那会让 leveldb 少一次干净落盘。
+
+## 日志里会看到、但属于正常工作的几行
+
+排查时先把这几行认出来，别当成故障。
+
+### `WARN FinishedProposal received fork block height N`
+
+**它是我们自己的出块路径在正常工作，不是错误。**
+
+机理在 `dpos/dispatcher.go:256-261` 的水位守卫：`if height <= d.finishedHeight { return }`。
+链头追平之后，同一个高度再被喂进来就会被这里短路，并打这一行。
+
+所以计数会比高度数大：实测 164 次封块时这条 WARN 出现 140 次左右（数量随重启/回退变化）。
+`WARN 数 > 高度数` 是因为快照重放与回退窗口会让同一高度被重复喂几次，**不是分叉**。
+
+**这条同时是 M3 的判据，请一并记下来：**
+
+- **M3 上线后这行 WARN 应当降到接近 0。** 那时会有别的生产者的块进来，水位守卫不再短路。
+- 但"WARN 消失"**不等于**"一切变好"：它恰好是 R19 暴露面从 0 变成"每块一次"的信号
+  （`CleanProposals` 重建票数 map 与 `processVote` 无锁写同一批 map 的竞态）。
+  所以 **`#13` 必须在 M3 之前落地**。
+- 看到这里的人不要因为 WARN 没了就以为问题解决了；先确认 `#13` 的状态。
+
+### `WARN pgp: legacy ELA precompile set incomplete`
+
+12 个 ELA 跨链预编译里 11 个要等 SPV 注册。空块不触发任何预编译，**devnet 上可以忽略**。
+
+### `WARN Unknown config environment variable envvar=...`
+
+geth 会把环境里**所有 `GETH_*`** 当作配置覆盖项。`run.sh` 早先自己导出的 `GETH_BIN`
+就撞上过这条（已在 `start` 里 `unset`）。如果你在自己的环境里看到它指向别的变量，
+先 `env | grep ^GETH_` 看看是不是有杂散变量会影响节点配置。
 
 ## 安全注意
 
@@ -291,9 +385,44 @@ PBFT 那条是实测原文）：
 Fatal: field corresponding to 'InfluxDBPassword' in metrics.Config cannot be set through TOML
 ```
 
-PBFT 那个字段是本移植新建的、没有存量配置文件，所以能直接关。Metrics 这两个不行：
-正确的做法是一次迁移（保留 TOML 读取并打 deprecated 警告，同时让 `dumpconfig` 不输出），
-gencodec 的单个 tag 表达不了这件事，得手写 `MarshalTOML` 或改成输出侧过滤。那是独立工作量。
+PBFT 那个字段是本移植新建的、没有存量配置文件，所以能直接关。Metrics 这两个不行。
+
+### 想修的话，能走的路只有两条（**都尚未实施**）
+
+一个常见的误判值得先写清：**"加 `toml:"-"` + 把 `metrics.Config.InfluxDBPassword` 加进
+`cmd/geth/config.go` 的 `deprecatedConfigFields`"这样组合是不成立的。**
+`deprecatedConfigFields` 只对"结构体里已经没有这个字段"生效。naoina/toml 的
+`fieldCache.findField`（`util.go:42-56`）先在字段表里查名字：
+
+- 名字**查不到** → 调 `MissingField` → `deprecatedConfigFields` 可以把错误降级成
+  `Config field '...' is deprecated and won't have any effect.` 的 warn；
+- 名字**查到了、但 tag 是 `toml:"-"`**（`info.ignored`）→ 直接返回
+  `field corresponding to ... cannot be set through TOML`，**`MissingField` 根本不会被调用**。
+
+实测（`naoina/toml v0.1.2-0.20170918210437`，本仓库 go.sum 里的那个版本，
+最小复现程序放在仓库外）：
+
+```
+== 字段仍在、tag 为 toml:"-" ==
+    ERROR: line 1: field corresponding to `A' in main.Tagged cannot be set through TOML
+    （MissingField 未被调用）
+
+== 字段已从结构体删除 ==
+    MissingField called: id=main.Removed.A
+    ok, value=&{B:}
+```
+
+所以：
+
+| 路径 | 做法 | 代价 | 评价 |
+|---|---|---|---|
+| A. 删字段 + 登记 | 从 `metrics.Config` 里**删掉**两个字段，同时把 `"metrics.Config.InfluxDBPassword"` / `"metrics.Config.InfluxDBToken"` 加进 `deprecatedConfigFields` | 老配置不再 Fatal，只 warn，但**这两个值从此读不进来**（配置静默失效，只剩一条 warn）。要还让用户能用，得给一个不带 TOML 的入口（flag / 环境变量），否则等于撤掉功能 | 可行但降级 |
+| B. 只挡输出 | 保留字段与 `--config` 读取，给 `metrics.Config` 加一个 `MarshalTOML`（或包一层只用于输出的结构），序列化时丢掉这两个键 | 一个方法，读取路径零改动，`dumpconfig` 干净，**无升级中断**，功能不丢 | **推荐** |
+
+B 之所以是正解：泄漏发生在**输出侧**，而 `toml:"-"` 是**输入侧**的开关，用输入侧的开关去堵输出侧，
+就必然要牺牲兼容性。改输出侧不动输入侧，才既止漏又不破坏存量配置。
+
+两条都**没有做**，本轮按 team-lead 的决定留给独立迁移窗口。
 
 **本轮规避（用户侧可执行）**：
 
@@ -307,8 +436,11 @@ gencodec 的单个 tag 表达不了这件事，得手写 `MarshalTOML` 或改成
 
 ## 未验证 / 已知缺口
 
-- `run.sh status` 的"≥1 个块"分支（extra 长度反算、间隔计算）**没有在真实链上跑过**，
-  因为当前代码出不了块。代码路径已写好，修复后请重点看这一段。
+- `run.sh status` 的"≥1 个块"分支已经在真实链上跑通了（1..6、46→47、70→71 都采过），
+  但**它是先在真实链上崩了三次才修通的**：`rpc()` 用 `"$*"` 拼参数导致
+  `["0x1" false]` 不是合法 JSON、`json_get` 在 jq 下把缺失键打印成字面量 `null`
+  再进算术展开、`cmd_status` 不校验字段就做算术。修法见脚本内注释。教训：
+  "分支写好了"和"分支跑过"是两件事，只有出块之后才可能知道。
 - 多节点（4 生产者 + 相互投票）：`pbft.Transport` 无实现，本树做不到。
 - ELA SPV 服务会尝试连 ELA 主网（`startSpv` 对 legacy 链是强制的），devnet 上连不上
   任何 ELA peer，只会在日志里留下连接尝试，不影响空块出块。
