@@ -39,6 +39,22 @@ import (
 //	proposalMu -> mu   forbidden. Nothing may acquire mu while holding
 //	                   proposalMu -- which is why CleanProposals takes its two
 //	                   locks in two separate critical sections instead of one.
+//	mu -> viewMu       allowed, from this file's own CleanProposals branch and
+//	                   nowhere else yet. viewMu is not a leaf: it nests into
+//	                   producers.mtx, so the chain is mu -> viewMu -> producers.mtx.
+//	viewMu -> mu       forbidden. Nothing may take mu while holding viewMu.
+//	                   proposalMu stays a leaf and must not be taken under viewMu.
+//
+// The last two rows name a lock that does not exist yet: ConsensusView has no
+// lock today, so GetViewOffset is a bare read and mu -> viewMu is not an edge
+// there until R20 (#17) adds one. They are in the table early because that edge
+// is created by this file's function body, not by its callers -- CleanProposals
+// (true) has no caller in this tree -- and a lock order that only described
+// today's call graph would have to be rewritten on the day someone wires the
+// branch, by whoever is least equipped to notice. Note the direction: the
+// dispatcher may take the view's lock, the view must never take the
+// dispatcher's, because ConsensusView's callers include this file's critical
+// sections and not the other way round.
 //
 // The forbidden edge is not a style rule, it is a deadlock: code that took
 // proposalMu and then mu would run head-on into ProcessVote, which takes mu and
