@@ -93,9 +93,18 @@ need_tool() { command -v "$1" >/dev/null 2>&1; }
 # jq is preferred; python3 is the fallback so the script works on a machine
 # without jq.
 json_get() {
-    local path=$1
+    local path=$1 out=""
     if need_tool jq; then
-        jq -r "$path"
+        # jq -r prints the literal `null` for a missing key, and a bare `null`
+        # reaching an arithmetic expansion makes bash look for a variable called
+        # `null` (and abort under set -u, with a message that names neither the
+        # path nor the response). Normalise it to the empty string so both
+        # backends share one contract: "missing means empty".
+        out=$(jq -r "$path") || return 1
+        if [ "$out" = "null" ]; then
+            out=""
+        fi
+        printf '%s' "$out"
     elif need_tool python3; then
         python3 -c '
 import json, re, sys
@@ -125,11 +134,22 @@ else:
     fi
 }
 
+# rpc sends one JSON-RPC call. Parameters are joined with commas: "$*" would
+# glue them together without separators, so the two-argument call
+# `eth_getBlockByNumber "0x1" false` would serialise as `["0x1" false]` -- not
+# JSON, and geth answers with a parse error instead of a block. That failure is
+# silent unless the caller checks for it, which is exactly how the per-block part
+# of `status` managed to look implemented while never having run.
 rpc() {
     local method=$1
     shift
+    local params="" sep="" arg
+    for arg in "$@"; do
+        params+="$sep$arg"
+        sep=","
+    done
     curl -s -m 5 -X POST -H 'Content-Type: application/json' \
-        --data "{\"jsonrpc\":\"2.0\",\"method\":\"$method\",\"params\":[$*],\"id\":1}" \
+        --data "{\"jsonrpc\":\"2.0\",\"method\":\"$method\",\"params\":[$params],\"id\":1}" \
         "http://$HTTP_ADDR:$HTTP_PORT"
 }
 
@@ -165,8 +185,22 @@ ensure_geth() {
 # cheap way to tell a binary that predates the environment wiring apart from one
 # that supports it. Guessing would be worse than asking: a wrong guess starts the
 # node as a silent verifier.
+#
+# Do NOT write this as `"$GETH_BIN" --help | grep -q ...`. Under `set -o pipefail`
+# that reads a SIGPIPE as a failure: grep exits at the match, geth is still
+# writing, the writer gets EPIPE, the pipeline returns 141 and the answer is
+# "no". Measured on this tree: `geth --help | grep -q GETH_PBFT_KEYSTORE_PASSWORD`
+# returns 141 five times out of five with pipefail and 0 without -- and the
+# consequence of the false negative is not cosmetic: cmd_start then falls back to
+# `--pbft.keystore.password`, putting the password in argv where `ps` can see it.
+# Capturing the output first has no such race.
 env_password_supported() {
-    "$GETH_BIN" --help 2>&1 | grep -q 'GETH_PBFT_KEYSTORE_PASSWORD'
+    local help
+    help=$("$GETH_BIN" --help 2>&1 || true)
+    case "$help" in
+        *GETH_PBFT_KEYSTORE_PASSWORD*) return 0 ;;
+        *) return 1 ;;
+    esac
 }
 
 is_running() {
@@ -308,8 +342,16 @@ cmd_start() {
     # terminal addresses geth itself: exec keeps the pid.
     printf '%s\n' "producer" > "$HOME_DIR/mode"
     printf '%s\n' "$$" > "$PIDFILE"
+    # geth applies every GETH_*-prefixed variable in the environment as a config
+    # override, so it would otherwise warn "Unknown config environment variable
+    # envvar=GETH_BIN" about our own variable -- and, worse, silently honour any
+    # other GETH_* the operator happens to have exported. Copy the path into a
+    # local name, then clear ours; GETH_PBFT_KEYSTORE_PASSWORD stays, because
+    # that one geth genuinely reads.
+    local geth_exe=$GETH_BIN
+    unset GETH_BIN
     exec > >(tee -a "$logfile") 2>&1
-    exec "$GETH_BIN" \
+    exec "$geth_exe" \
         --datadir "$DATA_DIR" \
         --networkid "$CHAIN_ID" \
         --nodiscover --maxpeers 0 --port "$P2P_PORT" \
@@ -395,11 +437,21 @@ cmd_status() {
     local n hdr num_hex ts extra diff miner extra_len
     for n in $(seq "$first" "$tip"); do
         hdr=$(rpc eth_getBlockByNumber "\"$(printf '0x%x' "$n")\"" false)
-        num_hex=$(printf '%s' "$hdr" | json_get '.result.number')
-        ts=$(printf '%s' "$hdr" | json_get '.result.timestamp')
-        extra=$(printf '%s' "$hdr" | json_get '.result.extraData')
-        diff=$(printf '%s' "$hdr" | json_get '.result.difficulty')
-        miner=$(printf '%s' "$hdr" | json_get '.result.miner')
+        num_hex=$(printf '%s' "$hdr" | json_get '.result.number' 2>/dev/null || true)
+        ts=$(printf '%s' "$hdr" | json_get '.result.timestamp' 2>/dev/null || true)
+        extra=$(printf '%s' "$hdr" | json_get '.result.extraData' 2>/dev/null || true)
+        diff=$(printf '%s' "$hdr" | json_get '.result.difficulty' 2>/dev/null || true)
+        miner=$(printf '%s' "$hdr" | json_get '.result.miner' 2>/dev/null || true)
+        # Check every field before doing arithmetic on it. Without this the script
+        # dies with `null: unbound variable` -- naming neither the height nor the
+        # RPC response, which is the opposite of a useful error.
+        if [ -z "$num_hex" ] || [ -z "$ts" ] || [ -z "$extra" ] || [ -z "$diff" ]; then
+            die "eth_getBlockByNumber 0x$(printf '%x' "$n") returned no usable block: $hdr"
+        fi
+        case "$extra" in
+            0x*) ;;
+            *) die "block $n has a malformed extraData: $extra" ;;
+        esac
         extra_len=$(( (${#extra} - 2) / 2 ))
         local votes=$(( (extra_len - 143) / 132 ))
         log "block $(( num_hex ))  ts=$(( ts ))  difficulty=$(( diff ))  extra=${extra_len}B  votes=$votes"
