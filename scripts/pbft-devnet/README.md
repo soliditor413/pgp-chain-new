@@ -177,7 +177,15 @@ point --datadir at a pgp-chain data directory or wipe this one with 'geth remove
 （= `b5861d7b4` 的版本）；二进制单独构建在 `build/bin/geth-aqs`，构建前后源码哈希逐字节一致。
 
 下表是**一个时间点的快照**（7278 行日志那次）。封块数与日志行数会随着你继续跑而增长，
-但下面几项**比值与分布是稳定的**，可以直接当判据用。
+所以这里**故意保留两个快照、不收敛成一个"正确数字"**：
+
+- 主表用**最新快照**：187 块 / 187 行 WARN / 178 个段内 `+3.000s` 间隔 / 8 处重启断口；
+- 保留更早那个 **6389 行快照**（164 : 164）作为**第二样本**。
+
+**判据是比值与分布，不是绝对值。** 两个样本在**比值**上一致（都是严格 1:1），
+这比任何一个单独的数字都强；谁跑得更久谁的数字就更大，争"哪个才对"没有意义。
+（间隔分布那两行 `178` / `8` 是主表这次快照的数，第二样本对应的是它自己那一组，
+不必对齐，看的是"绝大多数恰为 +3s、少数是重启断口"这个形状。）
 
 | 判据 | 实测 |
 |---|---|
@@ -200,9 +208,40 @@ point --datadir at a pgp-chain data directory or wipe this one with 'geth remove
 
 两个快照都是严格相等：6389 行那次是 **164 : 164**，7278 行这次是 **187 : 187**。
 
-这不是巧合。它对应 `dpos/dispatcher.go:256-261` 的水位守卫：本节点每封一个块，
-链头就被自己的块推进一步，之后 `FinishedProposal` 再喂同一个高度必然被
-`if height <= d.finishedHeight { return }` 短路，于是**恰好**打一行 WARN。
+**而且不只是条数相等**（这一条是 QA 补的，我在当前日志上复算过）：
+
+- 封块的高度序列与 WARN 的高度序列**逐元素相同** —— 第 k 次封块的高度 == 第 k 行 WARN 的高度；
+- 两个序列的**高度和都是 12845**。
+
+所以这 187 行 WARN 是**按高度、按顺序一一配上的**，不是"计数碰巧相等"。
+`WARN 数 > 封块数` 只会在重启重放/回退窗口出现（那时序列才会错开），
+`WARN 数 < 封块数` 则说明有块封出来了却没走到水位守卫 —— 那才是要查的信号。
+
+复算命令（当前日志实测输出粘在下面）：
+
+```console
+$ L=~/.pgp-devnet/logs/geth.log
+$ A=$(grep -o 'Successfully seal and write new block.*number=[0-9]*' $L | grep -o '[0-9]*$')
+$ B=$(grep -o 'fork blockheight[0-9]*' $L | grep -o '[0-9]*$')
+$ [ "$A" = "$B" ] && echo identical
+identical
+$ echo "$A" | paste -sd+ - | bc; echo "$B" | paste -sd+ - | bc
+12845
+12845
+```
+
+注意第二条 grep 的模式是 `fork blockheight`（**连体、没有空格**），这不是笔误，
+是当前代码的真实输出格式，原因见「已知缺口」里的日志格式回归。
+
+这不是巧合。它对应 `Dispatcher.FinishedProposal` 里的水位守卫（`dpos/dispatcher.go`，
+锚点用那句代码、不要用行号 —— 它在 `f7c38120c` 之后从 `:256` 漂到了 `:280`）：
+
+```go
+if height <= d.finishedHeight { return }
+```
+
+本节点每封一个块，链头就被自己的块推进一步，之后 `FinishedProposal` 再喂同一个高度
+必然被这行短路，于是**恰好**打一行 WARN。
 
 这个 1:1 有两层用处：
 
@@ -211,6 +250,8 @@ point --datadir at a pgp-chain data directory or wipe this one with 'geth remove
    无锁争用那批票数 map 的前提是"有第二个投票者"，而单节点 devnet 的每一票都来自
    自己那一票，且与 `FinishedProposal` 同协程。1:1 说明水位守卫逐块生效、
    没有第二条投票路径被走到 —— 这比"代码上推导不可达"硬。
+   （争用本身已由 `f7c38120c` 上了锁；这个签名的用途不变：它是**当时**判"这条路径没被
+   走到"的现场依据，重跑时仍然可以照这个比值来看链路健康。）
 
 ### 修复位（现在的代码长这样）
 
@@ -283,15 +324,29 @@ WARN  PBFT: height already has a confirm, refusing to propose height=1
 
 排查时先把这几行认出来，别当成故障。
 
-### `WARN FinishedProposal received fork block height N`
+### `WARN FinishedProposal received fork blockheight N`
 
 **它是我们自己的出块路径在正常工作，不是错误。**
 
-机理在 `dpos/dispatcher.go:256-261` 的水位守卫：`if height <= d.finishedHeight { return }`。
+真实日志行（照抄，注意 `block` 和高度**连在一起**、中间没有空格）：
+
+```
+WARN [10-29|13:52:03.379] FinishedProposal received fork blockheight1
+WARN [10-29|13:52:06.001] FinishedProposal received fork blockheight2
+```
+
+`blockheight1` 不是笔误，也不是我抄漏了空格 —— 当前代码就是这么打的。
+原因与影响见「已知缺口」里的**日志格式回归**：上游原版是 `... fork block height 1`
+（`fmt.Sprintln`，带空格），本移植把 helper 换成 `fmt.Sprint` 之后空格没了。
+所以**做 grep 时不要写成 `fork block height`**，那样一行都匹配不到。
+
+机理在 `Dispatcher.FinishedProposal` 的水位守卫（`dpos/dispatcher.go`，找那句
+`if height <= d.finishedHeight`，别按行号找 —— 它在 `f7c38120c` 之后已经漂过一次）。
 链头追平之后，同一个高度再被喂进来就会被这里短路，并打这一行。
 
 所以它的计数**不是随机的**：实测封块数与该 WARN 数**严格 1:1**
-（6389 行快照 164 : 164，7278 行快照 187 : 187）。本节点每封一个块就推进一步链头，
+（6389 行快照 164 : 164，7278 行快照 187 : 187；两个高度序列还逐元素相同、高度和都是 12845，
+见上面「一个值得记住的签名」）。本节点每封一个块就推进一步链头，
 随后同高度的 `FinishedProposal` 必然被短路，正好一行。`WARN 数 > 高度数` 的部分来自
 重启后的重放/回退窗口重复喂同一高度，但**每个成功封出的块恰好一行**这一点不变。
 
@@ -300,7 +355,9 @@ WARN  PBFT: height already has a confirm, refusing to propose height=1
 - **M3 上线后这行 WARN 应当降到接近 0。** 那时会有别的生产者的块进来，水位守卫不再短路。
 - 但"WARN 消失"**不等于**"一切变好"：它恰好是 R19 暴露面从 0 变成"每块一次"的信号
   （`CleanProposals` 重建票数 map 与 `processVote` 无锁写同一批 map 的竞态）。
-  所以 **`#13` 必须在 M3 之前落地**。
+  代码侧 `f7c38120c` 已经把重建整段放进 `d.mu`（`CleanProposals` 里 `d.mu.Lock()` 之后
+  才 `make` 那四张 map），但**任务板上的 `#13` 仍未关闭** —— 以任务板为准，不要以
+  commit 标题为准。
 - 看到这里的人不要因为 WARN 没了就以为问题解决了；先确认 `#13` 的状态。
 
 ### `WARN pgp: legacy ELA precompile set incomplete`
@@ -326,9 +383,16 @@ geth 会把环境里**所有 `GETH_*`** 当作配置覆盖项。`run.sh` 早先�
    之外——能被从磁盘文件里读回来的密码不算秘密。所以只有两条路：
    - `GETH_PBFT_KEYSTORE_PASSWORD` 环境变量（**默认走这条**）；
    - `--pbft.keystore.password` 命令行参数（本机任何用户都能 `ps` 看到）。
-   `run.sh` 会先 `"$GETH_BIN" --help | grep GETH_PBFT_KEYSTORE_PASSWORD` 判断这个二进制
-   认不认环境变量：认就用环境变量（**密码既不进 argv 也不落盘**），不认才退回命令行并
-   打警告（否则节点会静默降级成只验证不出块）。`ARGV_PASSWORD=1` 可以强制用命令行。
+   `run.sh` 的 `env_password_supported()` 会先跑 `"$GETH_BIN" --help` 并**把输出整段接住**，
+   再在 bash 里判断里面有没有 `GETH_PBFT_KEYSTORE_PASSWORD`：认就用环境变量（**密码既不进
+   argv 也不落盘**），不认才退回命令行并打警告（否则节点会静默降级成只验证不出块）。
+   `ARGV_PASSWORD=1` 可以强制用命令行。
+
+   这里曾经写的是 `"$GETH_BIN" --help | grep -q GETH_PBFT_KEYSTORE_PASSWORD`，
+   在 `set -o pipefail` 下 `grep -q` 一匹配就退出、写端 `--help` 收到 EPIPE，
+   管道整体返回 **141**，于是探测**恒假**、"不认环境变量"分支被静默选中 —— 密码回到了 argv 里。
+   **改法就是"不要在不该用管道的地方用管道"**：捕获输出再用 `case` 匹配。
+
    实测：走环境变量启动后 `ps` 里 grep 不到密码，日志有
    `Config environment variable found envvar=GETH_PBFT_KEYSTORE_PASSWORD`，
    且仍能签名出 confirm（说明 keystore 真的被解开了）。
@@ -535,5 +599,18 @@ B 需要正确实现一个接口，写错了什么都不说。这与本项目反
   再进算术展开、`cmd_status` 不校验字段就做算术。修法见脚本内注释。教训：
   "分支写好了"和"分支跑过"是两件事，只有出块之后才可能知道。
 - 多节点（4 生产者 + 相互投票）：`pbft.Transport` 无实现，本树做不到。
+  规划互通/多节点测试时**别用"等 ticker 排空就自愈"带过 R18 的第二档**：
+  `(now_v, now_v+30]` 这一档不会永久丢块，但 `ChangeView` 用的 5s ticker 大于 3s 的
+  `blockPeriod`，排空有可能**跨过一个出槽位**；落后对端若在重锚之后正落在自己 on-duty 的
+  视图上，就会产出同高度的竞争块。这一档要**单独造场景**验，不是在长跑里顺带看一眼。
+- **日志格式回归（移植引入，已立项 `#20`，排在 `#13` / R20 之后）。**
+  `dpos/log.go` 的四个 helper 是 `glog.Warn(fmt.Sprint(a...))`，而 `fmt.Sprint` 只在
+  "两个操作数都不是字符串"时才插空格；上游原版走 `fmt.Sprintln`，是
+  `... fork block height N`，现在是 `... fork blockheightN`。**约 300 个调用点被静默改掉了格式**
+  —— 而 `dpos/log.go` 的注释恰好写着"helper 名字保持不变、便于逐行对照原版 review"：
+  名字保住了，语义没保住。
+  影响：M3 与本项目要对齐的 1.9.7 节点日志**不能直接逐行对照**，所有按原文 grep 的排查手册
+  （包括本文）都会失配。本文的做法是**按当前实际格式写证据行**；这条修完之后只需要改
+  本文里那一个字符串，别处不用动。
 - ELA SPV 服务会尝试连 ELA 主网（`startSpv` 对 legacy 链是强制的），devnet 上连不上
   任何 ELA peer，只会在日志里留下连接尝试，不影响空块出块。
