@@ -510,24 +510,39 @@ func (v *ConsensusView) SetChangViewTime(parentTime uint64) {
 	v.setChangViewTimeLocked(parentTime)
 }
 
-// RecoverFromStatus applies a recovered view state under one lock. It exists
-// because RecoverFromConsensusStatus needs to set four fields and then recompute
-// the duty flag from them; going through the exported setters would release the
-// lock in between, and another goroutine could read the recovered offset with
-// the pre-recovery start time.
+// RecoverFromStatus applies a recovered view state under one acquisition of the
+// view lock. It exists because RecoverFromConsensusStatus needs to set four
+// fields and then recompute the duty flag from them; going through the exported
+// setters would release the lock in between, and another goroutine could read
+// the recovered offset with the pre-recovery start time.
 //
-// One lock, but not one atomic transaction over the five fields, and the
-// difference is worth stating because the previous shape invites the wrong
-// conclusion. p.mtx is taken twice with a release in between: once by
-// UpdateWorkingHeight, once by updateDutyIndexLocked through
-// Producers.UpdateDutyIndex. ChangeCurrentProducers takes p.mtx and does not take
-// this lock -- the comment on it says why it must not -- so it can land between
-// the two, and the duty index can end up computed from a working height that
-// someone else just changed. Before R20 the same window was a data race; now it
-// is a legal interleaving. That is better, it is not atomic, and calling it
-// atomic would hide the remaining window from the next reader. Closing it needs
-// one Producers entry point that does both under a single acquisition, which is
-// a separate change rather than a note here.
+// One acquisition of v.mu, not one atomic transaction. The five view fields are
+// stored atomically with respect to anyone who takes the view lock; what is not
+// atomic is the value one of them was derived from. isDposOnDuty is derived from
+// Producers state, and reaching that state costs more than one p.mtx
+// acquisition -- two when finishedHeight is 0, four when it is positive, because
+// updateDutyIndexLocked sits inside that branch. In execution order:
+// UpdateWorkingHeight is #1; producerIsOnDutyLocked is #2, inside
+// GetNextOnDutyProducer; updateDutyIndexLocked then takes #3 inside
+// Producers.UpdateDutyIndex and #4 inside the GetNextOnDutyProducer that follows
+// it. All of them take the write lock, including the ones that only read --
+// GetNextOnDutyProducer is not an RLock and does not pretend to be one.
+//
+// ChangeCurrentProducers takes p.mtx and does not take this lock -- the comment
+// on it says why it must not -- so it can land in the gaps between those
+// acquisitions: one gap before the branch, two more inside it. The last one is
+// the one worth naming: between #3 and #4 the duty index has already been
+// rewritten and isDposOnDuty has not been recomputed from it yet, so a
+// producer-set change landing there leaves this node deriving its
+// block-production flag from a new duty index against a different producer
+// slice. Every step holds a lock; the combination never existed. Locks stop
+// tearing, not composition.
+//
+// Before R20 the same gaps were data races; now they are legal interleavings
+// with names. That is better, it is not atomic, and calling it atomic would hide
+// the remaining gap from the next reader. Closing it needs one Producers entry
+// point that does all of them under a single acquisition, which is a separate
+// change rather than a note here.
 func (v *ConsensusView) RecoverFromStatus(status uint32, viewOffset uint32, viewStartTime time.Time, workingHeight uint64, finishedHeight uint64) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
