@@ -241,10 +241,11 @@ func (v *ConsensusView) ProducerIndex(signer []byte) int {
 	return v.producers.ProducerIndex(signer)
 }
 
-// SetWorkingHeight delegates to Producers.SetWorkingHeight, which is deliberately
-// unlocked; see the comment there before adding a lock to either half.
+// SetWorkingHeight delegates to Producers.UpdateWorkingHeight, which takes p.mtx.
+// The view lock plays no part here: workingHeight is Producers' field, and p.mtx
+// is the only lock that can order it against UpdateDutyIndex' read.
 func (v *ConsensusView) SetWorkingHeight(workingHeight uint64) {
-	v.producers.SetWorkingHeight(workingHeight)
+	v.producers.UpdateWorkingHeight(workingHeight)
 }
 
 func (v *ConsensusView) GetWorkingHeight() uint64 {
@@ -477,8 +478,10 @@ func (v *ConsensusView) RecoverFromStatus(status uint32, viewOffset uint32, view
 	v.consensusStatus = status
 	v.viewOffset = viewOffset
 	v.setChangViewTimeLocked(uint64(viewStartTime.Unix()))
-	// SetWorkingHeight is intentionally unlocked; see Producers.
-	v.producers.SetWorkingHeight(workingHeight)
+	// UpdateWorkingHeight, not the locked twin: workingHeight belongs to
+	// Producers, and viewMu orders nothing about it. This nests viewMu ->
+	// producers.mtx, which is the allowed direction.
+	v.producers.UpdateWorkingHeight(workingHeight)
 	v.isDposOnDuty = v.producerIsOnDutyLocked(v.publicKey)
 	if finishedHeight > 0 {
 		v.updateDutyIndexLocked(finishedHeight)

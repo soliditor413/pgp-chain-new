@@ -404,16 +404,38 @@ func (d *Dispatcher) RecordViewRequest(sponsor []byte) {
 // GetProcessingProposal, and the two would deadlock. Do not merge these two
 // critical sections.
 //
-// Before mu was taken here, this was the only writer of the four vote maps that
-// did not hold it: AddPendingVote, ProcessVote and setProcessingProposal all do.
-// A vote arriving while a round finished therefore raced with the rebuild, and in
-// Go that is not a race report -- it is
-// `fatal error: concurrent map read and map write`, which kills the process.
+// Before mu was taken here, this was one of the two writers of the vote maps
+// that did not hold it (the other is RecoverFromConsensusStatus): AddPendingVote,
+// ProcessVote and setProcessingProposal all do. A vote arriving while a round
+// finished therefore raced with the rebuild, and in Go that is not a race report
+// -- it is `fatal error: concurrent map read and map write`, which kills the
+// process.
+//
+// The rebuild itself now goes through resetVoteMapsLocked, shared with the
+// recovery path, so the two sites cannot drift apart again: there is one place
+// that replaces the three maps and it takes a d.mu holder to call.
 //
 // Do not call this from the onConfirm/unConfirm callbacks: ProcessVote invokes
 // them while holding mu, and sync.RWMutex is not reentrant. That holds today
 // (engine.onConfirm only appends to the block pool and does a non-blocking
 // channel send), and it has to keep holding.
+// resetVoteMapsLocked replaces the three vote maps. The caller must hold d.mu.
+//
+// It exists so the two rebuild sites -- CleanProposals and
+// RecoverFromConsensusStatus -- cannot drift apart: one of them held the lock and
+// the other did not for as long as they were written independently, and the
+// difference was invisible in both. The maps share one owner (mu) because they
+// are written by ProcessVote and read by the confirm path; giving any one of them
+// a second lock is the defect, not the fix.
+//
+// precociousProposals is deliberately not here: only CleanProposals rebuilds it,
+// and the other site prunes rather than replaces.
+func (d *Dispatcher) resetVoteMapsLocked() {
+	d.acceptVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
+	d.rejectedVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
+	d.pendingVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
+}
+
 func (d *Dispatcher) CleanProposals(changeView bool) {
 	Info("Clean proposals")
 	d.setProcessingProsalNil()
@@ -421,9 +443,7 @@ func (d *Dispatcher) CleanProposals(changeView bool) {
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	d.acceptVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
-	d.rejectedVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
-	d.pendingVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
+	d.resetVoteMapsLocked()
 	if !changeView {
 		d.precociousProposals = make(map[elacom.Uint256]*payload.DPOSProposal)
 	} else {
@@ -436,11 +456,11 @@ func (d *Dispatcher) CleanProposals(changeView bool) {
 		// ported-but-not-wired, not abandoned: it starts running again when M3
 		// connects the view-change handlers.
 		//
-		// When it does, the lock matters: this code runs inside mu (taken above),
-		// so GetViewOffset() is a mu -> viewMu edge. Once ConsensusView has its
-		// own lock (R20), mu -> viewMu is the same shape as mu -> proposalMu --
-		// allowed in that direction only, and nothing reached from inside this
-		// critical section may take mu again.
+		// When it does, the lock matters: this code runs inside mu (taken above)
+		// and GetViewOffset takes viewMu, so this is the mu -> viewMu edge --
+		// allowed in that direction only, as the lock order note on Dispatcher
+		// says, and nothing reached from inside this critical section may take mu
+		// again.
 		// clear pending proposals less than current view offset
 		currentOffset := d.consensusView.GetViewOffset()
 		for k, v := range d.precociousProposals {
@@ -617,10 +637,32 @@ func (d *Dispatcher) RecoverAbnormal(status *dmsg.ConsensusStatus, medianTime in
 
 func (d *Dispatcher) RecoverFromConsensusStatus(status *dmsg.ConsensusStatus) error {
 	Info("RecoverFromConsensusStatus", "status", status.ConsensusStatus, "viewOffset", status.ViewOffset, "viewStartTime", status.ViewStartTime)
-	d.acceptVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
-	d.rejectedVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
+	// setProcessingProsalNil takes proposalMu and releases it before returning, so
+	// it has to happen before mu is taken. Taking mu while holding proposalMu is
+	// the forbidden direction (see the lock order note on Dispatcher), and it is
+	// the direction ProcessVote runs in, so getting this wrong is an ABBA
+	// deadlock rather than a race.
 	d.setProcessingProsalNil()
-	d.pendingVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
+
+	// The vote maps have exactly one owner: d.mu. CleanProposals was the rebuild
+	// site that took it; this one did not, which is the same invariant broken in
+	// the same shape -- a vote arriving during a recovery would have raced a map
+	// rebuild and killed the process with `fatal error: concurrent map read and
+	// map write`. Both sites now call resetVoteMapsLocked, so they cannot drift
+	// apart again.
+	//
+	// No defer on purpose. The log line and DumpInfo below must stay outside the
+	// lock: after R20, DumpInfo takes viewMu, so a deferred unlock would hold mu
+	// across a view lock and across a write to the log sink.
+	//
+	// Unreachable in this tree today -- HelpToRecoverAbnormal and RecoverAbnormal
+	// have no callers until the recovery messages are wired -- and reachable on
+	// the day M3 connects them (upstream calls this from network.go:597 and
+	// :924). Ported-but-not-wired, not dead: the same status as CleanProposals'
+	// changeView branch.
+	d.mu.Lock()
+	d.resetVoteMapsLocked()
+	d.mu.Unlock()
 
 	// One call, one critical section. Doing this through the exported setters
 	// would release the view lock between the offset and the start time, and a
