@@ -5,8 +5,12 @@
 # status-before-stop.txt) and prints one verdict per gate. It never starts,
 # stops or writes to a node.
 #
-# Exit status: 0 all gates pass, 1 at least one gate failed, 2 an input could
-# not be read (treated as a failure, never as a pass).
+# Exit status: 0 all gates pass, 1 at least one gate failed or the gate accounting
+# is broken, 2 an input could not be read (treated as a failure, never as a pass).
+#
+# "Accounting is broken" is reported on its own line, not as a failed gate: when the
+# checker is what broke, saying "N gates failed" sends the reader to audit gates that
+# are fine.
 #
 # Every gate prints the command that produced its number, so a reader can rerun
 # one line without trusting this script. See README.md, "gate.sh: judging a
@@ -76,6 +80,7 @@ trap 'rm -rf "$TMP"; exit 2' INT TERM
 FAILED=0
 PASSED=0
 NA=0
+META=0
 GATE_TOTAL=25
 
 # Every verdict is tagged with the section it came from, so the accounting at the end
@@ -90,6 +95,12 @@ cmt()  { printf '   cmd   %s\n' "$*"; }
 ok()   { printf '   PASS  %s\n' "$*"; PASSED=$((PASSED + 1)); _tag; }
 na()   { printf '   n/a   %s\n' "$*"; NA=$((NA + 1));       _tag; }
 bad()  { printf '   FAIL  %s\n' "$*"; FAILED=$((FAILED + 1)); _tag; }
+
+# A problem with the accounting is not a failed gate, and folding the two together
+# makes the report say "2 gates failed" for a run where zero gates failed and the
+# checker is what broke. Same rule as everywhere else here: the symptom and the cause
+# must not be reported in the same field.
+meta() { printf '   FAIL  %s\n' "$*"; META=$((META + 1)); }
 
 # A verdict must never change its own exit status just because it was untagged; the
 # accounting block below runs with SEC empty and its own bad() calls must still be
@@ -381,9 +392,27 @@ SEC=""
 # function name, and `-v exp=` / `exp[x]` are rejected or silently reinterpreted. This
 # exact mistake already cost one wrong report on this project (see README, "a name that
 # means something in two layers"). Prefix the name instead of remembering the hazard.
-if ! awk 'BEGIN {
-         n = split("G0 2 G1 2 G2 5 G3 6 G4 3 G5 2 G6 1 G7 2 G8 2", spec, " ")
-         for (i = 1; i < n; i += 2) want_n[spec[i]] = spec[i + 1]
+#
+# The list of per-section counts is declared once, here, and read by both checks below.
+# GATE_TOTAL stays a separate literal on purpose: a total derived from this list cannot
+# notice that a row was deleted from it. So the two are compared to each other, and
+# that failure is reported as what it is. Without that, the symptom of "the two tables
+# disagree" is "some section emitted the wrong number", and the reader goes and audits
+# an innocent section.
+DECL_SPEC="G0 2 G1 2 G2 5 G3 6 G4 3 G5 2 G6 1 G7 2 G8 2"
+DECL=$(awk -v spec="$DECL_SPEC" 'BEGIN {
+        n = split(spec, kv, " ")
+        for (i = 1; i < n; i += 2) t += kv[i + 1]
+        print t
+    }') || cannot "could not parse the per-section declaration table"
+need_num "sum of per-section declarations" "$DECL"
+if [ "$DECL" -ne "$GATE_TOTAL" ]; then
+    meta "the two declaration tables disagree: GATE_TOTAL says $GATE_TOTAL, the per-section list sums to $DECL -- fix the tables, the sections below are not what is wrong"
+fi
+
+if ! awk -v spec="$DECL_SPEC" 'BEGIN {
+         n = split(spec, kv, " ")
+         for (i = 1; i < n; i += 2) want_n[kv[i]] = kv[i + 1]
      }
      { got[$1]++ }
      END {
@@ -394,21 +423,25 @@ if ! awk 'BEGIN {
      }' "$TMP/slots.txt" >"$TMP/acct.txt"; then
     # An accounting check that fails to run must not read as an accounting check that
     # found nothing. Same rule as count(): a broken gate is not a passing gate.
-    bad "gate accounting could not be evaluated: the checker itself failed"
+    meta "gate accounting could not be evaluated: the checker itself failed"
 fi
 if [ -s "$TMP/acct.txt" ]; then
-    while IFS= read -r line; do bad "$line"; done <"$TMP/acct.txt"
+    while IFS= read -r line; do meta "$line"; done <"$TMP/acct.txt"
 fi
 TOTAL=$(wc -l <"$TMP/slots.txt" | tr -d ' ')
 need_num "tagged verdict count" "$TOTAL"
 if [ "$TOTAL" -ne "$GATE_TOTAL" ]; then
-    bad "gate accounting: $TOTAL verdicts issued by the declared gates, $GATE_TOTAL declared"
+    meta "gate accounting: $TOTAL verdicts issued by the declared gates, $GATE_TOTAL declared"
 fi
 
 printf '\n== verdict\n'
 printf '   gates passed: %d   failed: %d   not applicable: %d\n' "$PASSED" "$FAILED" "$NA"
 printf '   gates accounted for: %s of %d\n' "$(wc -l <"$TMP/slots.txt" | tr -d ' ')" "$GATE_TOTAL"
-if [ "$FAILED" -eq 0 ]; then
+if [ "$META" -gt 0 ]; then
+    printf '   accounting problems: %d -- these are not failed gates; they mean this\n' "$META"
+    printf '   report cannot be trusted at all, which is worse than a failed gate\n'
+fi
+if [ "$FAILED" -eq 0 ] && [ "$META" -eq 0 ]; then
     printf '   PASS: this run is usable as evidence\n'
     exit 0
 fi

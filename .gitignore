@@ -76,3 +76,18 @@ cmd/keeper/keeper
 # package.json: it exits ENOENT but still writes an empty lockfile.
 /geth
 /package-lock.json
+
+# A finished devnet run, kept verbatim so that the "exit 0" path of gate.sh can be
+# re-verified by someone else without them having to reproduce a 42-block run -- and
+# without anyone being tempted to fabricate a log to test the log checker with.
+#
+# Only two files are kept, because those are the only two gate.sh reads: logs/geth.log
+# and status-before-stop.txt (137 KiB together). The rest of the run directory is
+# deliberately not copied: `chain` is 64 MiB of leveldb, and `keys` + `pw` are a
+# keystore and its password file. There is no verification that needs those inside a
+# source tree, and one that puts them there is a worse bug than the one it checks for.
+#
+# This must stay ignored. An untracked directory here makes `git status` dirty, which
+# makes vcs.modified=true for every binary built afterwards, which is the exact thing
+# gate.sh's G8 is trying to read.
+/.tmp-gate-run/
