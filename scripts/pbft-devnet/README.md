@@ -483,7 +483,10 @@ Fatal: field corresponding to 'InfluxDBPassword' in metrics.Config cannot be set
 
 PBFT 那个字段是本移植新建的、没有存量配置文件，所以能直接关。Metrics 这两个不行。
 
-### 想修的话，能走的路只有两条（**都尚未实施**）
+### 想修的话，只有这三条路可走（**都尚未实施**）
+
+（这条标题曾经写"两条"，但表里一直是 A / B / B' 三条 —— 留一句在这里，是因为"数量对不上"
+本身就是文档不可信的信号，而后面每一条的取舍都要靠这张表。）
 
 一个常见的误判值得先写清：**"加 `toml:"-"` + 把 `metrics.Config.InfluxDBPassword` 加进
 `cmd/geth/config.go` 的 `deprecatedConfigFields`"这样组合是不成立的。**
