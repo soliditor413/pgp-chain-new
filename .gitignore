@@ -62,3 +62,17 @@ cmd/geth/geth
 cmd/rlpdump/rlpdump
 cmd/workload/workload
 cmd/keeper/keeper
+
+# Artifacts of running build/npm commands from the repository root instead of
+# through the Makefile. Ignoring them is a stopgap, not a fix: it only stops them
+# showing up in `git status`, and the next bare build recreates them.
+#
+# /geth is what a bare `go build ./cmd/geth` leaves behind (a ~137 MB unstripped
+# binary); `make geth` writes build/bin/geth, which is ignored further up. The
+# leading slash is load-bearing: a bare `geth` pattern also matches the cmd/geth
+# directory and would ignore the whole cmd/ tree.
+#
+# /package-lock.json is what npm leaves behind when run in a directory with no
+# package.json: it exits ENOENT but still writes an empty lockfile.
+/geth
+/package-lock.json
