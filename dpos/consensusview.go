@@ -547,11 +547,12 @@ func (v *ConsensusView) SetChangViewTime(parentTime uint64) {
 //
 // It is also invisible, which is why it needs a paragraph rather than a fix.
 // UpdateDutyIndex and GetNextOnDutyProducer each reduce their index modulo the
-// roster length in front of them and each return early when that length is 0
-// (producers.go:197 and :265), so an index computed against the old length and
-// then reduced against the new one is always in range -- nothing for a bounds
-// check to catch, and an index that neither roster's own arithmetic produces.
-// All four acquisitions take p.mtx, so -race has nothing to report either.
+// roster length in front of them, and each returns early when that length is 0
+// (the modulo is producers.go:200 and :268; the guards are :197 and :265). An
+// index computed against the old length and then reduced against the new one is
+// always in range -- nothing for a bounds check to catch, and an index that
+// neither roster's own arithmetic produces. All four acquisitions take p.mtx,
+// so -race has nothing to report either.
 //
 // None of this is reachable in this tree today, and that changes what the
 // paragraph is for. ChangeCurrentProducers has no caller here, production or
