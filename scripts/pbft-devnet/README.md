@@ -407,7 +407,40 @@ rc=1
 
    判据是**跑之前数一次、跑之后数一次**，不是"跑完没看到"。前者能区分
    "这条路径干净"和"这条路径没被执行到"，后者不能。
-   清理：`rm -rf "${TMPDIR:-/tmp}"/pgp-gate.*`。
+
+   **清理也必须是数出来的，不能是"跑一条 `rm -rf` 就算清过"。** 实测：
+
+   ```
+   $ rm -rf "${TMPDIR:-/tmp}"/pgp-gate.NOSUCH.* ; echo "rc=$?"
+   rc=0                              ← 无匹配也返回 0
+   $ mkdir -p /tmp/other_tmp
+   $ TMPDIR=/tmp/other_tmp sh -c 'mktemp -d "$TMPDIR/pgp-gate.XXXXXX"'
+   /tmp/other_tmp/pgp-gate.fFmgDu
+   $ rm -rf "${TMPDIR:-/tmp}"/pgp-gate.* ; echo "rc=$?"
+   rc=0                              ← 报成功
+   $ ls -d /tmp/other_tmp/pgp-gate.*
+   /tmp/other_tmp/pgp-gate.fFmgDu    ← 还在
+   ```
+
+   **"清理成功"和"什么也没删"在这条命令上输出完全一样**，而且 `-f` 让无匹配也返回 0。
+   这和 `count()` 那条（`rc>1` 不能读成 0）是同一条病，只是这次的落点在清理动作上。
+   所以清理要写成带前后计数的：
+
+   ```
+   $ before=$(ls -d "${TMPDIR:-/tmp}"/pgp-gate.* 2>/dev/null | wc -l | tr -d ' ')
+   $ rm -rf "${TMPDIR:-/tmp}"/pgp-gate.*
+   $ after=$(ls -d "${TMPDIR:-/tmp}"/pgp-gate.* 2>/dev/null | wc -l | tr -d ' ')
+   $ echo "residue: $before -> $after"
+   residue: 1 -> 0
+   ```
+
+   **它只覆盖当前 `TMPDIR`。** 在别的 `TMPDIR` 下产生的残留（另一个 shell、
+   `sudo`、`launchd`、别的用户）对这条命令**不可见**，既数不到也删不掉，而上一个
+   例子就是这么漏的。残留数目对不上时，把搜索面放宽再数：
+
+   ```
+   $ ls -d /tmp/pgp-gate.* /var/folders/*/*/T/pgp-gate.* 2>/dev/null
+   ```
 
    打一次 SIGKILL 只要一条（macOS 没有 `timeout(1)`，用后台 + `kill`）：
 
