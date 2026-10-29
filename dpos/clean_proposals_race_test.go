@@ -23,18 +23,37 @@ package dpos
 //
 //	fatal error: concurrent map read and map write
 //
-// which kills the process and can leave no stack behind. That is why this is a
-// correctness test and not a race-detector nicety: the assertion is that votes
-// keep being counted while rounds are torn down, and the -race entry point has to
-// stay clean for it to mean anything.
+// which kills the process and can leave no stack behind.
 //
-// The crossover is the point. TestFinishedHeightRace drives FinishedProposal from
-// several goroutines, but FinishedProposal's tail also writes ConsensusView, which
-// has no locks at all (recorded separately as R20) -- so that shape goes red on
-// the view rather than on the maps and cannot be used to grade this fix. Here the
-// two goroutines are CleanProposals(false) and ProcessVote: the changeView=false
-// branch never touches the view, so the only mutable state they share is the vote
-// maps.
+// This file guards two different failures, and they need two different kinds of
+// test. Conflating them is what produced the previous version's judgement, which
+// asserted how many votes survived and thereby asserted something that is legal
+// at both extremes:
+//
+//   - "the rebuild lost its lock" is a concurrency defect. It is invisible to
+//     counting -- a legal schedule has no lost vote at all -- and visible to
+//     -race, which reports the moment two accesses are unordered, whatever the
+//     schedule did. So the concurrent case below asserts only what it forces
+//     (both sides entered, and they entered together) and lets -race decide.
+//   - "the rebuild stopped happening" is a behaviour defect, not a concurrency
+//     one: if CleanProposals returns early, nothing about the interleaving
+//     matters. No counting of votes can see it either, because the votes are then
+//     simply never cleared. It needs a sequential case that looks at the maps
+//     across the call, and that is TestCleanProposalsEmptiesTheVoteMaps below.
+//
+// The vote counts that used to be assertions are now diagnostics. A count is a
+// quantity that moves under a legal scheduler: measured on the real tree, the
+// accepted count ranges over dozens of values with no defect present, and a
+// mutant that made the clean-up do nothing produced the maximum, not the minimum
+// -- so the old `counted == 0` guard could not fire on the very mutant it was
+// meant to catch, while a `counted == all` guard would fire on healthy runs.
+//
+// The crossover is still the point. TestFinishedHeightRace drives
+// FinishedProposal from several goroutines, but FinishedProposal's tail also
+// writes ConsensusView -- so that shape goes red on the view rather than on the
+// maps and cannot be used to grade this fix. Here the two goroutines are
+// CleanProposals(false) and ProcessVote: the changeView=false branch never
+// touches the view, so the only mutable state they share is the vote maps.
 //
 // This is exactly the pair the production paths produce once there is a network:
 // a vote arrives on the p2p goroutine while the chain-head goroutine finishes a
@@ -47,6 +66,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	elacom "github.com/elastos/Elastos.ELA/common"
 	"github.com/elastos/Elastos.ELA/core/types/payload"
@@ -55,12 +75,15 @@ import (
 )
 
 // TestCleanProposalsDoesNotRaceVotes runs CleanProposals(false) against ProcessVote
-// and requires that votes are still accepted while that happens.
+// and lets -race decide whether the two sides are ordered.
 //
-// The accepted count is deliberately asserted to be non-zero. Without it the case
-// would pass just as well if both sides failed for unrelated reasons -- a vote that
-// never reaches the map write cannot demonstrate anything about the map write. That
-// is the one thing worse than a red test: a green one that exercises nothing.
+// No vote count is asserted, in either direction. Both extremes are reachable on
+// healthy code -- zero when the clean-up happens to land outside the vote, the
+// maximum when it never lands inside it -- so a count cannot say "the defect is
+// absent" and cannot say "the defect is present" either. What is asserted here is
+// the part the test forces: a rendezvous that makes both sides start together, and
+// the fact that each side then ran. Those two cannot flake, and they are the only
+// reason a silent -race run means anything.
 func TestCleanProposalsDoesNotRaceVotes(t *testing.T) {
 	const (
 		// Enough interleavings to make a lost race certain under -race; the
@@ -88,50 +111,136 @@ func TestCleanProposalsDoesNotRaceVotes(t *testing.T) {
 		signToleranceForTest, nil, dtime.NewMedianTime(), nil, 1)
 
 	// One vote on its own first, so "the write path works at all" is established
-	// before concurrency can be blamed for anything.
+	// before concurrency can be blamed for anything. Without this, a silent -race
+	// run could mean the votes never reached the map at all.
 	d.setProcessingProposal(proposals[0])
 	if ok, _, err := d.ProcessVote(votes[0]); !ok {
 		t.Fatalf("a single accept vote was not counted, so this test cannot say anything about the concurrent case: err=%v", err)
 	}
 
 	var (
-		wg      sync.WaitGroup
-		counted int64
+		wg             sync.WaitGroup
+		counted        int64
+		entered        int64
+		inFlight, peak int64
 	)
+
+	// The rendezvous is the whole construction: both sides announce themselves and
+	// then wait for the same channel, so their first calls are concurrent by
+	// arrangement rather than by luck. A barrier that only starts the goroutines
+	// would leave the overlap to the scheduler.
+	ready := make(chan struct{}, 2)
+	start := make(chan struct{})
+
+	enter := func() {
+		atomic.AddInt64(&entered, 1)
+		n := atomic.AddInt64(&inFlight, 1)
+		for {
+			old := atomic.LoadInt64(&peak)
+			if n <= old || atomic.CompareAndSwapInt64(&peak, old, n) {
+				return
+			}
+		}
+	}
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		ready <- struct{}{}
+		<-start
+		enter()
 		for i := 1; i < voteRounds; i++ {
 			d.setProcessingProposal(proposals[i])
 			if ok, _, _ := d.ProcessVote(votes[i]); ok {
 				atomic.AddInt64(&counted, 1)
 			}
 		}
+		atomic.AddInt64(&inFlight, -1)
 	}()
 
 	wg.Add(1)
 	go func() {
 		defer wg.Done()
+		ready <- struct{}{}
+		<-start
+		enter()
 		for i := 0; i < cleanRounds; i++ {
 			d.CleanProposals(false)
 		}
+		atomic.AddInt64(&inFlight, -1)
 	}()
 
+	// Both sides must reach the rendezvous, otherwise one of them never ran and
+	// the run proves nothing. The timeout keeps a broken rendezvous from looking
+	// like a hung suite.
+	for i := 0; i < 2; i++ {
+		select {
+		case <-ready:
+		case <-time.After(2 * time.Second):
+			t.Fatalf("only %d of 2 goroutines reached the rendezvous, so the two sides were never concurrent", i)
+		}
+	}
+	close(start)
 	wg.Wait()
 
-	// A vote only fails here when the concurrently-running CleanProposals has
-	// already cleared the processing proposal, so the two goroutines really did
-	// interleave -- and some votes still landed while that was happening.
-	if got := atomic.LoadInt64(&counted); got == 0 {
-		t.Fatal("no vote was counted while CleanProposals was running; the two goroutines never overlapped, so this test proves nothing")
+	if got := atomic.LoadInt64(&entered); got != 2 {
+		t.Fatalf("entered = %d, want 2: one side did not run, so this run proves nothing", got)
 	}
+
+	// Diagnostics, deliberately not assertions: see the file comment.
+	t.Logf("votes counted = %d of %d, peak concurrent sides = %d", atomic.LoadInt64(&counted), voteRounds-1, atomic.LoadInt64(&peak))
 
 	// The maps must still be usable afterwards, not left in a replaced-but-nil
 	// state.
 	d.setProcessingProposal(proposals[0])
 	if ok, _, err := d.ProcessVote(votes[0]); !ok {
 		t.Fatalf("the dispatcher stopped counting votes after %d clean-ups: err=%v", cleanRounds, err)
+	}
+}
+
+// TestCleanProposalsEmptiesTheVoteMaps is the behavioural half: it asks whether
+// the rebuild happened at all, which no amount of concurrency testing can answer.
+// If CleanProposals returns early -- the mutant that made the count-based guard
+// look useless, because a short-circuited rebuild leaves every vote in place and
+// therefore reports the maximum count, not zero -- every map below keeps its
+// entry, and this case fails deterministically.
+//
+// Sequential on purpose: no goroutines, no -race, no interleaving. Two different
+// failures need two different detectors, and using the flaky one for the
+// deterministic defect is how a real regression gets explained away as "that test
+// is racy anyway".
+func TestCleanProposalsEmptiesTheVoteMaps(t *testing.T) {
+	const producerCount = 3
+
+	accounts, producers := newProducerSetForRaceTest(t, producerCount)
+	proposals, votes := buildSignedAcceptVotes(t, accounts[0], 2)
+
+	d := NewDispatcher(producers,
+		func(*payload.Confirm) error { return nil },
+		func(*payload.Confirm) error { return nil },
+		signToleranceForTest, nil, dtime.NewMedianTime(), nil, 1)
+
+	d.setProcessingProposal(proposals[0])
+	if ok, _, err := d.ProcessVote(votes[0]); !ok {
+		t.Fatalf("preparing a counted vote failed, so the clean-up below would have nothing to clear: err=%v", err)
+	}
+	d.AddPendingVote(votes[1])
+
+	if len(d.acceptVotes) == 0 || len(d.pendingVotes) == 0 {
+		t.Fatalf("the maps were not populated before the clean-up (accept=%d pending=%d), so this case would pass on a no-op",
+			len(d.acceptVotes), len(d.pendingVotes))
+	}
+
+	d.CleanProposals(false)
+
+	if got := [4]int{len(d.acceptVotes), len(d.rejectedVotes), len(d.pendingVotes), len(d.precociousProposals)}; got != [4]int{} {
+		t.Fatalf("CleanProposals left state behind (accept, rejected, pending, precocious) = %v; either the rebuild did not run or it skipped a map", got)
+	}
+
+	// The processing proposal is cleared too, and that half lives behind
+	// proposalMu rather than mu.
+	if p := d.GetProcessingProposal(); p != nil {
+		t.Fatalf("processingProposal survived the clean-up: %x", p.Hash())
 	}
 }
 
