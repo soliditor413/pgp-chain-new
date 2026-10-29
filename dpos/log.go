@@ -18,6 +18,7 @@ package dpos
 
 import (
 	"fmt"
+	"strings"
 
 	glog "github.com/ethereum/go-ethereum/log"
 )
@@ -33,13 +34,32 @@ import (
 // reviewable against the original. They funnel into go-ethereum's root logger,
 // which means `--verbosity` and `--log.json` apply to consensus chatter too.
 
-func Debug(a ...interface{}) { glog.Debug(fmt.Sprint(a...)) }
+// sprintArgs joins one call's operands the way fmt.Sprintln does, then drops the
+// single trailing newline Sprintln appends.
+//
+// Sprint would be the obvious choice and it is wrong: Sprint only inserts spaces
+// between operands when neither side is a string, so Sprint("is self", true)
+// renders "is self true" but Sprint("viewOffset", "3") renders "viewOffset3".
+// The ported call sites pass bare identifiers as arguments all over the place
+// (`Info("is self", self)`), so Sprint silently fused them into one word and made
+// the logs unreadable -- a format regression that no compiler and no test could
+// see. Sprintln separates every operand unconditionally, which is what these
+// call sites were written against.
+//
+// It is kept as a separate function rather than inlined into the four helpers so
+// the formatting rule is testable: the helpers themselves are one-line wrappers
+// around glog, and a test for them has to reach through the logger.
+func sprintArgs(a ...interface{}) string {
+	return strings.TrimSuffix(fmt.Sprintln(a...), "\n")
+}
 
-func Info(a ...interface{}) { glog.Info(fmt.Sprint(a...)) }
+func Debug(a ...interface{}) { glog.Debug(sprintArgs(a...)) }
 
-func Warn(a ...interface{}) { glog.Warn(fmt.Sprint(a...)) }
+func Info(a ...interface{}) { glog.Info(sprintArgs(a...)) }
 
-func Error(a ...interface{}) { glog.Error(fmt.Sprint(a...)) }
+func Warn(a ...interface{}) { glog.Warn(sprintArgs(a...)) }
+
+func Error(a ...interface{}) { glog.Error(sprintArgs(a...)) }
 
 func Debugf(format string, a ...interface{}) { glog.Debug(fmt.Sprintf(format, a...)) }
 
