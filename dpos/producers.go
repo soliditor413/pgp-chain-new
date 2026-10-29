@@ -271,12 +271,36 @@ func (p *Producers) GetNextOnDutyProducer(offset uint32) []byte {
 	return producer
 }
 
+// producersCount returns the current set size under p.mtx.
+//
+// Callers must not hold p.mtx, and this deliberately does not call
+// GetMajorityCount itself: p.mtx is not reentrant, so the two reads have to be
+// separate calls rather than one nested critical section.
+func (p *Producers) producersCount() int {
+	p.mtx.Lock()
+	defer p.mtx.Unlock()
+	return len(p.producers)
+}
+
 func (p *Producers) IsMajorityAgree(count int) bool {
 	return count >= p.GetMajorityCount()
 }
 
+// IsMajorityRejected is the same expression as HasArbitersMinorityCount, and
+// historically exactly one of the two took p.mtx. That is how the defect got
+// here: someone copied the neighbouring line, and only one copy had the lock.
+// They are kept as separate functions rather than one delegating to the other
+// because the two names may diverge upstream, and a delegation would hide that
+// divergence at the moment it appears.
+//
+// This one is on a live path: ConsensusView.IsMajorityRejected is reached from
+// processVote's reject branch, which runs on every round via the proposer's own
+// vote, while the write side (UpdateProducers replacing the slice) arrives with
+// the SPV producer-set update. So the read side is already executing -- that is
+// why this is not the same "nothing has been wired yet" case as the recovery
+// chain.
 func (p *Producers) IsMajorityRejected(count int) bool {
-	num := len(p.producers)
+	num := p.producersCount()
 	return count >= num-p.GetMajorityCount()
 }
 
@@ -285,8 +309,6 @@ func (p *Producers) HasProducerMajorityCount(num int) bool {
 }
 
 func (p *Producers) HasArbitersMinorityCount(num int) bool {
-	p.mtx.Lock()
-	count := len(p.producers)
-	p.mtx.Unlock()
+	count := p.producersCount()
 	return num >= count-p.GetMajorityCount()
 }
