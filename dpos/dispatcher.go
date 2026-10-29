@@ -411,6 +411,20 @@ func (d *Dispatcher) CleanProposals(changeView bool) {
 	if !changeView {
 		d.precociousProposals = make(map[elacom.Uint256]*payload.DPOSProposal)
 	} else {
+		// Not reachable today: every call site in this tree passes false -- the
+		// three in this file above, and the race test. Upstream is not like that,
+		// which is why this branch exists: the Elastos.ELA module's view-change
+		// handlers pass true (dpos/manager/dposnormalhandler.go:89,
+		// dposondutyhandler.go:57, proposaldispatcher.go:822) and so does
+		// pgp-chain (consensus/pbft/pbft.go:1189, the !force path). This is
+		// ported-but-not-wired, not abandoned: it starts running again when M3
+		// connects the view-change handlers.
+		//
+		// When it does, the lock matters: this code runs inside mu (taken above),
+		// so GetViewOffset() is a mu -> viewMu edge. Once ConsensusView has its
+		// own lock (R20), mu -> viewMu is the same shape as mu -> proposalMu --
+		// allowed in that direction only, and nothing reached from inside this
+		// critical section may take mu again.
 		// clear pending proposals less than current view offset
 		currentOffset := d.consensusView.GetViewOffset()
 		for k, v := range d.precociousProposals {
