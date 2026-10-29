@@ -76,12 +76,26 @@ trap 'rm -rf "$TMP"; exit 2' INT TERM
 FAILED=0
 PASSED=0
 NA=0
+GATE_TOTAL=25
 
-sec()  { printf '\n== %s\n' "$*"; }
+# Every verdict is tagged with the section it came from, so the accounting at the end
+# can be per section instead of a single total. A total alone can be balanced by two
+# compensating errors -- one gate looping out an extra verdict while another drops one
+# -- and the sum still looks right. That is the same shape of bug as the "42 blocks"
+# report: every number correct, the set of numbers wrong.
+: >"$TMP/slots.txt"
+
+sec()  { printf '\n== %s\n' "$*"; SEC=$1; }
 cmt()  { printf '   cmd   %s\n' "$*"; }
-ok()   { printf '   PASS  %s\n' "$*"; PASSED=$((PASSED + 1)); }
-na()   { printf '   n/a   %s\n' "$*"; NA=$((NA + 1)); }
-bad()  { printf '   FAIL  %s\n' "$*"; FAILED=$((FAILED + 1)); }
+ok()   { printf '   PASS  %s\n' "$*"; PASSED=$((PASSED + 1)); _tag; }
+na()   { printf '   n/a   %s\n' "$*"; NA=$((NA + 1));       _tag; }
+bad()  { printf '   FAIL  %s\n' "$*"; FAILED=$((FAILED + 1)); _tag; }
+
+# A verdict must never change its own exit status just because it was untagged; the
+# accounting block below runs with SEC empty and its own bad() calls must still be
+# ordinary successes to the shell.
+_tag() { if [ -n "$SEC" ]; then printf '%s\n' "$SEC" >>"$TMP/slots.txt"; fi; return 0; }
+SEC=""
 info() { printf '   ..    %s\n' "$*"; }
 cannot() { printf '   CANNOT %s\n' "$*" >&2; exit 2; }
 
@@ -179,6 +193,11 @@ if [ "$SEALED" -gt 0 ]; then
     else
         bad "snapshot has no parseable eth_blockNumber: cannot cross-check the log against the chain"
     fi
+else
+    na "first sealed block: not evaluated, the run sealed nothing"
+    na "highest block against the count: not evaluated"
+    na "contiguity of block numbers: not evaluated"
+    na "log against the recorded head: not evaluated"
 fi
 
 sec "G3 failure markers (each must be 0)"
@@ -213,6 +232,7 @@ if [ -s "$TMP/fork_h.txt" ] && [ -s "$TMP/seal_h.txt" ]; then
     if [ "$FSUM" = "$SSUM" ]; then ok "height sums equal ($FSUM)"; else bad "height sums differ: $FSUM vs $SSUM"; fi
 else
     bad "cannot extract heights from one side, so the two sequences cannot be compared"
+    na "height sums: not comparable"
 fi
 
 sec "G5 chain head snapshot: extra length and block period"
@@ -232,7 +252,14 @@ if [ -s "$TMP/extra.txt" ]; then
           if (v + 0 > mv) mv = v + 0 }
         END { printf "%d %d\n", n, mv > sv }' sv="$TMP/extra_stats.txt" "$TMP/extra.txt" || cannot "awk failed while checking the extra layout"
     if [ -s "$TMP/viol.txt" ]; then
-        while IFS= read -r line; do bad "$line"; done <"$TMP/viol.txt"
+        # One verdict slot, not one per bad block. The count goes in the message and
+        # the detail goes to info lines: a gate that emits a variable number of
+        # verdicts cannot be accounted for, and a run with 300 bad blocks would read
+        # as 300 failed gates rather than one failed gate.
+        NVIOL=$(wc -l <"$TMP/viol.txt" | tr -d ' ')
+        need_num "extra-layout violation count" "$NVIOL"
+        while IFS= read -r line; do info "$line"; done <"$TMP/viol.txt"
+        bad "$NVIOL block(s) violate the extra length or vote-count floor; first: $(head -1 "$TMP/viol.txt")"
     else
         ok "extra length is $EXTRA_BASE + $EXTRA_PER_VOTE*votes on every inspected block, votes >= 1"
     fi
@@ -259,8 +286,10 @@ awk 'match($0, /[0-9][0-9]:[0-9][0-9]:[0-9][0-9]\.[0-9][0-9][0-9]/) {
 if [ -s "$TMP/ts.txt" ]; then
     awk 'NR > 1 { d = $1 - prev; print d; if (d < 0) neg++ } { prev = $1 }
          END { if (neg > 0) exit 3 }' "$TMP/ts.txt" >"$TMP/dt.txt"
-    if [ $? -eq 3 ]; then bad "log timestamps go backwards: this log mixes two runs, or crossed midnight"; fi
-    if [ -s "$TMP/dt.txt" ]; then
+    RC=$?
+    if [ "$RC" -eq 3 ]; then
+        bad "log timestamps go backwards: this log mixes two runs, or crossed midnight"
+    elif [ -s "$TMP/dt.txt" ]; then
         info "first interval (start -> block 1, includes unlocking): $(head -1 "$TMP/dt.txt")ms"
         awk -v want=$((EXPECT_INTERVAL * 1000)) 'NR > 1 {
                  s += $1; n++
@@ -271,7 +300,10 @@ if [ -s "$TMP/ts.txt" ]; then
              }
              END { if (n > 0) printf "   ..    steady state, %d intervals: mean %.1fms min %dms max %dms; %d deviate more than 30ms\n", n, s / n, min, max, big + 0
                    else printf "   ..    no steady-state interval to report\n" }' "$TMP/dt.txt"
-        info "these numbers are for comparing two runs; no threshold is applied here"
+        # This slot is 'ok' for "the intervals were read", not for "the intervals are
+        # good": no threshold is applied. It exists so the section always accounts for
+        # exactly one verdict, whether or not there was anything wrong to report.
+        ok "intervals were computed and reported (no threshold applied here)"
     else
         bad "cannot compute any interval: fewer than two seal timestamps"
     fi
@@ -332,12 +364,50 @@ if [ -n "$BINARY" ]; then
     fi
 else
     sec "G8 binary provenance (skipped)"
-    na "no --binary given: the binary that produced this run was not judged"
+    na "vcs stamp: no --binary given, the binary that produced this run was not judged"
+    na "race detector: no --binary given"
+fi
+
+# Every gate declares how many verdict slots it owns. A slot that silently disappears
+# when an earlier gate fails looks exactly like a gate that had nothing to judge, and
+# the totals of two runs stop being comparable -- which is how the earlier "42 blocks"
+# report survived review with every number correct.
+#
+# The check is per section, not just on the total: two compensating errors (one gate
+# looping out an extra verdict, another dropping one) leave the total intact, and the
+# total is the only thing a human reads.
+SEC=""
+# The declared counts live in an array called want_n, not exp: `exp` is a builtin
+# function name, and `-v exp=` / `exp[x]` are rejected or silently reinterpreted. This
+# exact mistake already cost one wrong report on this project (see README, "a name that
+# means something in two layers"). Prefix the name instead of remembering the hazard.
+if ! awk 'BEGIN {
+         n = split("G0 2 G1 2 G2 5 G3 6 G4 3 G5 2 G6 1 G7 2 G8 2", spec, " ")
+         for (i = 1; i < n; i += 2) want_n[spec[i]] = spec[i + 1]
+     }
+     { got[$1]++ }
+     END {
+         for (s in want_n) if ((got[s] + 0) != want_n[s])
+             printf "gate accounting: section %s emitted %d verdict(s), %d declared\n", s, got[s] + 0, want_n[s]
+         for (s in got) if (!(s in want_n))
+             printf "gate accounting: section %s emitted %d verdict(s) but is not declared\n", s, got[s]
+     }' "$TMP/slots.txt" >"$TMP/acct.txt"; then
+    # An accounting check that fails to run must not read as an accounting check that
+    # found nothing. Same rule as count(): a broken gate is not a passing gate.
+    bad "gate accounting could not be evaluated: the checker itself failed"
+fi
+if [ -s "$TMP/acct.txt" ]; then
+    while IFS= read -r line; do bad "$line"; done <"$TMP/acct.txt"
+fi
+TOTAL=$(wc -l <"$TMP/slots.txt" | tr -d ' ')
+need_num "tagged verdict count" "$TOTAL"
+if [ "$TOTAL" -ne "$GATE_TOTAL" ]; then
+    bad "gate accounting: $TOTAL verdicts issued by the declared gates, $GATE_TOTAL declared"
 fi
 
 printf '\n== verdict\n'
 printf '   gates passed: %d   failed: %d   not applicable: %d\n' "$PASSED" "$FAILED" "$NA"
-printf '   gates evaluated: %d\n' "$((PASSED + FAILED + NA))"
+printf '   gates accounted for: %s of %d\n' "$(wc -l <"$TMP/slots.txt" | tr -d ' ')" "$GATE_TOTAL"
 if [ "$FAILED" -eq 0 ]; then
     printf '   PASS: this run is usable as evidence\n'
     exit 0
