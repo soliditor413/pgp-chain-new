@@ -1,0 +1,39 @@
+{
+  "config": {
+    "chainId": 8606211,
+    "homesteadBlock": 1,
+    "daoForkSupport": true,
+    "eip150Block": 2,
+    "eip155Block": 3,
+    "eip158Block": 3,
+    "byzantiumBlock": 3,
+    "constantinopleBlock": 3,
+    "petersburgBlock": 3,
+    "istanbulBlock": 3,
+    "berlinBlock": 3,
+    "londonBlock": 3,
+    "shanghaiTime": 4102444800,
+    "legacy": {
+      "forkHeight": 18446744073709551615,
+      "gasFeeRecipient": "0x71562b71999873db5b286df957af199ec94617f7",
+      "gasFeeRecipientRatio": 65,
+      "passBalance": 0,
+      "verifySeal": true,
+      "producers": [
+        "__PRODUCERS__"
+      ]
+    }
+  },
+  "nonce": "0x0",
+  "timestamp": "0x67748580",
+  "extraData": "0x",
+  "gasLimit": "0x1c9c380",
+  "difficulty": "0x2",
+  "mixHash": "0x0000000000000000000000000000000000000000000000000000000000000000",
+  "coinbase": "0x0000000000000000000000000000000000000000",
+  "alloc": {
+    "0x71562b71999873db5b286df957af199ec94617f7": {
+      "balance": "1000000000000000000000000"
+    }
+  }
+}

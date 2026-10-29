@@ -1,0 +1,593 @@
+// Copyright (c) 2017-2019 The Elastos Foundation
+// Use of this source code is governed by an MIT
+// license that can be found in the LICENSE file.
+//
+// Ported from pgp-chain/dpos/dispatcher.go.
+
+package dpos
+
+import (
+	"bytes"
+	"errors"
+	"fmt"
+	"sync"
+	"time"
+
+	elacom "github.com/elastos/Elastos.ELA/common"
+	"github.com/elastos/Elastos.ELA/core/types/payload"
+	"github.com/elastos/Elastos.ELA/crypto"
+	"github.com/elastos/Elastos.ELA/dpos/account"
+	"github.com/elastos/Elastos.ELA/dpos/dtime"
+	emsg "github.com/elastos/Elastos.ELA/dpos/p2p/msg"
+	"github.com/elastos/Elastos.ELA/dpos/p2p/peer"
+
+	dmsg "github.com/ethereum/go-ethereum/dpos/msg"
+)
+
+// Dispatcher is the round state machine: it accepts the current proposal,
+// collects votes for it, and turns a 2/3 majority into a confirm.
+//
+// State is per-round and entirely in memory. finishedHeight is the only thing
+// that outlives a round, and it is the irreversible height the reorg guard
+// consumes.
+//
+// Lock order: mu guards the vote maps and is never taken while proposalMu is
+// held; proposalMu is a leaf. processVote is called with mu already held by
+// ProcessVote and with mu held by setProcessingProposal's caller, so anything it
+// calls must not take mu again — that is why it takes the maps directly instead
+// of going through the exported accessors.
+//
+// finishedMu guards the three finality fields (finishedHeight,
+// finishedBlockSealHash, finishedProposal) and is the outermost lock in the file:
+// it is never held while mu or proposalMu is taken, because FinishedProposal
+// releases it before touching the view, and the accessors only read the fields.
+//
+// processingProposal is NOT guarded by finishedMu. It already has an owner,
+// proposalMu, at its one write site (setProcessingProposal), its clearing site
+// (setProcessingProsalNil) and its accessor (GetProcessingProposal); giving one
+// field two locks is the defect, not the fix. Everything that touches it goes
+// through proposalMu, including the two places that used to read it unsynchronised
+// (FinishedProposal and createUnConfirm).
+type Dispatcher struct {
+	acceptVotes         map[elacom.Uint256]*payload.DPOSProposalVote
+	rejectedVotes       map[elacom.Uint256]*payload.DPOSProposalVote
+	pendingVotes        map[elacom.Uint256]*payload.DPOSProposalVote
+	precociousProposals map[elacom.Uint256]*payload.DPOSProposal
+
+	processingProposal *payload.DPOSProposal
+	consensusView      *ConsensusView
+	timeSource         dtime.MedianTimeSource
+
+	onConfirm func(confirm *payload.Confirm) error
+	unConfirm func(confirm *payload.Confirm) error
+
+	proposalProcessFinished bool
+	finishedHeight          uint64
+	finishedBlockSealHash   elacom.Uint256
+	finishedProposal        elacom.Uint256
+
+	mu         sync.RWMutex
+	proposalMu sync.RWMutex
+	finishedMu sync.RWMutex
+
+	resetViewRequests map[string]struct{} // sponsors
+	resetViewMu       sync.RWMutex
+}
+
+func (d *Dispatcher) ProcessProposal(id peer.PID, proposal *payload.DPOSProposal) (err error, isSendReject bool, handled bool) {
+	Info("[ProcessProposal] start ", proposal.Hash().String(), "peerID", id.String(), "Sponsor", elacom.BytesToHexString(proposal.Sponsor))
+	defer Info("[ProcessProposal] end", proposal.Hash().String())
+	self := bytes.Equal(id[:], proposal.Sponsor)
+	Info("is self", self)
+	if d.GetConsensusView().GetViewOffset() != proposal.ViewOffset {
+		Info("have different view offset")
+		if proposal.ViewOffset > d.GetConsensusView().GetViewOffset() {
+			d.precociousProposals[proposal.Hash()] = proposal
+		}
+		return errors.New("have different view offset"), false, false
+	}
+
+	if !d.consensusView.ProducerIsOnDuty(proposal.Sponsor) {
+		return errors.New("current signer is not onDuty"), false, !self
+	}
+	processingProposal := d.GetProcessingProposal()
+	if processingProposal != nil && processingProposal.Hash().IsEqual(proposal.Hash()) {
+		return errors.New("already processing this proposal:" + proposal.Hash().String()), false, true
+	}
+
+	if !d.consensusView.IsProducers(proposal.Sponsor) {
+		str := fmt.Sprintf("%s proposal signer is not producer", elacom.BytesToHexString(proposal.Sponsor))
+		return errors.New(str), true, true
+	}
+	err = CheckProposal(proposal)
+	if err != nil {
+		return err, true, true
+	}
+
+	d.setProcessingProposal(proposal)
+	return nil, false, true
+}
+
+func (d *Dispatcher) GetProposalProcessFinished() bool {
+	return d.proposalProcessFinished
+}
+
+// GetFinishedHeight returns the highest height a confirm has finalised.
+//
+// It is read from the miner goroutine on every Prepare and Seal, while
+// FinishedProposal writes it from the chain-head goroutine, which is why the
+// field cannot simply be a uint64 on the struct.
+func (d *Dispatcher) GetFinishedHeight() uint64 {
+	d.finishedMu.RLock()
+	defer d.finishedMu.RUnlock()
+	return d.finishedHeight
+}
+
+func (d *Dispatcher) SetProposalProcessFinished() {
+	d.proposalProcessFinished = true
+}
+
+func (d *Dispatcher) GetFinishedBlockSealHash() elacom.Uint256 {
+	d.finishedMu.RLock()
+	defer d.finishedMu.RUnlock()
+	return d.finishedBlockSealHash
+}
+
+func (d *Dispatcher) GetFinishedProposal() elacom.Uint256 {
+	d.finishedMu.RLock()
+	defer d.finishedMu.RUnlock()
+	return d.finishedProposal
+}
+
+func (d *Dispatcher) setProcessingProposal(p *payload.DPOSProposal) (finished bool) {
+	Info("setProcessingProposal start")
+	d.proposalMu.Lock()
+	d.processingProposal = p
+	d.proposalMu.Unlock()
+	d.mu.Lock()
+	defer func() {
+		d.mu.Unlock()
+		Info("setProcessingProposal end")
+	}()
+	for _, v := range d.pendingVotes {
+		if v.ProposalHash.IsEqual(p.Hash()) {
+			_, finished, _ := d.processVote(v)
+			if finished {
+				return finished
+			}
+		}
+	}
+	d.pendingVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
+	return false
+}
+
+func (d *Dispatcher) AddPendingVote(v *payload.DPOSProposalVote) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.pendingVotes[v.Hash()] = v
+}
+
+func (d *Dispatcher) ProcessVote(vote *payload.DPOSProposalVote) (succeed bool, finished bool, err error) {
+	Info("[ProcessVote] start")
+	defer Info("[ProcessVote] end")
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return d.processVote(vote)
+}
+
+func (d *Dispatcher) processVote(vote *payload.DPOSProposalVote) (succeed bool, finished bool, err error) {
+	proposal := d.GetProcessingProposal()
+	if proposal == nil {
+		err = errors.New("not proposal to process vote")
+		return false, false, err
+	}
+
+	if !vote.ProposalHash.IsEqual(proposal.Hash()) {
+		err = errors.New("vote proposal is not processing proposal")
+		return false, false, err
+	}
+
+	if d.alreadyExistVote(vote) {
+		err = errors.New("alreadyExistVote")
+		return false, false, err
+	}
+
+	if !d.consensusView.IsProducers(vote.Signer) {
+		str := fmt.Sprintf("%s vote signer is not producer", elacom.BytesToHexString(vote.Signer))
+		err = errors.New(str)
+		return false, false, err
+	}
+
+	if err := CheckVote(vote); err != nil {
+		return false, false, err
+	}
+
+	if vote.Accept {
+		d.acceptVotes[vote.Hash()] = vote
+		acceptCount := len(d.acceptVotes)
+		Info("acceptVotes count:", acceptCount)
+		if d.consensusView.IsMajorityAgree(acceptCount) {
+			Info("Collect majority signs. Proposal confirmed.")
+			confirm := d.createConfirm()
+			if confirm != nil {
+				err = d.onConfirm(confirm)
+			}
+			Info("Block confirmed.", "error", err)
+			return true, true, err
+		}
+	} else {
+		d.rejectedVotes[vote.Hash()] = vote
+		Info("rejectedVotes count:", len(d.rejectedVotes))
+		if d.consensusView.IsMajorityRejected(len(d.rejectedVotes)) {
+			Info("Collect majority signs, reject proposal")
+			if unconfirm := d.createUnConfirm(); unconfirm != nil {
+				d.unConfirm(unconfirm)
+			}
+			return true, false, nil
+		}
+	}
+
+	return true, false, nil
+}
+
+// FinishedProposal advances the irreversible height after a block is imported.
+//
+// It is called from consensus/pbft's chain-head handling, NOT from Finalize: in
+// this client engine.Finalize runs on every imported block including side
+// branches, so advancing finality there would let a side chain move the
+// irreversible height. See docs/design/pbft-port-design.md D2.
+//
+// The "is this a fork block" comparison and the write that follows it have to be
+// one critical section: split apart, two concurrent imports of heights h and h+1
+// could both pass the comparison against h-1 and then write in either order,
+// moving the watermark backwards. By contrast the view work at the bottom of this
+// function must happen OUTSIDE the lock: SetReady/CleanProposals/ChangeView call
+// back into the listener, which calls miner.RequestNewWork, and holding
+// finishedMu across that would put a foreign goroutine's wake-up inside our
+// critical section.
+func (d *Dispatcher) FinishedProposal(height uint64, sealHash elacom.Uint256,
+	headerTime uint64) {
+	Info("FinishedProposal")
+
+	// Read the proposal before taking finishedMu: proposalMu is never acquired
+	// while finishedMu is held (see the lock order note on Dispatcher).
+	processing := d.GetProcessingProposal()
+
+	d.finishedMu.Lock()
+	if height <= d.finishedHeight {
+		d.finishedMu.Unlock()
+		Warn("FinishedProposal received fork block", "height", height)
+		return
+	}
+	d.finishedHeight = height
+	d.finishedBlockSealHash = sealHash
+	if processing != nil {
+		d.finishedProposal = processing.Hash()
+	}
+	d.finishedMu.Unlock()
+
+	d.consensusView.SetReady()
+	d.CleanProposals(false)
+	d.consensusView.UpdateDutyIndex(height)
+	d.consensusView.ChangeView(d.timeSource.AdjustedTime(), true, headerTime)
+	d.resetViewMu.Lock()
+	d.resetViewRequests = make(map[string]struct{}, 0)
+	d.resetViewMu.Unlock()
+}
+
+func (d *Dispatcher) ResetConsensus(height uint64) {
+	Info("[resetConsensus] start", "d.consensusView.IsRunning()", d.consensusView.IsRunning())
+	defer Info("[resetConsensus] end")
+
+	if d.consensusView.IsRunning() {
+		Info("[resetConsensus] reset view")
+		d.consensusView.SetReady()
+		d.CleanProposals(false)
+		d.consensusView.resetViewOffset()
+		d.consensusView.UpdateDutyIndex(height)
+		d.consensusView.ChangeView(d.timeSource.AdjustedTime(), true, uint64(d.timeSource.AdjustedTime().Unix()))
+	}
+	d.resetViewMu.Lock()
+	d.resetViewRequests = make(map[string]struct{}, 0)
+	d.resetViewMu.Unlock()
+}
+
+func (d *Dispatcher) ResetConsensusForEpochTransition(height uint64, parentTime uint64) {
+	Info("[ResetConsensusForEpochTransition] start", "height", height)
+	defer Info("[ResetConsensusForEpochTransition] end")
+
+	d.consensusView.SetReady()
+	d.CleanProposals(false)
+	d.consensusView.resetViewOffset()
+	d.consensusView.UpdateDutyIndex(height)
+	d.consensusView.ChangeView(d.timeSource.AdjustedTime(), true, parentTime)
+
+	d.resetViewMu.Lock()
+	d.resetViewRequests = make(map[string]struct{}, 0)
+	d.resetViewMu.Unlock()
+}
+
+func (d *Dispatcher) OnResponseResetViewReceived(msg *emsg.ResetView) error {
+	signer := msg.Sponsor
+	sign := msg.Sign
+
+	data := new(bytes.Buffer)
+	if err := msg.SerializeUnsigned(
+		data); err != nil {
+		return err
+	}
+
+	pk, err := crypto.DecodePoint(signer)
+	if err != nil {
+		return err
+	}
+
+	if err := crypto.Verify(*pk, data.Bytes(), sign); err != nil {
+		Errorf("invalid message signature: %v", *msg)
+		return err
+	}
+	d.RecordViewRequest(signer)
+	return nil
+}
+
+func (d *Dispatcher) GetResetViewReqCount() int {
+	d.resetViewMu.Lock()
+	defer d.resetViewMu.Unlock()
+	return len(d.resetViewRequests)
+}
+
+func (d *Dispatcher) ResetViewRequestIsContain(sponsor []byte) bool {
+	d.resetViewMu.Lock()
+	defer d.resetViewMu.Unlock()
+	if d.resetViewRequests == nil {
+		return false
+	}
+	_, ok := d.resetViewRequests[elacom.BytesToHexString(sponsor)]
+	return ok
+}
+
+func (d *Dispatcher) RecordViewRequest(sponsor []byte) {
+	d.resetViewMu.Lock()
+	defer d.resetViewMu.Unlock()
+	if d.resetViewRequests == nil {
+		d.resetViewRequests = make(map[string]struct{}, 0)
+	}
+	d.resetViewRequests[elacom.BytesToHexString(sponsor)] = struct{}{}
+}
+
+func (d *Dispatcher) CleanProposals(changeView bool) {
+	Info("Clean proposals")
+	d.setProcessingProsalNil()
+	d.acceptVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
+	d.rejectedVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
+	d.pendingVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
+	d.proposalProcessFinished = false
+	if !changeView {
+		d.precociousProposals = make(map[elacom.Uint256]*payload.DPOSProposal)
+	} else {
+		// clear pending proposals less than current view offset
+		currentOffset := d.consensusView.GetViewOffset()
+		for k, v := range d.precociousProposals {
+			if v.ViewOffset < currentOffset {
+				delete(d.precociousProposals, k)
+			}
+		}
+	}
+}
+
+func (d *Dispatcher) setProcessingProsalNil() {
+	d.proposalMu.Lock()
+	d.processingProposal = nil
+	d.proposalMu.Unlock()
+}
+
+func (d *Dispatcher) ResetAcceptVotes() {
+	d.acceptVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
+}
+
+func (d *Dispatcher) UpdatePrecociousProposals() *payload.DPOSProposal {
+	for k, v := range d.precociousProposals {
+		if d.consensusView.IsRunning() &&
+			v.ViewOffset == d.consensusView.GetViewOffset() {
+			delete(d.precociousProposals, k)
+			return v
+		}
+	}
+	return nil
+}
+
+func (d *Dispatcher) alreadyExistVote(v *payload.DPOSProposalVote) bool {
+	_, ok := d.acceptVotes[v.Hash()]
+	if ok {
+		Info("[alreadyExistVote]: ", elacom.BytesToHexString(v.Signer), "already in the AcceptVotes!")
+		return true
+	}
+
+	_, ok = d.rejectedVotes[v.Hash()]
+	if ok {
+		Info("[alreadyExistVote]: ", elacom.BytesToHexString(v.Signer), "already in the RejectedVotes!")
+		return true
+	}
+
+	return false
+}
+
+func (d *Dispatcher) AcceptProposal(proposal *payload.DPOSProposal, ac account.Account) *emsg.Vote {
+	hash := proposal.Hash()
+
+	vote, err := StartVote(&hash, true, ac)
+	if err != nil {
+		Error("StartVote error", "err", err)
+		return nil
+	}
+	return &emsg.Vote{Command: emsg.CmdAcceptVote, Vote: *vote}
+}
+
+func (d *Dispatcher) RejectProposal(proposal *payload.DPOSProposal, ac account.Account) *emsg.Vote {
+	if d.setProcessingProposal(proposal) {
+		return nil
+	}
+	hash := proposal.Hash()
+	vote, err := StartVote(&hash, false, ac)
+	if err != nil {
+		Error("StartVote error", "err", err)
+		return nil
+	}
+	return &emsg.Vote{Command: emsg.CmdRejectVote, Vote: *vote}
+}
+
+func (d *Dispatcher) createConfirm() *payload.Confirm {
+	processingProposal := d.GetProcessingProposal()
+	if processingProposal == nil {
+		Warn("processingProposal is nil, can't create confirm")
+		return nil
+	}
+	confirm := &payload.Confirm{
+		Proposal: *processingProposal,
+		Votes:    make([]payload.DPOSProposalVote, 0),
+	}
+	for _, vote := range d.acceptVotes {
+		confirm.Votes = append(confirm.Votes, *vote)
+	}
+
+	return confirm
+}
+
+// createUnConfirm builds the rejection message for the proposal being processed.
+//
+// It goes through GetProcessingProposal rather than reading the field: the field
+// is guarded by proposalMu, and this runs on the vote goroutine while ProcessProposal
+// may be writing it from a network goroutine. The nil check is what the direct
+// dereference used to do implicitly -- by panicking.
+func (d *Dispatcher) createUnConfirm() *payload.Confirm {
+	processingProposal := d.GetProcessingProposal()
+	if processingProposal == nil {
+		Warn("processingProposal is nil, can't create unconfirm")
+		return nil
+	}
+	confirm := &payload.Confirm{
+		Proposal: *processingProposal,
+		Votes:    make([]payload.DPOSProposalVote, 0),
+	}
+	for _, vote := range d.rejectedVotes {
+		confirm.Votes = append(confirm.Votes, *vote)
+	}
+
+	return confirm
+}
+
+func (d *Dispatcher) IsProducer(account []byte) bool {
+	return d.consensusView.IsProducers(account)
+}
+
+func (d *Dispatcher) ProducerIsOnDuty() bool {
+	return d.consensusView.IsOnduty()
+}
+
+func (d *Dispatcher) GetProcessingProposal() *payload.DPOSProposal {
+	d.proposalMu.Lock()
+	defer d.proposalMu.Unlock()
+	return d.processingProposal
+}
+
+func (d *Dispatcher) GetNextNeedConnectArbiters() []peer.PID {
+	return d.consensusView.GetNextNeedConnectArbiters()
+}
+
+func (d *Dispatcher) GetCurrentNeedConnectArbiters() []peer.PID {
+	return d.consensusView.getCurrentNeedConnectArbiters()
+}
+
+func (d *Dispatcher) OnChangeView() {
+	d.consensusView.TryChangeView(d.timeSource.AdjustedTime())
+}
+
+func (d *Dispatcher) ResetView(parentTime uint64) {
+	d.consensusView.ResetView(parentTime)
+}
+
+func (d *Dispatcher) GetConsensusView() *ConsensusView {
+	return d.consensusView
+}
+
+func (d *Dispatcher) HelpToRecoverAbnormal(id peer.PID, height uint64, currentHeight uint64) *dmsg.ConsensusStatus {
+	Info("[HelpToRecoverAbnormal]  peer id:", elacom.BytesToHexString(id[:]))
+
+	if height > currentHeight {
+		Warn("Requesting height greater than current processing height")
+		return nil
+	}
+	if len(d.consensusView.GetProducers()) <= 0 {
+		Warn("Requesting chain is pow state")
+		return nil
+	}
+	status := &dmsg.ConsensusStatus{}
+	status.ConsensusStatus = d.consensusView.consensusStatus
+	status.ViewOffset = d.consensusView.viewOffset
+	status.ViewStartTime = d.consensusView.GetViewStartTime()
+
+	// The vote and proposal payloads are deliberately not shipped: a recovering
+	// peer only needs the view, the working height and the duty index to resume
+	// at the right turn. Sending the votes would let a peer collect signatures
+	// it never witnessed, which is exactly what the quorum is there to prevent.
+	status.AcceptVotes = make([]payload.DPOSProposalVote, 0, len(d.acceptVotes))
+	status.RejectedVotes = make([]payload.DPOSProposalVote, 0, len(d.rejectedVotes))
+	status.PendingProposals = make([]payload.DPOSProposal, 0, 1)
+	status.PendingVotes = make([]payload.DPOSProposalVote, 0, len(d.pendingVotes))
+	status.WorkingHeight = d.consensusView.producers.workingHeight
+	return status
+
+}
+
+func (d *Dispatcher) RecoverAbnormal(status *dmsg.ConsensusStatus, medianTime int64) {
+	Info("RecoverAbnormal", "status", status.ConsensusStatus, "viewOffset", status.ViewOffset, "viewStartTime", status.ViewStartTime)
+	if status == nil {
+		return
+	}
+	status.ViewStartTime = dtime.Int64ToTime(medianTime)
+	if medianTime != 0 {
+		offset, offsetTime := d.consensusView.calculateOffsetTime(status.ViewStartTime, d.timeSource.AdjustedTime())
+		status.ViewOffset += offset
+		status.ViewStartTime = d.timeSource.AdjustedTime().Add(-offsetTime)
+	}
+	d.RecoverFromConsensusStatus(status)
+}
+
+func (d *Dispatcher) RecoverFromConsensusStatus(status *dmsg.ConsensusStatus) error {
+	Info("RecoverFromConsensusStatus", "status", status.ConsensusStatus, "viewOffset", status.ViewOffset, "viewStartTime", status.ViewStartTime)
+	d.consensusView.consensusStatus = status.ConsensusStatus
+	d.acceptVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
+	d.rejectedVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
+	d.setProcessingProsalNil()
+	d.pendingVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
+
+	d.consensusView.viewOffset = status.ViewOffset
+	d.consensusView.ResetView(uint64(status.ViewStartTime.Unix()))
+	d.consensusView.isDposOnDuty = d.consensusView.ProducerIsOnDuty(d.consensusView.publicKey)
+	d.consensusView.SetWorkingHeight(status.WorkingHeight)
+	if finished := d.GetFinishedHeight(); finished > 0 {
+		d.consensusView.UpdateDutyIndex(finished)
+	}
+	Info("-------[End RecoverFromConsensusStatus]--------", "startTime", d.consensusView.GetViewStartTime(), "WorkingHeight", status.WorkingHeight, "dutyIndex", d.GetConsensusView().GetDutyIndex(), "d.finishedHeight", d.GetFinishedHeight(), "status.ViewOffset", status.ViewOffset)
+	d.consensusView.DumpInfo()
+	return nil
+}
+
+func (d *Dispatcher) GetNowTime() time.Time {
+	return d.timeSource.AdjustedTime()
+}
+
+func NewDispatcher(producers [][]byte, onConfirm func(confirm *payload.Confirm) error,
+	unConfirm func(confirm *payload.Confirm) error, tolerance time.Duration, publicKey []byte,
+	medianTime dtime.MedianTimeSource, viewListener ViewListener, dposStartHeight uint64) *Dispatcher {
+	return &Dispatcher{
+		acceptVotes:         make(map[elacom.Uint256]*payload.DPOSProposalVote),
+		rejectedVotes:       make(map[elacom.Uint256]*payload.DPOSProposalVote),
+		pendingVotes:        make(map[elacom.Uint256]*payload.DPOSProposalVote),
+		precociousProposals: make(map[elacom.Uint256]*payload.DPOSProposal),
+		consensusView:       NewConsensusView(tolerance, publicKey, NewProducers(producers, dposStartHeight), viewListener),
+		onConfirm:           onConfirm,
+		unConfirm:           unConfirm,
+		timeSource:          medianTime,
+	}
+}

@@ -198,6 +198,41 @@ var (
 		Value:    "warn",
 		Category: flags.EthCategory,
 	}
+	// PBFT/DPoS block production over the pgp-chain legacy history. All four are
+	// inert unless --pbft.enable is given, so a node that configures none of them
+	// stays a verifier.
+	//
+	// The names are copied from pgp-chain verbatim so an existing arbiter
+	// configuration can be moved across by hand without translation.
+	// --pbft.net.* and --pbft.maxnodeperhost are deliberately NOT defined yet:
+	// the engine does not read those Config fields, and a flag that is accepted
+	// and then ignored is worse than a missing one. They arrive with the DPoS
+	// network layer (M4).
+	PbftEnableFlag = &cli.BoolFlag{
+		Name:     "pbft.enable",
+		Usage:    "Produce PBFT blocks on the pgp-chain legacy history",
+		Category: flags.EthCategory,
+	}
+	PbftKeyStoreFlag = &cli.StringFlag{
+		Name:     "pbft.keystore",
+		Usage:    "Path to the Elastos arbiter keystore holding the producer key",
+		Category: flags.EthCategory,
+	}
+	// The password is a plain string because a cleartext password is the only
+	// form pgp-chain ever supported for this keystore. GetDposAccount takes it as
+	// bytes and the ELA keystore has no other unlock path.
+	PbftKeyStorePasswordFlag = &cli.StringFlag{
+		Name:     "pbft.keystore.password",
+		Usage:    "Password of the arbiter keystore (prefer a file over the command line)",
+		Category: flags.EthCategory,
+	}
+	// header.Coinbase is part of the PBFT seal hash, so this is not cosmetic: the
+	// address named here is the one the block is signed against.
+	PbftMinerAddressFlag = &cli.StringFlag{
+		Name:     "pbft.miner.address",
+		Usage:    "Coinbase to seal with; defaults to --miner.etherbase",
+		Category: flags.EthCategory,
+	}
 	ChapelFlag = &cli.BoolFlag{
 		Name:     "chapel",
 		Usage:    "Chapel network: pre-configured Proof-of-Stake-Authority BSC test network",
@@ -1765,20 +1800,58 @@ func MakeAddress(ks *keystore.KeyStore, account string) (accounts.Account, error
 }
 
 // setEtherbase retrieves the etherbase from the directly specified command line flags.
+//
+// Two flags can name the coinbase: --miner.etherbase, and --pbft.miner.address
+// (or Pbft.MinerAddress from the config file) for a PBFT/DPoS producer, which has
+// to seal with its arbiter address rather than with whatever account happens to
+// be first in the keystore. They resolve to the same header field, so they are
+// only ambiguous when they disagree -- and disagreeing is a configuration error
+// rather than something to settle by precedence, because header.Coinbase is part
+// of the PBFT seal hash: silently picking one means the block is signed against,
+// and the proposal commits to, an address the operator did not choose.
 func setEtherbase(ctx *cli.Context, cfg *ethconfig.Config) {
-	if !ctx.IsSet(MinerEtherbaseFlag.Name) {
+	pbftAddr := cfg.Pbft.MinerAddress
+	if ctx.IsSet(PbftMinerAddressFlag.Name) {
+		pbftAddr = ctx.String(PbftMinerAddressFlag.Name)
+	}
+	var flagName, etherbase string
+	switch {
+	case ctx.IsSet(MinerEtherbaseFlag.Name):
+		flagName, etherbase = MinerEtherbaseFlag.Name, ctx.String(MinerEtherbaseFlag.Name)
+		if pbftAddr != "" && !sameHexAddress(etherbase, pbftAddr) {
+			Fatalf("-%s (%s) and -%s (%s) name different addresses; both write header.Coinbase, which the PBFT seal hash commits to",
+				MinerEtherbaseFlag.Name, etherbase, PbftMinerAddressFlag.Name, pbftAddr)
+		}
+	case pbftAddr != "":
+		flagName, etherbase = PbftMinerAddressFlag.Name, pbftAddr
+	default:
 		return
 	}
-	addr := ctx.String(MinerEtherbaseFlag.Name)
+	addr := etherbase
 	if strings.HasPrefix(addr, "0x") || strings.HasPrefix(addr, "0X") {
 		addr = addr[2:]
 	}
 	b, err := hex.DecodeString(addr)
 	if err != nil || len(b) != common.AddressLength {
-		Fatalf("-%s: invalid etherbase address %q", MinerEtherbaseFlag.Name, addr)
+		Fatalf("-%s: invalid etherbase address %q", flagName, etherbase)
 		return
 	}
 	cfg.Miner.Etherbase = common.BytesToAddress(b)
+}
+
+// sameHexAddress reports whether two address strings name the same account.
+//
+// It exists so that "--miner.etherbase 0xAbC..." and "--pbft.miner.address
+// abc..." (the same address, differently spelled) are not reported as a
+// conflict. Bytes that do not parse fall back to a literal comparison.
+func sameHexAddress(a, b string) bool {
+	if a == b {
+		return true
+	}
+	if !common.IsHexAddress(a) || !common.IsHexAddress(b) {
+		return false
+	}
+	return common.HexToAddress(a) == common.HexToAddress(b)
 }
 
 // MakePasswordList reads password lines from the file specified by the global --password flag.
@@ -2135,6 +2208,26 @@ func setMiner(ctx *cli.Context, cfg *minerconfig.Config) {
 	}
 }
 
+// setPbft applies the --pbft.* flags to the eth config.
+//
+// Only the four settings the engine actually reads are wired here. The relative
+// keystore path is NOT resolved at this point: resolving needs the node's datadir
+// and belongs to eth/backend.go, which has the *node.Node in hand.
+func setPbft(ctx *cli.Context, cfg *ethconfig.Config) {
+	if ctx.IsSet(PbftEnableFlag.Name) {
+		cfg.Pbft.Enable = ctx.Bool(PbftEnableFlag.Name)
+	}
+	if ctx.IsSet(PbftKeyStoreFlag.Name) {
+		cfg.Pbft.KeyStore = ctx.String(PbftKeyStoreFlag.Name)
+	}
+	if ctx.IsSet(PbftKeyStorePasswordFlag.Name) {
+		cfg.Pbft.KeyStorePassword = ctx.String(PbftKeyStorePasswordFlag.Name)
+	}
+	if ctx.IsSet(PbftMinerAddressFlag.Name) {
+		cfg.Pbft.MinerAddress = ctx.String(PbftMinerAddressFlag.Name)
+	}
+}
+
 func setRequiredBlocks(ctx *cli.Context, cfg *ethconfig.Config) {
 	requiredBlocks := ctx.String(EthRequiredBlocksFlag.Name)
 	if requiredBlocks == "" {
@@ -2178,6 +2271,7 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	setTxPool(ctx, &cfg.TxPool)
 	setBlobPool(ctx, &cfg.BlobPool)
 	setMiner(ctx, &cfg.Miner)
+	setPbft(ctx, cfg)
 	setRequiredBlocks(ctx, cfg)
 
 	// Cap the cache allowance and tune the garbage collector
@@ -2951,7 +3045,7 @@ func MakeChain(ctx *cli.Context, stack *node.Node, readonly bool) (*core.BlockCh
 	if err != nil {
 		Fatalf("%v", err)
 	}
-	engine, err := ethconfig.CreateConsensusEngine(config, chainDb, nil, genesisHash)
+	engine, _, err := ethconfig.CreateConsensusEngine(config, chainDb, nil, genesisHash, nil)
 	if err != nil {
 		Fatalf("%v", err)
 	}

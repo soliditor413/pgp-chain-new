@@ -153,6 +153,15 @@ func (miner *Miner) Start() {
 	miner.startCh <- struct{}{}
 }
 
+// RequestNewWork asks the worker to rebuild its current work item. The PBFT
+// engine calls it from its view-change path so that a newly on-duty producer
+// starts sealing immediately instead of waiting for the next block interval.
+//
+// It is safe to call from any goroutine and never blocks, including after the
+// worker has been closed: the wake-up is a buffered channel send that nobody has
+// to consume.
+func (miner *Miner) RequestNewWork() { miner.worker.requestNewWork() }
+
 func (miner *Miner) Stop() {
 	miner.stopCh <- struct{}{}
 }

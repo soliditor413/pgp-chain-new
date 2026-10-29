@@ -20,6 +20,7 @@ type fakeEngine struct {
 	name    string
 	verify  int
 	prepare int
+	seal    int
 }
 
 func (f *fakeEngine) Author(*types.Header) (common.Address, error) { return common.Address{}, nil }
@@ -50,6 +51,7 @@ func (f *fakeEngine) Finalize(consensus.ChainHeaderReader, *types.Header, vm.Sta
 	return nil
 }
 func (f *fakeEngine) Seal(consensus.ChainHeaderReader, *types.Block, chan<- *types.Block, <-chan struct{}) error {
+	f.seal++
 	return nil
 }
 func (f *fakeEngine) SealHash(h *types.Header) common.Hash { return common.Hash{} }
@@ -87,6 +89,60 @@ func (f *fakeEngine) NextProposalBlock(consensus.ChainHeaderReader, *types.Heade
 
 func headerAt(number uint64) *types.Header {
 	return &types.Header{Number: new(big.Int).SetUint64(number)}
+}
+
+func blockAt(number uint64) *types.Block {
+	return types.NewBlockWithHeader(headerAt(number))
+}
+
+// TestSealDelegatesToLegacyBeforeFork pins the post-port behaviour: a pre-fork
+// Seal is a delegation, not a refusal. Refusing here is what kept the chain from
+// ever producing block 1, and the reason it was safe to refuse (the legacy engine
+// being read-only) no longer holds now that consensus/pbft produces.
+func TestSealDelegatesToLegacyBeforeFork(t *testing.T) {
+	legacy := &fakeEngine{name: "legacy"}
+	posa := &fakeEngine{name: "posa"}
+	r := New(legacy, posa, 10)
+
+	results := make(chan *types.Block, 1)
+	if err := r.Seal(nil, blockAt(9), results, nil); err != nil {
+		t.Fatalf("pre-fork Seal must delegate, got %v", err)
+	}
+	if legacy.seal != 1 || posa.seal != 0 {
+		t.Fatalf("pre-fork Seal did not reach the legacy engine: legacy=%d posa=%d", legacy.seal, posa.seal)
+	}
+
+	if err := r.Seal(nil, blockAt(10), results, nil); err != nil {
+		t.Fatalf("forked Seal must delegate: %v", err)
+	}
+	if posa.seal != 1 || legacy.seal != 1 {
+		t.Fatalf("forked Seal did not reach the posa engine: legacy=%d posa=%d", legacy.seal, posa.seal)
+	}
+}
+
+// TestSealForkedWithoutPoSA checks the forked era still fails loudly.
+func TestSealForkedWithoutPoSA(t *testing.T) {
+	r := New(&fakeEngine{}, nil, 10)
+	if err := r.Seal(nil, blockAt(10), make(chan *types.Block, 1), nil); err == nil {
+		t.Fatal("expected an error for a forked Seal without a posa engine")
+	}
+}
+
+// TestDelayNeverReturnsNil guards miner/worker.go:1418: a nil delay makes the
+// miner warn and stop collecting transactions until the next block, so the
+// router must never pass one through.
+func TestDelayNeverReturnsNil(t *testing.T) {
+	r := New(&fakeEngine{}, nil, 10)
+
+	if d := r.Delay(nil, headerAt(9), nil); d == nil {
+		t.Fatal("Delay returned nil for a pre-fork header")
+	}
+	if d := r.Delay(nil, headerAt(10), nil); d == nil {
+		t.Fatal("Delay returned nil for a header whose engine is missing")
+	}
+	if d := r.Delay(nil, nil, nil); d == nil {
+		t.Fatal("Delay returned nil for a nil header")
+	}
 }
 
 // TestRoutingByHeight checks that the fork height alone decides which engine runs.

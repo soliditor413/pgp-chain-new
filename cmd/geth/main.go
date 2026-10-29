@@ -201,6 +201,13 @@ var (
 		// utils.BeaconCheckpointFileFlag,
 		utils.LogSlowBlockFlag,
 		utils.SpvElaLogLevelFlag,
+		// PBFT/DPoS block production. nodeFlags is an explicit slice, so a flag
+		// that is not listed here is not defined at all -- geth refuses to start
+		// with "flag provided but not defined".
+		utils.PbftEnableFlag,
+		utils.PbftKeyStoreFlag,
+		utils.PbftKeyStorePasswordFlag,
+		utils.PbftMinerAddressFlag,
 	}, utils.NetworkFlags, utils.DatabaseFlags)
 
 	rpcFlags = []cli.Flag{

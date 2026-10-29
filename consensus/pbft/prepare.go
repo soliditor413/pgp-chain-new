@@ -1,0 +1,155 @@
+// Copyright 2026 The pgp-chain Authors
+// This file is part of the pgp-chain library.
+//
+// The pgp-chain library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+//
+// The pgp-chain library is distributed in the hope that it will be useful,
+// but WITHOUT ANY WARRANTY; without even the implied warranty of
+// MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+// GNU Lesser General Public License for more details.
+//
+// You should have received a copy of the GNU Lesser General Public License
+// along with the pgp-chain library. If not, see <http://www.gnu.org/licenses/>.
+
+package pbft
+
+import (
+	"math/big"
+	"sync/atomic"
+	"time"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/consensus/pgp"
+	"github.com/ethereum/go-ethereum/core/types"
+)
+
+// Prepare implements consensus.Engine.
+//
+// It runs inside miner's work-generation path and is the only place that decides
+// whether this node may propose at all. Every check below is a reason to produce
+// nothing this time; none of them is an error the operator should be paged for,
+// and the miner treats them as such (miner/worker.go's legacy branch logs them at
+// debug level).
+func (e *Engine) Prepare(chain consensus.ChainHeaderReader, header *types.Header) error {
+	if header.Number == nil || header.Number.Sign() == 0 {
+		// Genesis is constructed, not prepared.
+		return consensus.ErrUnknownAncestor
+	}
+	// The two "this node cannot produce at all" gates come first, before anything
+	// below mutates the header. A refused Prepare must leave the caller's header
+	// untouched: "production is off" is a configuration answer, and answering it
+	// by half-rewriting a header (Extra cleared, Difficulty forced to 2,
+	// MixDigest zeroed) makes "disabled means no side effects" impossible to
+	// state, and leaves anyone who reuses the header after the error holding a
+	// mutated one. See docs/design/pbft-port-design.md D6.
+	if !e.cfg.productionEnabled() {
+		return pgp.ErrProductionNotSupported
+	}
+	// Configured to produce but no usable key: report the key, not the config,
+	// because the config is already known to be willing.
+	if e.account == nil {
+		return ErrNotProducer
+	}
+	atomic.StoreInt32(&e.isSealOver, 0)
+
+	nowTime := uint64(time.Now().Unix())
+	if e.dispatcher != nil {
+		nowTime = uint64(e.dispatcher.GetNowTime().Unix())
+	}
+
+	// Overwrite every field whose value the miner or a previous attempt may have
+	// already set, BEFORE anything computes a hash from it. See
+	// docs/design/pbft-port-design.md D6:
+	//
+	//   Extra      miner pre-fills it from --miner.extradata (worker.go:1063);
+	//              a legacy block's Extra is the serialized confirm and nothing
+	//              else, with no vanity prefix.
+	//   MixDigest  miner writes genParams.random into it (worker.go:1073) on
+	//              chains with a beacon root; a legacy header must be zero.
+	//   Difficulty a legacy header must carry exactly 2.
+	header.Difficulty = new(big.Int).Set(diffInTurn)
+	header.Extra = nil
+	header.MixDigest = common.Hash{}
+	header.UncleHash = types.CalcUncleHash(nil)
+	if e.dispatcher != nil {
+		// header.Nonce anchors the ELA main chain height the confirm will be
+		// verified against (see consensus/pgp verifyConfirm). Using the producer
+		// set's own spv height keeps the sealer and the verifier reading the same
+		// height even while the SPV listener is catching up.
+		header.Nonce = types.EncodeNonce(e.dispatcher.GetConsensusView().GetSpvHeight())
+	}
+
+	parent := chain.GetHeader(header.ParentHash, header.Number.Uint64()-1)
+	if parent == nil {
+		return consensus.ErrUnknownAncestor
+	}
+
+	// The remaining gates cannot move above the rewrite: they depend on the parent
+	// header or on the view this round is about to open.
+	if atomic.LoadInt32(&e.recovered) == 0 {
+		return ErrWaitRecoverStatus
+	}
+	if header.Number.Uint64() <= e.dispatcher.GetFinishedHeight() {
+		return ErrAlreadyConfirmedBlock
+	}
+	// A round is already in flight for this height. Starting another would fork
+	// the proposal, and letting Prepare rewrite the header mid-round would leave
+	// the in-flight proposal committing to a different seal hash.
+	if e.dispatcher.GetConsensusView().IsRunning() {
+		return ErrConsensusIsRunning
+	}
+	if !e.IsProducer() {
+		return ErrUnauthorizedSigner
+	}
+
+	head := chain.CurrentHeader()
+	var headHeight uint64
+	if head != nil && head.Number != nil {
+		headHeight = head.Number.Uint64()
+	}
+	e.startView(parent.Time, headHeight)
+
+	header.Time = parent.Time + e.period
+	if header.Time < nowTime {
+		// We are late: the parent is older than one period ago. Re-anchor the view
+		// on the current time so the round's deadline is measured from now, and
+		// stamp the block with the current time so it is not born stale.
+		header.Time = nowTime
+		e.dispatcher.ResetView(nowTime)
+	}
+	return nil
+}
+
+// startView opens a round: align the view clock with the parent's timestamp,
+// recompute whose turn it is, and mark consensus running.
+//
+// The view loop that drives view changes is started once, on the first round, and
+// no-ops until the view is running. That is deliberately different from
+// pgp-chain, which starts and stops the loop around rounds: a loop that is
+// created per round can be created twice by two racing Prepare calls, and two
+// loops halve signTolerance without changing any configuration.
+func (e *Engine) startView(headerTime uint64, headHeight uint64) {
+	if e.account == nil {
+		return
+	}
+	view := e.dispatcher.GetConsensusView()
+	if view.IsRunning() {
+		e.dispatcher.ResetView(headerTime)
+	} else {
+		view.SetChangViewTime(headerTime)
+		view.UpdateDutyIndex(headHeight)
+	}
+	view.SetRunning()
+	e.ensureViewLoop()
+}
+
+// isEpochTransitionPending reports whether the producer set is rotating.
+//
+// Not wired to anything yet: the producer rotation arrives with the SPV event
+// path in M5 of the port. It exists so that Seal has the check in the right
+// place when that lands, and so the answer is false rather than undefined today.
+func (e *Engine) isEpochTransitionPending() bool { return false }

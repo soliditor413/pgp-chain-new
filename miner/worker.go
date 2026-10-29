@@ -34,6 +34,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
 	"github.com/ethereum/go-ethereum/consensus/parlia"
+	"github.com/ethereum/go-ethereum/consensus/pbft"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/stateless"
@@ -413,6 +414,21 @@ func (w *worker) start() {
 	w.startCh <- struct{}{}
 }
 
+// requestNewWork asks the task loop to rebuild work for a new consensus view.
+//
+// Non-blocking on purpose: the caller is the consensus engine's view-change
+// goroutine, and startCh has a single buffer slot. A blocking send here would
+// let a busy miner stall the view clock, which is how a view change turns into a
+// stalled chain.
+func (w *worker) requestNewWork() {
+	select {
+	case w.startCh <- struct{}{}:
+	default:
+		// One wake-up is already pending; coalescing is correct because the task
+		// that wake-up produces will be built from the latest head anyway.
+	}
+}
+
 // stop sets the running status as 0.
 func (w *worker) stop() {
 	w.running.Store(false)
@@ -506,8 +522,17 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 		case <-timer.C:
 			// If sealing is running resubmit a new work cycle periodically to pull in
 			// higher priced transactions. Disable this overhead for pending blocks.
+			//
+			// The legacy PBFT chain needs this even though it has neither a Clique
+			// period nor BSC's Parlia loop: a round that timed out has to be
+			// retried with fresh work, and the resubmit is what carries the new
+			// transaction set into that retry. Recommit stays the transaction
+			// collection window -- it is deliberately NOT tied to the block period,
+			// because a 3s window against a 3s block would mostly produce empty
+			// blocks.
 			if w.isRunning() && ((w.chainConfig.Clique != nil &&
-				w.chainConfig.Clique.Period > 0) || (w.chainConfig.IsInBSC())) {
+				w.chainConfig.Clique.Period > 0) || w.chainConfig.IsInBSC() ||
+				w.chainConfig.Legacy != nil) {
 				// Short circuit if no new transaction arrives.
 				commit(commitInterruptResubmit)
 			}
@@ -599,7 +624,16 @@ func (w *worker) taskLoop() {
 			w.pendingMu.Unlock()
 
 			if err := w.engine.Seal(w.chain, task.block, w.resultCh, stopCh); err != nil {
-				log.Warn("Block sealing failed", "err", err)
+				// A round that produced no block is the normal outcome for every
+				// producer that is not on duty, and for on-duty producers that
+				// lost the round, so those are debug: logging 12 nodes' worth of
+				// "sealing failed" every height is what makes an operator stop
+				// reading the log at all.
+				if pbft.IsBenignSealError(err) {
+					log.Debug("Block sealing did not produce a block", "err", err)
+				} else {
+					log.Warn("Block sealing failed", "err", err)
+				}
 				w.pendingMu.Lock()
 				delete(w.pendingTasks, sealHash)
 				w.pendingMu.Unlock()
@@ -1090,8 +1124,17 @@ func (w *worker) prepareWork(genParams *generateParams, witness bool) (*environm
 	}
 	// Run the consensus preparation with the default or customized consensus engine.
 	// Note that the `header.Time` may be changed.
+	//
+	// The error is returned either way: this header must not be used for
+	// anything, and commitWork already gives up on a non-nil Prepare result.
+	// What differs is only the log level -- "not my turn" and "not recovered
+	// yet" happen on every height for 11 of 12 producers and are not faults.
 	if err := w.engine.Prepare(w.chain, header); err != nil {
-		log.Error("Failed to prepare header for sealing", "err", err)
+		if pbft.IsBenignPrepareError(err) {
+			log.Debug("Not preparing a header for sealing", "err", err)
+		} else {
+			log.Error("Failed to prepare header for sealing", "err", err)
+		}
 		return nil, err
 	}
 	// Apply EIP-4844, EIP-4788.
@@ -1558,7 +1601,11 @@ LOOP:
 	var simBidBlockReward *uint256.Int
 	var simBidValidatorReward *uint256.Int
 	var localValidatorReward *uint256.Int
-	if w.bidFetcher != nil && bestWork.header.Difficulty.Cmp(diffInTurn) == 0 {
+	// The legacy PBFT chain has no MEV bid path at all: there is no builder to
+	// fetch a bid from and every legacy header carries difficulty 2, so the
+	// DiffInTurn test below would be true permanently and gate the block behind a
+	// bid that can never arrive.
+	if w.bidFetcher != nil && w.chainConfig.Legacy == nil && bestWork.header.Difficulty.Cmp(diffInTurn) == 0 {
 		inturnBlocksGauge.Inc(1)
 		localValidatorReward = new(uint256.Int).Mul(bestReward, uint256.NewInt(*w.config.Mev.ValidatorCommission))
 		localValidatorReward.Div(localValidatorReward, uint256.NewInt(10000))

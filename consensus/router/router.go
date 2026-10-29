@@ -247,6 +247,16 @@ func (e *Engine) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 }
 
 // Seal implements consensus.Engine.
+//
+// Pre-fork this is delegated to the legacy engine, which after the PBFT port is
+// the engine that can actually produce a block. Refusing here — as this method
+// did while the legacy engine was a read-only replay engine — would leave the
+// chain unable to make block 1 once the producer keys are configured.
+//
+// The delegation is still safe for a node that has no PBFT configuration: the
+// read-only engine in consensus/pgp answers Seal with ErrProductionNotSupported,
+// so a follower stays a follower by construction rather than by a check here.
+// See docs/design/pbft-port-design.md D4.
 func (e *Engine) Seal(chain consensus.ChainHeaderReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
 	if block == nil {
 		return errors.New("router: nil block")
@@ -258,7 +268,11 @@ func (e *Engine) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 		}
 		return engine.Seal(chain, block, results, stop)
 	}
-	return errors.New("router: sealing not supported before fork")
+	engine, err := e.legacyEngine()
+	if err != nil {
+		return err
+	}
+	return engine.Seal(chain, block, results, stop)
 }
 
 // SealHash implements consensus.Engine.
@@ -295,12 +309,23 @@ func (e *Engine) CalcDifficulty(chain consensus.ChainHeaderReader, time uint64, 
 }
 
 // Delay implements consensus.Engine.
+//
+// A nil return is not a valid answer: miner treats it as "something is wrong",
+// warns and stops collecting transactions until the next block
+// (miner/worker.go:1418). When the owning engine cannot be resolved the answer is
+// therefore "no delay", which keeps the miner working on the next block instead
+// of silently starving it of transactions for the rest of this one.
 func (e *Engine) Delay(chain consensus.ChainReader, header *types.Header, leftOver *time.Duration) *time.Duration {
 	engine, err := e.engineFor(header)
 	if err != nil {
-		return nil
+		noDelay := time.Duration(0)
+		return &noDelay
 	}
-	return engine.Delay(chain, header, leftOver)
+	if delay := engine.Delay(chain, header, leftOver); delay != nil {
+		return delay
+	}
+	noDelay := time.Duration(0)
+	return &noDelay
 }
 
 // Close implements consensus.Engine. Both engines are closed, the Parlia one

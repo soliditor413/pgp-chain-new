@@ -568,3 +568,86 @@ func TestGoldenTamperedMainnetHeadersAreRejected(t *testing.T) {
 		}
 	})
 }
+
+// TestGoldenConfirmSerializesBackToTheSameBytes pins the producer/verifier
+// contract that the whole PBFT port rests on.
+//
+// consensus/pbft seals a block by calling (*payload.Confirm).Serialize on the
+// confirm its vote round produced; consensus/pgp verifies a block by decoding
+// header.Extra back into a confirm. Those two halves only agree if Serialize is
+// the exact inverse of decodeConfirm on real data -- including the vote order,
+// because the dispatcher appends votes in arrival order and does not sort them.
+// A serializer that reordered or re-encoded anything would produce a header that
+// the sealer accepts and every peer rejects, which is a chain split that no
+// amount of self-testing on the producing side can detect.
+//
+// The twelve vectors are the only place this can be checked against bytes the
+// chain actually accepted.
+func TestGoldenConfirmSerializesBackToTheSameBytes(t *testing.T) {
+	for _, v := range loadGoldenVectors(t) {
+		header := v.header(t)
+		confirm := v.decodeGoldenConfirm(t, header)
+
+		round := serializeConfirm(t, confirm)
+		if !bytes.Equal(round, header.Extra) {
+			first := -1
+			for i := 0; i < len(round) && i < len(header.Extra); i++ {
+				if round[i] != header.Extra[i] {
+					first = i
+					break
+				}
+			}
+			t.Fatalf("block %d: re-serialized confirm is %d bytes, header.Extra is %d, first difference at %d",
+				v.Number, len(round), len(header.Extra), first)
+		}
+
+		// Round-trip through the decoder once more: the bytes the sealer would
+		// write must decode back to a confirm the verifier accepts. Doing this on
+		// the re-serialized bytes rather than the recorded ones is what makes the
+		// test about consensus/pbft's output and not only about the recording.
+		again, err := decodeConfirm(round)
+		if err != nil {
+			t.Fatalf("block %d: the re-serialized confirm does not decode: %v", v.Number, err)
+		}
+		if again.Proposal.BlockHash != confirm.Proposal.BlockHash ||
+			len(again.Votes) != len(confirm.Votes) {
+			t.Fatalf("block %d: the re-serialized confirm decodes to a different confirm", v.Number)
+		}
+	}
+}
+
+// TestConfirmWireLengthIs1199For8Votes pins the arithmetic the seal path relies
+// on before it has a confirm.
+//
+// The pool and the sealer both need to know how big a confirm will be, and the
+// constants are the only source for that: a confirm is exactly
+//
+//	proposal (135) + vote count (8) + n * vote (132)
+//
+// with n = 8 on mainnet. If a field is ever added to payload.Confirm the sum
+// stops matching reality, and the failure has to be here rather than in a
+// rejected mainnet header.
+func TestConfirmWireLengthIs1199For8Votes(t *testing.T) {
+	const (
+		voteCountWord = 8
+		mainnetVotes  = 8
+	)
+
+	if got, want := legacyConfirmMinLen, legacyProposalWireLen+voteCountWord; got != want {
+		t.Fatalf("ConfirmMinLen = %d, want proposal %d + count %d = %d",
+			got, legacyProposalWireLen, voteCountWord, want)
+	}
+	if got, want := legacyProposalWireLen+voteCountWord+mainnetVotes*legacyVoteWireLen, 1199; got != want {
+		t.Fatalf("an 8 vote confirm is %d bytes, want %d", got, want)
+	}
+
+	// And the constants must describe the recorded blocks, not just themselves.
+	for _, v := range loadGoldenVectors(t) {
+		header := v.header(t)
+		if len(header.Extra) != legacyConfirmMinLen+len(v.Confirm.Votes)*legacyVoteWireLen {
+			t.Fatalf("block %d: Extra is %d bytes, the formula gives %d for %d votes",
+				v.Number, len(header.Extra),
+				legacyConfirmMinLen+len(v.Confirm.Votes)*legacyVoteWireLen, len(v.Confirm.Votes))
+		}
+	}
+}

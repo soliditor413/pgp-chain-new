@@ -38,6 +38,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/parlia"
+	"github.com/ethereum/go-ethereum/consensus/pbft"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/filtermaps"
 	"github.com/ethereum/go-ethereum/core/history"
@@ -135,6 +136,17 @@ type Ethereum struct {
 
 	engine         consensus.Engine
 	accountManager *accounts.Manager
+
+	// pbftEngine is the legacy PBFT/DPoS producing engine, nil on every chain
+	// that does not carry the pgp-chain legacy history. It cannot be recovered
+	// from engine: that is a *router.Engine, which implements consensus.Engine
+	// only, so ethconfig.CreateConsensusEngine hands it out as a second return
+	// value instead.
+	pbftEngine *pbft.Engine
+	// pbftChainHeadCh/pbftChainHeadSub drive pbftLoop, which turns an imported
+	// block into either a finality advance or a round reset.
+	pbftChainHeadCh  chan core.ChainHeadEvent
+	pbftChainHeadSub event.Subscription
 
 	filterMaps      *filtermaps.FilterMaps
 	closeFilterMaps chan chan struct{}
@@ -330,7 +342,13 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		log.Info("Unprotected transactions allowed")
 	}
 	ethAPI := ethapi.NewBlockChainAPI(eth.APIBackend)
-	eth.engine, err = ethconfig.CreateConsensusEngine(chainConfig, chainDb, ethAPI, genesisHash)
+	// The arbiter keystore path is per-node and may be relative; only this
+	// function has the node's datadir, so it is resolved here rather than in
+	// cmd/utils' setPbft.
+	if config.Pbft.KeyStore != "" && !filepath.IsAbs(config.Pbft.KeyStore) {
+		config.Pbft.KeyStore = stack.ResolvePath(config.Pbft.KeyStore)
+	}
+	eth.engine, eth.pbftEngine, err = ethconfig.CreateConsensusEngine(chainConfig, chainDb, ethAPI, genesisHash, &config.Pbft)
 	if err != nil {
 		return nil, err
 	}
@@ -421,6 +439,21 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		return nil, err
 	}
 
+	// Hand the chain to the PBFT engine and start listening for chain heads.
+	//
+	// Both must happen before miner.New below, because that constructor starts the
+	// worker goroutines itself and they begin calling Prepare immediately. A
+	// worker that runs Prepare against an engine with no chain attached cannot
+	// resolve the parent header and produces nothing; a missing head subscription
+	// means the irreversible height never advances and a finished round is never
+	// reset.
+	if eth.pbftEngine != nil {
+		eth.pbftEngine.AttachChain(eth.blockchain) // *BlockChain satisfies consensus.ChainHeaderReader
+		eth.pbftChainHeadCh = make(chan core.ChainHeadEvent, 16)
+		eth.pbftChainHeadSub = eth.blockchain.SubscribeChainHeadEvent(eth.pbftChainHeadCh)
+		go eth.pbftLoop()
+	}
+
 	// Initialize filtermaps log index.
 	// Auto-enable checkpoint file
 	checkpointFile := filepath.Join(stack.DataDir(), "geth", "filtermap_checkpoints.json")
@@ -502,7 +535,19 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	eth.dropper = newDropper(eth.p2pServer.MaxDialedConns(), eth.p2pServer.MaxInboundConns())
 
 	eth.miner = miner.New(eth, &config.Miner, eth.handler.eventMux, eth.engine)
-	eth.miner.SetExtra(makeExtraData(config.Miner.ExtraData))
+	if eth.pbftEngine != nil {
+		// The engine's view-change notification asks for fresh work through this
+		// hook; without it a producer that becomes on-duty mid-height waits for
+		// the next chain head instead of sealing immediately.
+		eth.pbftEngine.StartMine = eth.miner.RequestNewWork
+	}
+	if chainConfig.Legacy == nil {
+		// A legacy header's Extra is the serialized PBFT confirm and nothing
+		// else, so --miner.extradata has no meaning on that chain: Prepare
+		// overwrites the field anyway and SetExtra would only warn about the
+		// length on every start.
+		eth.miner.SetExtra(makeExtraData(config.Miner.ExtraData))
+	}
 	eth.miner.SetPrioAddresses(config.TxPool.Locals)
 
 	// Create voteManager instance
@@ -843,6 +888,13 @@ func (s *Ethereum) StartMining() error {
 			}()
 		}
 
+		// A single-node producer has nobody to exchange consensus status with, so
+		// the recovery gate must be opened here. Without this the engine answers
+		// ErrWaitRecoverStatus on every Prepare and the node silently never seals.
+		if s.pbftEngine != nil && !s.pbftEngine.HasTransport() {
+			s.pbftEngine.MarkRecovered()
+		}
+
 		go s.miner.Start()
 	}
 	return nil
@@ -864,6 +916,27 @@ func (s *Ethereum) StopMining() {
 
 func (s *Ethereum) IsMining() bool      { return s.miner.Mining() }
 func (s *Ethereum) Miner() *miner.Miner { return s.miner }
+
+// PbftEngine returns the legacy PBFT producing engine, or nil when the node is
+// not running the pgp-chain legacy rules.
+func (s *Ethereum) PbftEngine() *pbft.Engine { return s.pbftEngine }
+
+// pbftLoop feeds imported chain heads to the PBFT engine.
+//
+// It runs off the chain-head event rather than off engine.Finalize because
+// Finalize is called for every imported block, side branches included, so
+// advancing the irreversible height there would let a side chain move the
+// watermark. See docs/design/pbft-port-design.md D2.
+func (s *Ethereum) pbftLoop() {
+	for {
+		select {
+		case ev := <-s.pbftChainHeadCh:
+			s.pbftEngine.OnBlockImported(ev.Header)
+		case <-s.pbftChainHeadSub.Err():
+			return
+		}
+	}
+}
 
 func (s *Ethereum) AccountManager() *accounts.Manager  { return s.accountManager }
 func (s *Ethereum) BlockChain() *core.BlockChain       { return s.blockchain }
@@ -1073,6 +1146,9 @@ func (s *Ethereum) Stop() error {
 	s.filterMaps.Stop()
 	s.txPool.Close()
 	s.miner.Close()
+	if s.pbftChainHeadSub != nil {
+		s.pbftChainHeadSub.Unsubscribe()
+	}
 	s.blockchain.Stop()
 	s.engine.Close()
 

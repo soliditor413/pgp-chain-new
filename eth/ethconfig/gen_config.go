@@ -6,6 +6,7 @@ import (
 	"time"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/consensus/pbft"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/history"
 	"github.com/ethereum/go-ethereum/core/txpool/blobpool"
@@ -90,6 +91,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 		TxSyncMaxTimeout        time.Duration `toml:",omitempty"`
 		RangeLimit              uint64        `toml:",omitempty"`
 		BlobExtraReserve        uint64
+		Pbft                    pbft.Config
 	}
 	var enc Config
 	enc.Genesis = c.Genesis
@@ -164,6 +166,7 @@ func (c Config) MarshalTOML() (interface{}, error) {
 	enc.TxSyncMaxTimeout = c.TxSyncMaxTimeout
 	enc.RangeLimit = c.RangeLimit
 	enc.BlobExtraReserve = c.BlobExtraReserve
+	enc.Pbft = c.Pbft
 	return &enc, nil
 }
 
@@ -242,6 +245,7 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 		TxSyncMaxTimeout        *time.Duration `toml:",omitempty"`
 		RangeLimit              *uint64        `toml:",omitempty"`
 		BlobExtraReserve        *uint64
+		Pbft                    *pbft.Config
 	}
 	var dec Config
 	if err := unmarshal(&dec); err != nil {
@@ -462,6 +466,9 @@ func (c *Config) UnmarshalTOML(unmarshal func(interface{}) error) error {
 	}
 	if dec.BlobExtraReserve != nil {
 		c.BlobExtraReserve = *dec.BlobExtraReserve
+	}
+	if dec.Pbft != nil {
+		c.Pbft = *dec.Pbft
 	}
 	return nil
 }

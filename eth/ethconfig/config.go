@@ -27,7 +27,7 @@ import (
 	"github.com/ethereum/go-ethereum/consensus/clique"
 	"github.com/ethereum/go-ethereum/consensus/ethash"
 	"github.com/ethereum/go-ethereum/consensus/parlia"
-	"github.com/ethereum/go-ethereum/consensus/pgp"
+	"github.com/ethereum/go-ethereum/consensus/pbft"
 	"github.com/ethereum/go-ethereum/consensus/router"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/history"
@@ -279,37 +279,58 @@ type Config struct {
 
 	// blob setting
 	BlobExtraReserve uint64
+
+	// Pbft holds the per-node settings of the pgp-chain PBFT/DPoS block
+	// producer. It is inert (Enable=false) unless --pbft.enable is given, which
+	// is what keeps a node without any pbft configuration a pure verifier.
+	Pbft pbft.Config
 }
 
 // CreateConsensusEngine creates a consensus engine for the given chain config.
 // Clique is allowed for now to live standalone, but ethash is forbidden and can
 // only exist on already merged networks.
-func CreateConsensusEngine(config *params.ChainConfig, db ethdb.Database, ee *ethapi.BlockChainAPI, genesisHash common.Hash) (consensus.Engine, error) {
+//
+// The second return value is the legacy PBFT/DPoS producing engine, and it is nil
+// for every chain that does not carry the pgp-chain legacy history. It exists
+// because the returned consensus.Engine is a router.Engine, which implements
+// consensus.Engine and nothing else on purpose (a PoSA implementation there would
+// abort startup when eth/backend.go asserts the engine to *parlia.Parlia), so the
+// caller cannot type-assert the inner producing engine back out of it. This is
+// the ONLY channel through which the node wiring can reach it.
+//
+// pbftCfg may be nil; the engine then treats production as disabled and behaves
+// exactly like the read-only consensus/pgp engine.
+func CreateConsensusEngine(config *params.ChainConfig, db ethdb.Database, ee *ethapi.BlockChainAPI, genesisHash common.Hash,
+	pbftCfg *pbft.Config) (consensus.Engine, *pbft.Engine, error) {
 	// Chains that carry the pgp-chain legacy history are handled by the height
 	// router: the legacy PBFT/DPoS engine validates the blocks up to
 	// Legacy.ForkHeight, Parlia takes over from there (if it is configured).
 	if config.Legacy != nil {
-		legacy := pgp.New(config.Legacy)
+		// pbft embeds pgp, so this is still the read-only verifier plus block
+		// production: a node without --pbft.enable answers Seal with
+		// pgp.ErrProductionNotSupported and stays a follower by construction.
+		legacy := pbft.New(config.Legacy, pbftCfg)
 		var posa consensus.PoSA
 		if config.Parlia != nil {
 			posa = parlia.New(config, db, ee, genesisHash)
 		}
 		log.Info("Created pgp-chain height router",
-			"forkHeight", config.Legacy.ForkHeight, "parlia", posa != nil)
-		return router.New(legacy, posa, config.Legacy.ForkHeight), nil
+			"forkHeight", config.Legacy.ForkHeight, "parlia", posa != nil,
+			"producing", legacy.IsProductionEnabled())
+		return router.New(legacy, posa, config.Legacy.ForkHeight), legacy, nil
 	}
 	if config.IsInBSC() {
-		return parlia.New(config, db, ee, genesisHash), nil
+		return parlia.New(config, db, ee, genesisHash), nil, nil
 	}
 	if config.TerminalTotalDifficulty == nil {
 		log.Error("Geth only supports PoS networks. Please transition legacy networks using Geth v1.13.x.")
-		return nil, errors.New("'terminalTotalDifficulty' is not set in genesis block")
+		return nil, nil, errors.New("'terminalTotalDifficulty' is not set in genesis block")
 	}
 	// If proof-of-authority is requested, set it up
 	if config.Clique != nil {
-		return clique.New(config.Clique, db), nil
+		return clique.New(config.Clique, db), nil, nil
 	}
-	return beacon.New(ethash.NewFaker()), nil
+	return beacon.New(ethash.NewFaker()), nil, nil
 }
 
 func ApplyDefaultEthConfig(cfg *Config) {
