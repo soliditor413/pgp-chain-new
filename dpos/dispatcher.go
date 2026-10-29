@@ -31,11 +31,34 @@ import (
 // that outlives a round, and it is the irreversible height the reorg guard
 // consumes.
 //
-// Lock order: mu guards the vote maps and is never taken while proposalMu is
-// held; proposalMu is a leaf. processVote is called with mu already held by
-// ProcessVote and with mu held by setProcessingProposal's caller, so anything it
-// calls must not take mu again — that is why it takes the maps directly instead
-// of going through the exported accessors.
+// Lock order, stated as the edges that actually exist rather than as a slogan:
+//
+//	mu -> proposalMu   allowed, and required. ProcessVote holds mu and processVote
+//	                   reaches GetProcessingProposal; createConfirm and
+//	                   createUnConfirm do the same. proposalMu is a leaf.
+//	proposalMu -> mu   forbidden. Nothing may acquire mu while holding
+//	                   proposalMu -- which is why CleanProposals takes its two
+//	                   locks in two separate critical sections instead of one.
+//
+// The forbidden edge is not a style rule, it is a deadlock: code that took
+// proposalMu and then mu would run head-on into ProcessVote, which takes mu and
+// then proposalMu.
+//
+// Two consequences that are easy to undo by "tidying up":
+//
+//   - CleanProposals' two locks must stay separate (see its own comment).
+//   - Everything reached while mu is held must not take mu again, because
+//     sync.RWMutex is not reentrant. That covers processVote and, through it, the
+//     onConfirm/unConfirm callbacks. It is also why processVote takes the maps
+//     directly instead of going through the exported accessors.
+//
+// mu is also taken by two entry points that must therefore never be called with
+// mu already held: ProcessVote (obviously) and ProcessProposal, which takes it for
+// its single map write to precociousProposals. ProcessProposal's callers are Seal
+// (no locks held, consensus/pbft/seal.go) and, from M3, the p2p proposal
+// handler -- both must stay lock-free at the call site. This is a precondition on
+// the caller that the callee cannot check, and violating it is a self-deadlock
+// rather than a data race, so -race will not find it.
 //
 // finishedMu guards the three finality fields (finishedHeight,
 // finishedBlockSealHash, finishedProposal) and is the outermost lock in the file:
@@ -61,10 +84,9 @@ type Dispatcher struct {
 	onConfirm func(confirm *payload.Confirm) error
 	unConfirm func(confirm *payload.Confirm) error
 
-	proposalProcessFinished bool
-	finishedHeight          uint64
-	finishedBlockSealHash   elacom.Uint256
-	finishedProposal        elacom.Uint256
+	finishedHeight        uint64
+	finishedBlockSealHash elacom.Uint256
+	finishedProposal      elacom.Uint256
 
 	mu         sync.RWMutex
 	proposalMu sync.RWMutex
@@ -79,10 +101,19 @@ func (d *Dispatcher) ProcessProposal(id peer.PID, proposal *payload.DPOSProposal
 	defer Info("[ProcessProposal] end", proposal.Hash().String())
 	self := bytes.Equal(id[:], proposal.Sponsor)
 	Info("is self", self)
-	if d.GetConsensusView().GetViewOffset() != proposal.ViewOffset {
+	// One read of the view offset, not two: the two reads below used to be
+	// separate, so the comparison and the decision could be made against
+	// different values while a view change was in flight.
+	if currentOffset := d.GetConsensusView().GetViewOffset(); currentOffset != proposal.ViewOffset {
 		Info("have different view offset")
-		if proposal.ViewOffset > d.GetConsensusView().GetViewOffset() {
+		if proposal.ViewOffset > currentOffset {
+			// This map is rebuilt by CleanProposals, so the write needs mu like
+			// every other writer of the vote state. It matters from M3 onwards,
+			// when proposals arrive on the p2p handler goroutine instead of
+			// only on the miner's.
+			d.mu.Lock()
 			d.precociousProposals[proposal.Hash()] = proposal
+			d.mu.Unlock()
 		}
 		return errors.New("have different view offset"), false, false
 	}
@@ -108,10 +139,6 @@ func (d *Dispatcher) ProcessProposal(id peer.PID, proposal *payload.DPOSProposal
 	return nil, false, true
 }
 
-func (d *Dispatcher) GetProposalProcessFinished() bool {
-	return d.proposalProcessFinished
-}
-
 // GetFinishedHeight returns the highest height a confirm has finalised.
 //
 // It is read from the miner goroutine on every Prepare and Seal, while
@@ -121,10 +148,6 @@ func (d *Dispatcher) GetFinishedHeight() uint64 {
 	d.finishedMu.RLock()
 	defer d.finishedMu.RUnlock()
 	return d.finishedHeight
-}
-
-func (d *Dispatcher) SetProposalProcessFinished() {
-	d.proposalProcessFinished = true
 }
 
 func (d *Dispatcher) GetFinishedBlockSealHash() elacom.Uint256 {
@@ -355,13 +378,36 @@ func (d *Dispatcher) RecordViewRequest(sponsor []byte) {
 	d.resetViewRequests[elacom.BytesToHexString(sponsor)] = struct{}{}
 }
 
+// CleanProposals discards the per-round proposal and vote state.
+//
+// mu guards this rebuild, and the position of the lock is the whole point: it is
+// taken AFTER setProcessingProsalNil has returned, i.e. after proposalMu has been
+// released. mu -> proposalMu is the one allowed edge in this file (see the lock
+// order note on Dispatcher); acquiring mu while holding proposalMu would take
+// them in the opposite order to ProcessVote, which holds mu and reaches
+// GetProcessingProposal, and the two would deadlock. Do not merge these two
+// critical sections.
+//
+// Before mu was taken here, this was the only writer of the four vote maps that
+// did not hold it: AddPendingVote, ProcessVote and setProcessingProposal all do.
+// A vote arriving while a round finished therefore raced with the rebuild, and in
+// Go that is not a race report -- it is
+// `fatal error: concurrent map read and map write`, which kills the process.
+//
+// Do not call this from the onConfirm/unConfirm callbacks: ProcessVote invokes
+// them while holding mu, and sync.RWMutex is not reentrant. That holds today
+// (engine.onConfirm only appends to the block pool and does a non-blocking
+// channel send), and it has to keep holding.
 func (d *Dispatcher) CleanProposals(changeView bool) {
 	Info("Clean proposals")
 	d.setProcessingProsalNil()
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
 	d.acceptVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
 	d.rejectedVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
 	d.pendingVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
-	d.proposalProcessFinished = false
 	if !changeView {
 		d.precociousProposals = make(map[elacom.Uint256]*payload.DPOSProposal)
 	} else {
@@ -379,21 +425,6 @@ func (d *Dispatcher) setProcessingProsalNil() {
 	d.proposalMu.Lock()
 	d.processingProposal = nil
 	d.proposalMu.Unlock()
-}
-
-func (d *Dispatcher) ResetAcceptVotes() {
-	d.acceptVotes = make(map[elacom.Uint256]*payload.DPOSProposalVote)
-}
-
-func (d *Dispatcher) UpdatePrecociousProposals() *payload.DPOSProposal {
-	for k, v := range d.precociousProposals {
-		if d.consensusView.IsRunning() &&
-			v.ViewOffset == d.consensusView.GetViewOffset() {
-			delete(d.precociousProposals, k)
-			return v
-		}
-	}
-	return nil
 }
 
 func (d *Dispatcher) alreadyExistVote(v *payload.DPOSProposalVote) bool {

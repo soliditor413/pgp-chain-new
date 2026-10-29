@@ -105,16 +105,20 @@ func TestFinishedHeightRace(t *testing.T) {
 // (M6) accept a block it has already finalised.
 //
 // There is exactly ONE writer on purpose. FinishedProposal is not reentrant: the
-// work it does after releasing finishedMu (CleanProposals writing the vote maps,
-// and the view transitions) is unsynchronised, so two simultaneous calls race
-// there. That is a pre-existing property of this dispatcher, not something the
-// finishedMu fix introduced, and it is wider than the finality watermark -- it
-// covers the whole ConsensusView. Serialising the function would mean holding a
-// lock across SetReady/CleanProposals/ChangeView, i.e. across the listener
-// callback, which is the nesting the M2 review explicitly ruled out. It is
-// reported as an open item instead of being asserted here; see the M2 QA
-// follow-up notes. What this test does cover is the production-critical pair: one
-// writer, many readers.
+// work it does after releasing finishedMu includes the view transitions
+// (SetReady/UpdateDutyIndex/ChangeView), and ConsensusView has no locks at all, so
+// two simultaneous calls race there. That is a separate defect from the vote maps
+// and is recorded on its own (R20 in docs/design/pbft-port-design.md); grading it
+// here would mean this test goes red on the view, which says nothing about the
+// finality watermark it is named for. Serialising FinishedProposal instead would
+// mean holding a lock across the listener callback, which the M2 review explicitly
+// ruled out.
+//
+// The vote-map half of that tail is fixed and graded elsewhere: CleanProposals now
+// rebuilds the four maps under mu, and TestCleanProposalsDoesNotRaceVotes drives it
+// against ProcessVote directly. Note which half is which -- this test's one-writer
+// shape is about ConsensusView now, not about the maps, and the crossover case is
+// what a future reader should extend if the view gets its lock.
 func TestFinishedProposalRejectsForkBlocks(t *testing.T) {
 	const rounds = 100
 
