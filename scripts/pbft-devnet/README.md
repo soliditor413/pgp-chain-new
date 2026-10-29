@@ -620,8 +620,12 @@ B 需要正确实现一个接口，写错了什么都不说。这与本项目反
 - 多节点（4 生产者 + 相互投票）：`pbft.Transport` 无实现，本树做不到。
   规划互通/多节点测试时**别用"等 ticker 排空就自愈"带过 R18 的第二档**：
   `(now_v, now_v+30]` 这一档不会永久丢块，但 `ChangeView` 用的 5s ticker 大于 3s 的
-  `blockPeriod`，排空有可能**跨过一个出槽位**；落后对端若在重锚之后正落在自己 on-duty 的
-  视图上，就会产出同高度的竞争块。这一档要**单独造场景**验，不是在长跑里顺带看一眼。
+  `blockPeriod`，排空有可能**跨过一个出槽位**。落后对端重锚之后产出的竞争块，
+  **不是"碰巧也算出自己"**：`ChangeView` 里是先 `ResetView(...)`、再用
+  `GetNextOnDutyProducer(v.viewOffset)` 算 `isDposOnDuty`（`dpos/consensusview.go` 的
+  `ChangeView`），所以**它的 duty 判定是拿重锚后的视图算出来的**，两边从重锚那一刻起就可能
+  各自合法地判出"该我出块" —— 这是系统性不同步，不是小概率巧合。这个区别决定测试怎么写：
+  前者可以靠长跑碰运气，后者必须**单独造场景**验。
 - **日志格式回归（移植引入，已立项 `#20`，排在 `#13` / R20 之后）。**
   `dpos/log.go` 的四个 helper 是 `glog.Warn(fmt.Sprint(a...))`，而 `fmt.Sprint` 只在
   "两个操作数都不是字符串"时才插空格；上游原版走 `fmt.Sprintln`，是
