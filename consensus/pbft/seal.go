@@ -190,6 +190,26 @@ func (e *Engine) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 	// eats that confirm -- exactly the bug this ordering exists to fix. Seal holds
 	// one drain (this one) plus the one in finishRound, and no others.
 	e.drainRoundChannels()
+
+	// isSealOver is cleared in two places -- here and prepare.go:57 -- and this
+	// one is redundant defence, not a load-bearing line: the miner prepares each
+	// task (worker.go:1132) before it seals it (:626), so the flag has already
+	// been cleared before control gets here. Measured rather than assumed:
+	// deleting this line leaves the whole pbft suite green, including the
+	// multi-height single-producer case.
+	//
+	// Do not delete both, though. With Prepare's reset gone as well, a stale
+	// isSealOver==1 survives into the next round, onConfirm refuses that round's
+	// own confirm (:416), and the round times out at a height it should have
+	// sealed. QA measured that variant failing at height 2; it is not reproduced
+	// here because reproducing it means mutating prepare.go, which this change
+	// deliberately does not touch.
+	//
+	// Why keep a redundant store at all: the round's own bookkeeping belongs to
+	// the function that owns the round. Leaving one caller's worth of ordering
+	// (three files away, in the miner) as the only thing keeping this flag
+	// consistent is the kind of hidden precondition this file already avoids
+	// elsewhere. Two atomic stores per round is the cheaper side of that trade.
 	atomic.StoreInt32(&e.isSealOver, 0)
 
 	// Our own acceptance vote goes through the same dispatcher path a peer's vote
