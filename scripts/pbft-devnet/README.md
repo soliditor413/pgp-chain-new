@@ -515,6 +515,15 @@ PBFT 那个字段是本移植新建的、没有存量配置文件，所以能直
 `InfluxDBPassword` 这个键都不会出现（已实测：两个 flag 传空串时，`dumpconfig` 里
 这两个键的 grep 计数为 0）。凭据脱敏也因此和 `KeyStorePassword` 集中在同一处思路下。
 
+**"改副本"不是 B' 引入的新语义，这个函数本来就是这么写的**：`:395` 的
+`_, cfg := makeConfigNode(ctx)` 拿到的是值，紧接着 `:398-401` 就已经在
+`cfg.Eth.Genesis = nil` 上改副本，并在输出里加了一行
+`# Note: this config doesn't contain the genesis block.`。
+所以 B' 与它同形、不改变调用方语义；而且**那行注释值得照抄一份**
+（比如 `# Note: InfluxDB credentials are not included.`）——
+不然把 `dumpconfig` 当"配置备份"用的运维会以为导出的文件是完整的。
+清空但不说，和泄漏一样会让人做出错误判断。
+
 #### 为什么不是 B：B 会**静默失效**，B' 不会
 
 这是三条路径里唯一真正区分它们的依据 —— **不是"能不能做对"，而是"做错了会不会有人知道"**。
