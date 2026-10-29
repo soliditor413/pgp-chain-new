@@ -16,7 +16,7 @@
 |---|---|
 | `keygen/main.go` | 独立 Go 程序（`go run` 执行，不进 geth 二进制）。生成 N 个 Elastos 格式 arbiter 钱包、打印 33 字节压缩公钥、并把每个钱包用生产代码路径 `dpos.GetDposAccount` 读回来校验 |
 | `genesis.json` | genesis 模板。`config.legacy.producers` 里是一个占位字符串，`run.sh init` 用 JSON 解析器替换掉（不做文本拼接），再交给 `geth init` |
-| `run.sh` | 一键启动：`init` / `start` / `start-follower` / `status` / `stop` / `verify-keys` / `clean` |
+| `run.sh` | 一键启动：`init` / `start` / `start-follower` / `status` / `stop` / `verify-keys` / `verify-secrets` / `clean` |
 | 本文件 | runbook |
 
 **所有运行期产物（私钥、genesis、datadir、日志、临时配置）都在 `$PGP_DEVNET_HOME`
@@ -220,6 +220,90 @@ WARN  PBFT: height already has a confirm, refusing to propose height=1
    任何知道它的人都能花掉这些币——**只用于 devnet**。
 6. genesis 里 `legacy.gasFeeRecipient` 指向上面的测试地址、`gasFeeRecipientRatio=65`
    （对齐主网费率形状）。空块不产生手续费，所以现在没有任何资金流动。
+7. **`[Metrics]` 段的 InfluxDB 凭据会被 `geth dumpconfig` 原样打印出来 —— 这是已知缺陷，本轮并未修复。**
+   细节与规避见下面一节。不要因为 `verify-secrets` 通过就以为 `dumpconfig` 里没有秘密了
+   —— 那道闸门**只管 PBFT keystore 密码**，不管 Metrics。
+
+### 已知同类隐患：`[Metrics]` 的 InfluxDB 密码/令牌会落进 `dumpconfig`（**当前未修**）
+
+这是和 `KeyStorePassword` 同一族的缺陷，但没有修，原因见下。
+
+**现状（实测，当前二进制）**：`metrics/config.go` 里有两个承载凭据的字段带着
+`toml:",omitempty"`：
+
+```go
+InfluxDBPassword string `toml:",omitempty"`   // :31
+InfluxDBToken    string `toml:",omitempty"`   // :36
+```
+
+`omitempty` 只在**空值**时省略，而两者默认值都是非空占位符 `"test"`
+（`metrics/config.go:51` / `:57`），所以它们**总是**出现在输出里；一旦用户填了真凭据，
+真凭据就被原样打出来：
+
+```console
+$ geth --metrics.influxdb --metrics.influxdb.password='influx-admin-hunter2' dumpconfig | grep -A1 InfluxDBUsername
+InfluxDBUsername = "test"
+InfluxDBPassword = "influx-admin-hunter2"      # ← 明文
+
+$ geth --metrics.influxdb.token='SENTINEL-token-9f3a' dumpconfig | grep InfluxDBToken
+InfluxDBToken = "SENTINEL-token-9f3a"          # ← 明文，v2 里这个等于完整认证凭据
+```
+
+更严重的是**从配置文件读进来、再从 dumpconfig 漏出去**这条往返通路，它是现成的：
+
+```console
+$ cat /tmp/influx-compat.toml
+[Eth]
+NetworkId = 8606211
+
+[Metrics]
+EnableInfluxDB = true
+InfluxDBUsername = "alice"
+InfluxDBPassword = "SENTINEL-config-file-pass-7c2d"
+InfluxDBToken    = "SENTINEL-config-file-token-7c2d"
+
+$ geth --config /tmp/influx-compat.toml dumpconfig; echo "EXIT=$?"
+EXIT=0
+...
+InfluxDBUsername = "alice"                                  # ← 证明配置真的被读进去了
+InfluxDBPassword = "SENTINEL-config-file-pass-7c2d"         # ← 又原样打出来
+InfluxDBToken    = "SENTINEL-config-file-token-7c2d"        # ← 同上
+```
+
+也就是说：**配置里的凭据没有变安全，只是被搬到了 `dumpconfig` 的输出里。**
+运维动作里 `geth dumpconfig > somewhere` 这种"备份配置"习惯，等于在备份明文凭据。
+
+> 顺带记一个坑：`[Metrics]` 是 `gethConfig` 的**顶层**段，不是 `[Eth.Metrics]`。
+> 写成 `[Eth.Metrics]` 会报
+> `Fatal: /path/x.toml, line N: field 'Metrics' is not defined in ethconfig.Config`
+> （`eth/ethconfig.Config` 里根本没有 `Metrics` 字段，它挂在 `cmd/geth` 的 `gethConfig` 上）。
+
+受影响面比 PBFT 那个大：任何开了 `--metrics.influxdb*` 的用户。
+**但本仓库里 PBFT 的 `KeyStorePassword` 已经修了，Metrics 这两个没有。**
+
+**为什么不顺手加 `toml:"-"`**：`toml:"-"` 是**双向**的——连 `--config` 读取也一起关掉。
+而上面的实测已经证明 `InfluxDBPassword` / `InfluxDBToken` 的 `--config` 用法**今天是可以用的**，
+加了 tag 之后所有现存配置文件里写了这两个键的用户**升级即启动失败**。报错形态与下面这段同类
+（**这一条是按同一机制推演的，未在 Metrics 字段上实测**，因为本轮没有改那个字段；
+PBFT 那条是实测原文）：
+
+```
+Fatal: field corresponding to 'InfluxDBPassword' in metrics.Config cannot be set through TOML
+```
+
+PBFT 那个字段是本移植新建的、没有存量配置文件，所以能直接关。Metrics 这两个不行：
+正确的做法是一次迁移（保留 TOML 读取并打 deprecated 警告，同时让 `dumpconfig` 不输出），
+gencodec 的单个 tag 表达不了这件事，得手写 `MarshalTOML` 或改成输出侧过滤。那是独立工作量。
+
+**本轮规避（用户侧可执行）**：
+
+- **不要把 InfluxDB 凭据写进 `--config` 配置文件。** 用 flag 或环境变量传：
+  `--metrics.influxdb.password` / `--metrics.influxdb.token`，
+  或 `GETH_METRICS_INFLUXDB_PASSWORD` / `GETH_METRICS_INFLUXDB_TOKEN`。
+  这不能阻止 `dumpconfig` 打印（它打印的是**合并后**的配置），但至少凭据不落在磁盘文件里。
+- **`geth dumpconfig` 的输出本身就是要保护的文件。** 配了真实 InfluxDB 凭据的节点，
+  它的 `dumpconfig` 输出等同于一份凭据副本，别贴进 issue、别上传到共享目录。
+- 没开 `--metrics.influxdb*` 的节点泄漏的只是占位符 `"test"`，没有真实风险。
 
 ## 未验证 / 已知缺口
 

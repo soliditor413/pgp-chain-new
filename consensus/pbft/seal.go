@@ -45,10 +45,34 @@ import (
 //	            the block verifiable by every other node
 //
 // Seal blocks until either that confirm arrives, the votes are rejected, the view
-// deadline passes, or the miner gives up. miner/worker.go calls it synchronously
-// from its task loop, so the timeout is also what bounds node shutdown: nothing
-// here may wait longer than one signTolerance window. See
-// docs/design/pbft-port-design.md R12.
+// deadline passes, or the miner gives up. How long that can take, honestly:
+//
+//	pre-delay  the wait for header.Time, up to allowedFutureBlockTime + period
+//	           (15s + 3s = 18s): header.Time is parent.Time + period (prepare.go)
+//	           and a parent is accepted up to 15s ahead of our own clock.
+//	deadline   measured *after* the pre-delay, so it is at most
+//	           signTolerance - period = 3s (6s on the re-anchor path, where
+//	           Prepare rewrites header.Time to now and restarts the view).
+//	total      the worst case is therefore ~21s, not one window.
+//
+// The total is not just a latency figure: miner/worker.go calls Seal synchronously
+// from its task loop and worker.close waits for that loop, so it is also the
+// node's shutdown latency. A shutdown cannot interrupt an in-flight Seal today --
+// the stop channel belongs to the task loop, which is busy inside this call. That
+// is known debt, recorded as R12 in docs/design/pbft-port-design.md, and it is
+// NOT fixed by shortening either wait below.
+//
+// Neither wait is clamped, deliberately, and the block is never released before
+// header.Time. pgp-chain's verifier is zero tolerance on this
+// (consensus/pbft/pbft.go:395 and :421 in 1.9.7 -- any header whose time is in the
+// future is ErrFutureBlock, with no allowedFutureBlockTime-style window), so a
+// block broadcast early is rejected outright by every node that has not upgraded.
+// Clamping the pre-delay to a smaller budget B would trade that interop guarantee
+// for shutdown latency: it would leave this chain tolerating only B - period of
+// clock skew (3s at B=6s), so a verifier whose clock is 4s slow would reject our
+// blocks. The way to shrink the 21s is to refuse to start a round on a
+// future-dated parent in Prepare, i.e. to gate it at the source; that is M3+ work
+// (R12), not a change to the waits in this function.
 func (e *Engine) Seal(chain consensus.ChainHeaderReader, block *types.Block, results chan<- *types.Block, stop <-chan struct{}) error {
 	if e.isEpochTransitionPending() {
 		return ErrEpochTransitionPending
@@ -143,9 +167,17 @@ func (e *Engine) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 	//     instead of being delivered into this round's select;
 	//   - after isSealing=1, so a confirm that does belong to this round cannot be
 	//     dropped for arriving while isSealing was still 0.
-	// The only window left is the handful of instructions between ProcessProposal
-	// and these two atomic stores, and no peer can vote in it: the proposal is
-	// broadcast further down, after the self-vote.
+	//
+	// The invariant to preserve when editing this function, stated once:
+	//
+	//	this drain must stay ABOVE every statement that can produce a confirm
+	//	for this round (AcceptProposal and its ProcessVote), and
+	//	BroadcastProposal must stay BELOW it.
+	//
+	// Moving the broadcast above the drain is what would break it: a peer can then
+	// confirm inside the window between isSealing=1 and the drain, and the drain
+	// eats that confirm -- exactly the bug this ordering exists to fix. Seal holds
+	// one drain (this one) plus the one in finishRound, and no others.
 	e.drainRoundChannels()
 	atomic.StoreInt32(&e.isSealOver, 0)
 
@@ -178,22 +210,20 @@ func (e *Engine) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 		}
 	}
 
-	// Everything after the timestamp is bounded by the view deadline, so a
-	// partition cannot hold the miner longer than one window.
+	// The view deadline, measured from here rather than from Seal's entry: the
+	// pre-delay above already consumed whatever was left of the window, which is
+	// why this value is at most signTolerance - period (3s) -- or 6s on the
+	// re-anchor path, where Prepare restarted the view at now. A partition cannot
+	// hold the miner past it.
+	//
+	// Do not add an upper clamp here. It would be dead code: with
+	// viewChangeTime = parent.Time + signTolerance and now' >= header.Time =
+	// parent.Time + period, deadline <= signTolerance - period < signTolerance
+	// always, and ChangeView only ever moves viewChangeTime closer. See the
+	// function comment for where the real 21s bound comes from.
 	deadline := e.dispatcher.GetConsensusView().GetChangeViewTime().Sub(e.dispatcher.GetNowTime())
 	if deadline < 0 {
 		deadline = 0
-	}
-	// ...and never longer than one tolerance window either. Prepare anchors the
-	// deadline at parent.Time + signTolerance, so a parent that is already behind
-	// us (a stalled chain, a slow import) would otherwise hand Seal a deadline
-	// arbitrarily far in the future -- plus a header time up to
-	// allowedFutureBlockTime ahead of us. Seal is miner's blocking call and
-	// worker.close waits for the task loop that makes it, so this number is also
-	// the node's shutdown latency. R12 in docs/design/pbft-port-design.md states
-	// the bound as one signTolerance window; this clamp is what makes it true.
-	if deadline > signTolerance {
-		deadline = signTolerance
 	}
 
 	// One round, one resolution. The drain above already cleared both round
@@ -202,12 +232,12 @@ func (e *Engine) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 	// one-or-two-producer set), so it must be read, not drained.
 	select {
 	case confirm := <-e.confirmCh:
-		// Second line of defence. The channels are drained at every round
-		// boundary, so a confirm still carrying another block's seal hash means it
-		// was completed for a proposal that got as far as a signature set while
-		// this round was already running -- a late vote from the previous view, or
-		// two views proposing at once. Attaching it would put a signature set for
-		// a different block into this header, which every verifier then rejects, so
+		// Second line of defence. Both channels are drained at the round
+		// boundaries (once here at the start of the round, once in finishRound), so
+		// a confirm still carrying another block's seal hash was completed after
+		// this round's drain: a late vote from the previous view, or two views
+		// proposing at once. Attaching it would put a signature set for a
+		// different block into this header, which every verifier then rejects, so
 		// the comparison removes the possibility entirely.
 		if want := common.Hash(confirm.Proposal.BlockHash); want != pgp.SealHash(header) {
 			log.Warn("PBFT: confirm belongs to a different block, ignoring",

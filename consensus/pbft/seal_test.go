@@ -610,10 +610,12 @@ func TestLateConfirmAfterFinishRoundDoesNotPanic(t *testing.T) {
 // It exists because Seal must not depend on anybody closing a channel to get out:
 // the round channels are never closed (see drainRoundChannels), and Seal is their
 // only reader anyway, so closure could never have released it. What releases it is
-// the miner's `stop` channel, with the view deadline as the backstop that bounds a
-// hung view to one signTolerance window. If either of those regressed, node
-// shutdown would hang in miner.worker.close's Wait -- so it is worth a test rather
-// than a comment.
+// the miner's `stop` channel, with the view deadline as the backstop. Here the
+// backstop really is one window, because this round has no pre-delay to wait out
+// (the header time is already in the past); a round that does have one can block
+// for ~21s, which is the shutdown debt recorded as R12 and is not what this test
+// measures. If either arm regressed, shutdown would hang in miner.worker.close's
+// Wait -- so it is worth a test rather than a comment.
 func TestSealExitsWhenTheMinerStops(t *testing.T) {
 	const producerCount = 12
 

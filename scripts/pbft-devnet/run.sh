@@ -467,6 +467,13 @@ cmd_verify_secrets() {
         die "$failures dumpconfig check(s) failed: the keystore password can reach disk"
     fi
     log "PASS: neither channel puts the keystore password into geth's serialized config"
+    # Scope note, printed on success too: a green run here does NOT mean dumpconfig
+    # is secret-free. The [Metrics] InfluxDB password/token are still emitted in
+    # clear (upstream defect, deliberately not fixed in this round because
+    # toml:"-" would break existing --config files on upgrade). See README,
+    # "已知同类隐患：InfluxDB 密码/令牌".
+    log "NOTE: this gate covers the PBFT keystore password only; the [Metrics]"
+    log "      InfluxDB password/token are still emitted in clear (known, unfixed)."
 }
 
 # check_dumpconfig_output applies the three assertions to one dumpconfig run.
