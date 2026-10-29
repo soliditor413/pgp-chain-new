@@ -538,6 +538,32 @@ func (v *ConsensusView) SetChangViewTime(parentTime uint64) {
 // slice. Every step holds a lock; the combination never existed. Locks stop
 // tearing, not composition.
 //
+// Naming the last gap is not the same as saying the others are equally bad. In
+// the first gap the value #2 writes is overwritten at #3 and #4 whenever
+// finishedHeight is positive, and is the approximation documented on the two
+// assignments in the body when it is 0; in the second gap #3 recomputes from
+// whatever working height and roster are in force. Only the last gap's result
+// reaches the return.
+//
+// It is also invisible, which is why it needs a paragraph rather than a fix.
+// UpdateDutyIndex and GetNextOnDutyProducer each reduce their index modulo the
+// roster length in front of them and each return early when that length is 0
+// (producers.go:197 and :265), so an index computed against the old length and
+// then reduced against the new one is always in range -- nothing for a bounds
+// check to catch, and an index that neither roster's own arithmetic produces.
+// All four acquisitions take p.mtx, so -race has nothing to report either.
+//
+// None of this is reachable in this tree today, and that changes what the
+// paragraph is for. ChangeCurrentProducers has no caller here, production or
+// test: only this forwarder and Producers' own definition exist. Upstream calls
+// it from pgp-chain consensus/pbft/network.go:505, inside changeNextTurnProduces,
+// which has no counterpart here. UpdateNextProducers is called from
+// pgp-chain consensus/pbft/pbft.go:304 and :312, and the event that drives it is
+// still a TODO in this tree -- spv/blocklistener.go:379 and :496 both say
+// pgp-chain notified dpos.ETNextProducers there. The gap is structural, not
+// live; it becomes live when those wires are joined, and the reason to describe
+// it here is that whoever joins them will be reading this function.
+//
 // Before R20 the same gaps were data races; now they are legal interleavings
 // with names. That is better, it is not atomic, and calling it atomic would hide
 // the remaining gap from the next reader. Closing it needs one Producers entry
@@ -557,8 +583,11 @@ func (v *ConsensusView) RecoverFromStatus(status uint32, viewOffset uint32, view
 	// isDposOnDuty is assigned twice, and the second one is not redundant.
 	// GetNextOnDutyProducer reads the dutyIndex field rather than deriving an
 	// index, so this first assignment uses whatever dutyIndex the node carried
-	// into the recovery; the second one, below, runs after UpdateDutyIndex has
-	// recomputed it from the chain's finished height. The two answers can differ,
+	// into the recovery. The second assignment is inside updateDutyIndexLocked --
+	// the only call the finishedHeight branch makes -- and it writes
+	// isDposOnDuty only after UpdateDutyIndex has recomputed the index from the
+	// chain's finished height, so it is the one that sees a recovered index. The
+	// two answers can differ,
 	// and the second is the final one. Removing the finishedHeight branch as
 	// "duplicate work" would silently leave isDposOnDuty derived from a stale
 	// dutyIndex -- and IsOnduty is a block-production gate (Seal asks it), so the
@@ -568,7 +597,9 @@ func (v *ConsensusView) RecoverFromStatus(status uint32, viewOffset uint32, view
 	// not a reason to change the condition: the duty index is not restored, and
 	// every non-test consumer of it in this tree is a log line -- the End-Recover
 	// summary and ChangeView's view summary. Block production goes through
-	// isDposOnDuty, which was written above unconditionally.
+	// isDposOnDuty, which the producerIsOnDutyLocked assignment right after this
+	// comment writes unconditionally; the finishedHeight condition only decides
+	// whether the value is then recomputed.
 	v.isDposOnDuty = v.producerIsOnDutyLocked(v.publicKey)
 	if finishedHeight > 0 {
 		v.updateDutyIndexLocked(finishedHeight)

@@ -117,9 +117,10 @@ func (d *Dispatcher) ProcessProposal(id peer.PID, proposal *payload.DPOSProposal
 	defer Info("[ProcessProposal] end", proposal.Hash().String())
 	self := bytes.Equal(id[:], proposal.Sponsor)
 	Info("is self", self)
-	// One read of the view offset, not two: the two reads below used to be
-	// separate, so the comparison and the decision could be made against
-	// different values while a view change was in flight.
+	// One read of the view offset, not two. This used to be two separate reads,
+	// so the comparison and the branch taken on it could be made against
+	// different values while a view change was in flight; the branch now reuses
+	// currentOffset instead of asking the view again.
 	if currentOffset := d.GetConsensusView().GetViewOffset(); currentOffset != proposal.ViewOffset {
 		Info("have different view offset")
 		if proposal.ViewOffset > currentOffset {
@@ -734,8 +735,12 @@ func (d *Dispatcher) RecoverFromConsensusStatus(status *dmsg.ConsensusStatus) er
 	// once -- twice, or four times when finishedHeight is positive -- and
 	// ChangeCurrentProducers takes p.mtx without taking the view lock, so it can
 	// land in the gaps between those acquisitions. The comment there counts them,
-	// names the gaps, and spells out what the last one exposes.
-	// No annotation here should say "atomic", because the code is not.
+	// names the gaps, spells out what the last one exposes, and says why none of
+	// it is reachable until the SPV producer path is wired.
+	// No annotation here should say "atomic", because the code is not -- but the
+	// five view fields are: anyone who takes the view lock sees all of them or
+	// none of them, and what is not atomic is the value one of them was derived
+	// from.
 	d.consensusView.RecoverFromStatus(status.ConsensusStatus, status.ViewOffset,
 		status.ViewStartTime, status.WorkingHeight, d.GetFinishedHeight())
 	Info("-------[End RecoverFromConsensusStatus]--------", "startTime", d.consensusView.GetViewStartTime(), "WorkingHeight", status.WorkingHeight, "dutyIndex", d.GetConsensusView().GetDutyIndex(), "d.finishedHeight", d.GetFinishedHeight(), "status.ViewOffset", status.ViewOffset)
