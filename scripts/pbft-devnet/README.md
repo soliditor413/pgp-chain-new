@@ -451,15 +451,48 @@ PBFT 那个字段是本移植新建的、没有存量配置文件，所以能直
 `InfluxDBPassword` 这个键都不会出现（已实测：两个 flag 传空串时，`dumpconfig` 里
 这两个键的 grep 计数为 0）。凭据脱敏也因此和 `KeyStorePassword` 集中在同一处思路下。
 
+#### 为什么不是 B：B 会**静默失效**，B' 不会
+
+这是三条路径里唯一真正区分它们的依据 —— **不是"能不能做对"，而是"做错了会不会有人知道"**。
+
+`naoina/toml` 的 `encode.go:305` `marshaler()` 用 `rv.Interface()` 取方法集，**不做 `Addr()`**；
+而 `value()`（`encode.go:238`）在 `Kind` 分支之前就先调它。叠加两件事：
+
+- `gethConfig.Metrics` 是**值字段**（`cmd/geth/config.go:125`：`Metrics  metrics.Config`）；
+- 值字段的 `rv.Interface()` 拿到的是 `metrics.Config` **值**，方法集里不含 `*Config` 的方法。
+
+于是 B 有**两个**静默失效点，我用最小程序在这棵树的 `naoina/toml` 版本上实测了三种写法：
+
+```
+Val = REWRITTEN = true          ← 值接收者 + MarshalTOML() ([]byte, error)（Marshaler）
+                                  被调用了，但返回的裸片段落在"值的位置"，形状错
+
+[Ptr]                            ← 指针接收者
+User = "u"
+Pass = "SECRET-PTR"              ← 压根没被调用，明文照旧泄漏，且无任何报错
+
+[R]                              ← 值接收者 + MarshalTOML() (interface{}, error)（MarshalerRec）
+User = "u"                       ← 唯一正确的写法：渲染成表，Pass 被丢掉
+```
+
+三行的泄漏检查：`SECRET-PTR: true`（泄漏）、`SECRET-REC: false`（安全）。
+也就是说 B 要同时对**接收者形态**和**实现的接口**（`Marshaler` vs `MarshalerRec`）都对，
+写错任一处都不报错、只是继续泄漏。
+
+**所以选 B' 的理由是失败的可见性**：B' 只是赋值，写错了要么编译不过、要么配套测试立刻红；
+B 需要正确实现一个接口，写错了什么都不说。这与本项目反复强调的"让失败响亮"是同一条原则。
+
 > 一个易错点：`cmd/geth/config.go` 里并没有 `dumpConfigTOML` 这个生产变量 ——
 > 带这个名字的是 `eth/ethconfig/secrets_test.go:56` 里的**测试本地镜像**
 > （`toml.Config` 的值，不是函数），它存在的目的就是让测试用与生产相同的
-> encoder 设置。要改生产行为，改的是 `dumpConfig()`，不是测试里的那个镜像。
+> encoder 设置。要改生产行为，改的是 `dumpConfig()`（`:394`），不是测试里的那个镜像。
 
 **A / B / B' 三条都还没有实施**，本轮按 team-lead 的决定留给独立迁移窗口。
 如果将来做 B'，闸门要跟代码一起落地（否则等于没修）：
 `eth/ethconfig/secrets_test.go` 里对 `InfluxDBPassword` / `InfluxDBToken` 设哨兵值，
 断言 `dumpConfigTOML.Marshal` 的输出里既没有哨兵值、也没有键名 —— **删掉清零逻辑它就会红**。
+这条不是可选项：B 与 B' **都**需要它，区别只在于 B 写错时它多半还是绿的（因为泄漏路径和
+正确路径的输出可能相同），B' 写错时它一定红。
 
 **本轮规避（用户侧可执行）**：
 
@@ -473,6 +506,22 @@ PBFT 那个字段是本移植新建的、没有存量配置文件，所以能直
 
 ## 未验证 / 已知缺口
 
+- **`verify-secrets` 仍然保留"静默跳过"分支 —— 这是结构性缺口，待修。**
+  探测到"这个二进制不读环境变量"时，它会打印
+  `SKIP GETH_PBFT_KEYSTORE_PASSWORD: this binary does not read it` 并**只跑 4 条断言**，
+  然后照样 `PASS`。也就是说：**任何未来的探测缺陷都能重新打开同一个洞，而闸门自己不会红。**
+  这不是假设 —— 已经发生过一次（`geth --help | grep -q` 在 `set -o pipefail` 下恒返回 141，
+  探测恒假，后 4 条被跳过，总体仍打 PASS；见 `run.sh` 里 `env_password_supported()` 的注释）。
+
+  修补方向（**未实施**）：
+
+  1. 闸门结束前统计**实际执行**的断言条数，少于期望值就 `exit` 非零，
+     并打印"跑了 N 条、预期 M 条"；
+  2. 确实需要对不支持 env 通道的旧二进制放行时，走**显式开关**
+     （如 `ALLOW_MISSING_ENV_CHANNEL=yes`），不许隐式。
+
+  理由与 `CONFIRM_CLEAN=yes` 同源：把"我确实知情"变成必须写下来的东西。
+  在它修好之前，看到 `SKIP` 不要当成设计好的宽容 —— 当成**闸门漏了一条**。
 - `run.sh status` 的"≥1 个块"分支已经在真实链上跑通了（1..6、46→47、70→71 都采过），
   但**它是先在真实链上崩了三次才修通的**：`rpc()` 用 `"$*"` 拼参数导致
   `["0x1" false]` 不是合法 JSON、`json_get` 在 jq 下把缺失键打印成字面量 `null`
