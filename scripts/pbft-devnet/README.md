@@ -213,7 +213,9 @@ point --datadir at a pgp-chain data directory or wipe this one with 'geth remove
 
 #### 一个值得记住的签名：封块数 : `FinishedProposal received fork` = 1 : 1
 
-两个快照都是严格相等：6389 行那次是 **164 : 164**，7278 行这次是 **187 : 187**。
+三个样本都是严格相等：6389 行那次是 **164 : 164**，7278 行这次是 **187 : 187**，
+`ac87aeebc` 干净 worktree 实跑那次是 **17 : 17**（高度 1..17，序列逐元素相同，和都是 153）。
+三种规模、同一个比值 —— 这就是"判据是比值不是绝对值"的来历。
 
 **而且不只是条数相等**（这一条是 QA 补的，我在当前日志上复算过）：
 
@@ -341,17 +343,18 @@ WARN  PBFT: height already has a confirm, refusing to propose height=1
 可能是任意一版：
 
 ```
-当前格式（9e6880e42 之后，= 上游原版）：
-  WARN […] FinishedProposal received fork block height 1
+当前格式（9e6880e42 之后，= 上游原版），照抄真实日志：
+  WARN [10-29|18:01:43.917] FinishedProposal received fork block height 1
+  WARN [10-29|18:01:46.002] FinishedProposal received fork block height 2
 
-修前格式（9e6880e42 之前）：
+修前格式（9e6880e42 之前），同样是照抄：
   WARN [10-29|13:52:03.379] FinishedProposal received fork blockheight1
   WARN [10-29|13:52:06.001] FinishedProposal received fork blockheight2
 ```
 
-上面那两行**修前**的样例是照抄的，带时间戳；**当前格式那行没带时间戳**，因为它是按
-`dpos/log.go` 的 `sprintArgs`（`strings.TrimSuffix(fmt.Sprintln(a...), "\n")`）推出来的，
-不是从某份日志里抄的 —— 我不拿一个没采过的日志行冒充证据。
+两组都是真实采样，不是按源码推的：修前两行来自旧二进制那份日志，当前格式两行来自
+`ac87aeebc` 上**重新构建并实跑**的一次（干净 worktree，`git worktree add`，没碰共享工作树），
+同一份日志里 `seal=14 / warn=14 / seal timed out=0`。
 
 **所以 grep 要用容错模式**：`grep -E 'fork block ?height ?[0-9]+'`。
 写成 `fork blockheight` 会漏掉修复后的日志，写成 `fork block height` 会漏掉修复前的。
