@@ -99,18 +99,27 @@ func (t *tracker) assert(tb testing.TB, wantEntered int32) {
 	}
 }
 
-// drive runs f in workers goroutines for rounds rounds, with the barrier making
-// all of them enter f at the same time in every round.
-func drive(workers, rounds int, f func(id int)) {
-	b := newBarrier(workers)
+// drive runs f in workers goroutines for rounds rounds. Two barriers, each used
+// once per round per goroutine: the first marks the start of a round, the second
+// sits between enter and leave, so no goroutine can leave before every other one
+// has entered. That is what makes "at least two callers overlapped" true by
+// construction rather than by luck -- with a single barrier before enter, the
+// overlap still happens in practice but nothing forces it, and an assertion that
+// can flake is worse than no assertion.
+func drive(workers, rounds int, enter func(id int), leave func(), f func(id int)) {
+	start := newBarrier(workers)
+	allIn := newBarrier(workers)
 	var wg sync.WaitGroup
 	for id := 0; id < workers; id++ {
 		wg.Add(1)
 		go func(id int) {
 			defer wg.Done()
 			for i := 0; i < rounds; i++ {
-				b.wait()
+				start.wait()
+				enter(id)
+				allIn.wait()
 				f(id)
+				leave()
 			}
 		}(id)
 	}
@@ -147,33 +156,23 @@ func TestConsensusViewFieldsAreSafeForConcurrentViewWork(t *testing.T) {
 	v.SetRunning()
 
 	tr := newTracker(workers)
-	drive(workers, rounds, func(id int) {
+	drive(workers, rounds, tr.enter, tr.leave, func(id int) {
 		switch id {
 		case 0: // view loop: the writer that moves the view forward
-			tr.enter(id)
 			v.ChangeView(base.Add(time.Duration(rounds)*4*time.Second), false, uint64(base.Unix()))
-			tr.leave()
 		case 1: // chain head: FinishedProposal's tail
-			tr.enter(id)
 			v.UpdateDutyIndex(uint64(rounds))
-			tr.leave()
 		case 2: // Seal: the deadline and the signer domain
-			tr.enter(id)
 			_ = v.GetChangeViewTime()
 			_ = v.GetViewStartTime()
 			_ = v.GetViewOffset()
-			tr.leave()
 		case 3: // reader pair: status and duty flags
-			tr.enter(id)
 			_ = v.IsRunning()
 			_ = v.IsReady()
 			_ = v.IsOnduty()
-			tr.leave()
 		case 4: // consensusStatus has its own writers, separate from the view loop
-			tr.enter(id)
 			v.SetReady()
 			v.SetRunning()
-			tr.leave()
 		}
 	})
 	tr.assert(t, workers)
@@ -205,26 +204,18 @@ func TestConsensusViewProducerReadsAreSafe(t *testing.T) {
 	v := NewConsensusView(3*time.Second, make([]byte, 33), p, nil)
 
 	tr := newTracker(workers)
-	drive(workers, rounds, func(id int) {
+	drive(workers, rounds, tr.enter, tr.leave, func(id int) {
 		switch id {
 		case 0: // engine attach / epoch switch: the only writing path
-			tr.enter(id)
 			v.UpdateProducers(producers, len(producers), uint64(rounds))
-			tr.leave()
 		case 1: // the three bare field reads
-			tr.enter(id)
 			_ = v.GetTotalProducersCount()
 			_ = v.GetTotalArbiterCount()
 			_ = v.GetSpvHeight()
-			tr.leave()
 		case 2: // GetDutyIndex: same blind spot, reached from the recovery path
-			tr.enter(id)
 			_ = v.GetDutyIndex()
-			tr.leave()
 		case 3: // DumpInfo: looks protected by the view lock, iterates the raw slice
-			tr.enter(id)
 			v.DumpInfo()
-			tr.leave()
 		}
 	})
 	tr.assert(t, workers)
