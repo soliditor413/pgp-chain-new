@@ -331,6 +331,26 @@ func (d *Dispatcher) ResetConsensus(height uint64) {
 	d.resetViewMu.Unlock()
 }
 
+// ResetConsensusForEpochTransition resets the view this dispatcher already owns.
+//
+// That sentence is the whole point of the comment: there is a second way for a
+// view to change in this tree, and it is not this one. Engine.attachAccount
+// (consensus/pbft/engine.go) builds a whole new Dispatcher, and a new Dispatcher
+// means a new ConsensusView -- it does not reset the old one, it abandons it. So
+// after an account is attached, a reset delivered to a dispatcher pointer
+// obtained earlier lands on a view nothing else reads, while the chain head
+// keeps writing to the new one. Callers therefore have to go through the
+// engine's current dispatcher, not a cached one. The two operations are not
+// interchangeable in either direction.
+//
+// Compared with ResetConsensus above it drops the IsRunning guard and takes the
+// parent time from its caller instead of the adjusted clock, because at an epoch
+// transition the view has to be anchored to the parent block rather than to
+// whatever this node's own clock says now.
+//
+// No caller in this tree yet: upstream reaches it from the two epoch-transition
+// points in consensus/pbft/network.go, in the pgp-chain checkout rather than
+// here, so this is ported-but-not-wired and not dead.
 func (d *Dispatcher) ResetConsensusForEpochTransition(height uint64, parentTime uint64) {
 	Info("[ResetConsensusForEpochTransition] start", "height", height)
 	defer Info("[ResetConsensusForEpochTransition] end")
