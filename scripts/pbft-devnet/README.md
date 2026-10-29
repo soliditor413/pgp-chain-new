@@ -359,27 +359,44 @@ rc=1
    $ echo "$TMPDIR"
    /var/folders/h2/.../T
    $ ls -d "${TMPDIR:-/tmp}"/pgp-gate.*
-   .../T/pgp-gate.gq02XM      ← 20:48  我 kill -9 掉的（成因确定）
-   .../T/pgp-gate.kkNRwu      ← 20:11  成因未定，见下
+   .../T/pgp-gate.gq02XM      ← 20:48  我 kill -9 掉的
+   .../T/pgp-gate.kkNRwu      ← 20:11  另一次运行被外部 SIGKILL 打断（exit 137，有记录）
    $ ls .../T/pgp-gate.gq02XM/
    c  e  seal.txt  seal_h.txt  slots.txt
    ```
 
-   **20:11 那个我不给它编成因。** 它早于我的 kill 实验，可能是本次会话里被外部
-   `SIGKILL` 打断的某次运行（`exit 137` 记过一次），也可能是**同一台机器上别人的**
-   一次运行——同一用户下 `TMPDIR` 是同一个，两个目录都在这里出现是意料之中。
-   能站住的只有两个事实：**它存在**，以及**它不是正常退出留下的**（下面那张表）。
-   说"两个独立成因"是我多加的，撤掉。
+   临时目录是 `mktemp -d "${TMPDIR:-/tmp}/pgp-gate.XXXXXX"`，所以**在设了 `TMPDIR` 的机器上
+   它不在 `/tmp`**（macOS 默认就设）。`trap 'rm -rf "$TMP"' EXIT` 对 `SIGKILL` 无效
+   （信号无法捕获），这是设计边界不是 bug。
 
-   临时目录是 `mktemp -d "${TMPDIR:-/tmp}/pgp-gate.XXXXXX"`，所以**在设了 `TMPDIR` 的机器上它不在 `/tmp`**
-   （macOS 默认就设）。找残留得用 `"${TMPDIR:-/tmp}"/pgp-gate.*`，写死 `/tmp` 会得出
-   "没有残留"这个**假结论**——我第一次就是这么验的，`after: 0`。
+   **数这个数有两条前置条件，缺哪一条都有一个方向会错。** 两条都在同一个傍晚真实发生过：
+
+   | 错法 | 做法 | 得到 | 为什么错 |
+   |---|---|---|---|
+   | 假阴性 | 用 `/tmp/pgp-gate.*` 查 | 0 | 路径错：`TMPDIR` 已设，它不在这儿 |
+   | 假阳性 | 用 `${TMPDIR:-/tmp}/pgp-gate.*` 查，但**有实例正在跑** | 1 | 时点错：那是活着的实例自己的临时目录 |
+
+   所以查之前先确认没有实例在跑：
+
+   ```
+   $ pgrep -f 'pbft-devnet/gate\.sh' || echo "(none running)"
+   (none running)
+   $ ls -d "${TMPDIR:-/tmp}"/pgp-gate.* 2>/dev/null | wc -l
+   0
+   ```
+
+   `pgrep -f` 匹配**完整命令行**，所以它也可能命中一个命令行里带着这个字符串的外层 shell
+   （比如一条 `sh -c '... gate.sh ...'`）。看到命中先看 pid 是不是真在跑的那个，
+   别把包装者当成实例。实测两侧：没有实例时 0 命中，人为起一个立刻抓到同一个 pid。
+
+   两条前置条件合起来才说明白这件事：**一个瞬态资源的计数，两个方向都会给出一个
+   "看起来很确定的整数"，而其中只有一个是结论。**"0"和"1"都是整数。
+
    残留里是这次 run 的中间产物（`seal.txt`、`warn.txt` 之类），所以它既是"上次崩溃现场的符文"，
    也是**一份日志片段**：下次排查看到它，先确认它属于哪个 run，别当成这次 run 的产物。
-   `trap 'rm -rf "$TMP"' EXIT` 对 `SIGKILL` 无效（信号无法捕获），这是设计边界不是 bug。
 
    **四条退出路径各测一次，只有第四条留东西**——这张表之前不存在，
-   上面那句"只有 SIGKILL 会留"当时是读 `trap` 读出来的：
+   下面那句"只有 SIGKILL 会留"当时是读 `trap` 读出来的：
 
    | 情形 | 退出码 | 残留 |
    |---|---|---|
