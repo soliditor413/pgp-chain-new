@@ -3,7 +3,7 @@
 这个目录是给 `--pbft.enable` 用的**可执行启动件**：Elastos 格式的 arbiter keystore、
 `legacy.producers` 指向自己公钥的 genesis、以及一键 init/start/stop/status 的脚本。
 
-> **当前状态：单节点 devnet 能稳定出块（每 3 秒一个，已实测到 tip 130）。**
+> **当前状态：单节点 devnet 能稳定出块，块间隔恰为 3.000 秒（已实测 187 次封块、0 次超时）。**
 > 曾经挡住出块的那处 `seal.go` 顺序问题已经修好，证据与验收方法见后面的
 > 「已验证：单节点 devnet 能连续出块（原「已知阻塞」已修复）」一节。
 > 那个旧的"出不了块"叙述保留在该节的"历史形状"里作为排查样本，不再代表现状。
@@ -176,18 +176,41 @@ point --datadir at a pgp-chain data directory or wipe this one with 'geth remove
 采证基线：`seal.go = 50912286a2ca25e05f6164508f276262439778b1`
 （= `b5861d7b4` 的版本）；二进制单独构建在 `build/bin/geth-aqs`，构建前后源码哈希逐字节一致。
 
+下表是**一个时间点的快照**（7278 行日志那次）。封块数与日志行数会随着你继续跑而增长，
+但下面几项**比值与分布是稳定的**，可以直接当判据用。
+
 | 判据 | 实测 |
 |---|---|
-| 高度连涨 | 同一进程内 1→6 连续，之后每次采样都在涨；本次采证最高 **tip 130** |
-| 块间隔 | 相邻块 `ts` 差全为 **3.000s**（`status` 同步打印 `interval=3s (expected 3)`） |
+| `Successfully seal and write new block` | **187** 次（跨 13 次启动） |
+| 相邻块 header time 差恰为 **3.000s** | **178** 次 |
+| 间隔"离群"值 | **8** 处，全部是重启断口：71 / 78 / 101 / 112 / 117 / 123 / 960 / 995 秒（末尾两个是跨会话） |
 | `extra` 长度 | **0x113 = 275 字节** = `143 + 132×1`，全样本一致，`votes=1` |
 | `seal timed out waiting for a confirm` | **0** |
 | `height already has a confirm`（`ErrAlreadyConfirmedBlock`） | **0** |
 | `confirm channel busy` | **0** |
-| 封块总数 | 164 次（跨 8 次启动、6389 行日志），无一次超时 |
+| `fatal error` / `concurrent map` / `panic:` / `SIGSEGV` | **0 / 0 / 0 / 0** |
 | 单进程最长连续出块 | **45 块** |
 | `status` 分支 | 走到 "≥1 block" 并打印 `PASS: the chain is advancing` |
-| 优雅关停 | 日志 `Blockchain stopped`，`stopped in 4~5s` |
+| 优雅关停 | 日志 `Blockchain stopped`，`stopped in 3~5s` |
+
+**不要把这些数字读成"平均 6 秒一个块"。** 178 次相邻间隔全部**恰为** 3.000 秒；
+剩下 8 处是进程被杀 → 重启的断口（见下一节），把它们算进均值会得出 6 秒级的假周期。
+
+#### 一个值得记住的签名：封块数 : `FinishedProposal received fork` = 1 : 1
+
+两个快照都是严格相等：6389 行那次是 **164 : 164**，7278 行这次是 **187 : 187**。
+
+这不是巧合。它对应 `dpos/dispatcher.go:256-261` 的水位守卫：本节点每封一个块，
+链头就被自己的块推进一步，之后 `FinishedProposal` 再喂同一个高度必然被
+`if height <= d.finishedHeight { return }` 短路，于是**恰好**打一行 WARN。
+
+这个 1:1 有两层用处：
+
+1. **判"链是不是健康"**：出错时这个比例会先崩（比如超时未封块会让封块数落后于 WARN）。
+2. **它是 R19 在链头侧"构造上不可达"的现场签名**：`CleanProposals` 与 `processVote`
+   无锁争用那批票数 map 的前提是"有第二个投票者"，而单节点 devnet 的每一票都来自
+   自己那一票，且与 `FinishedProposal` 同协程。1:1 说明水位守卫逐块生效、
+   没有第二条投票路径被走到 —— 这比"代码上推导不可达"硬。
 
 ### 修复位（现在的代码长这样）
 
@@ -267,8 +290,10 @@ WARN  PBFT: height already has a confirm, refusing to propose height=1
 机理在 `dpos/dispatcher.go:256-261` 的水位守卫：`if height <= d.finishedHeight { return }`。
 链头追平之后，同一个高度再被喂进来就会被这里短路，并打这一行。
 
-所以计数会比高度数大：实测 164 次封块时这条 WARN 出现 140 次左右（数量随重启/回退变化）。
-`WARN 数 > 高度数` 是因为快照重放与回退窗口会让同一高度被重复喂几次，**不是分叉**。
+所以它的计数**不是随机的**：实测封块数与该 WARN 数**严格 1:1**
+（6389 行快照 164 : 164，7278 行快照 187 : 187）。本节点每封一个块就推进一步链头，
+随后同高度的 `FinishedProposal` 必然被短路，正好一行。`WARN 数 > 高度数` 的部分来自
+重启后的重放/回退窗口重复喂同一高度，但**每个成功封出的块恰好一行**这一点不变。
 
 **这条同时是 M3 的判据，请一并记下来：**
 
@@ -417,12 +442,24 @@ PBFT 那个字段是本移植新建的、没有存量配置文件，所以能直
 | 路径 | 做法 | 代价 | 评价 |
 |---|---|---|---|
 | A. 删字段 + 登记 | 从 `metrics.Config` 里**删掉**两个字段，同时把 `"metrics.Config.InfluxDBPassword"` / `"metrics.Config.InfluxDBToken"` 加进 `deprecatedConfigFields` | 老配置不再 Fatal，只 warn，但**这两个值从此读不进来**（配置静默失效，只剩一条 warn）。要还让用户能用，得给一个不带 TOML 的入口（flag / 环境变量），否则等于撤掉功能 | 可行但降级 |
-| B. 只挡输出 | 保留字段与 `--config` 读取，给 `metrics.Config` 加一个 `MarshalTOML`（或包一层只用于输出的结构），序列化时丢掉这两个键 | 一个方法，读取路径零改动，`dumpconfig` 干净，**无升级中断**，功能不丢 | **推荐** |
+| B. 给 `metrics.Config` 加 `MarshalTOML` | 保留字段与 `--config` 读取，自己实现序列化并丢掉这两个键 | 一个方法，但**它接手整个 `[Metrics]` 段的编码**，把"丢两个键"放大成"重写一段的序列化"，风险与收益不成比例 | 可用，但不是首选位置 |
+| **B'. 在 `dumpConfig` 的 marshal 前清零副本** | `cmd/geth/config.go:394 func dumpConfig()` 里，`tomlSettings.Marshal(&cfg)`（`:403`）**之前**把副本的 `InfluxDBPassword` / `InfluxDBToken` 清成空串 | 几行；`--config` 读取路径一个字节都不用改，升级零中断 | **推荐** |
 
-B 之所以是正解：泄漏发生在**输出侧**，而 `toml:"-"` 是**输入侧**的开关，用输入侧的开关去堵输出侧，
-就必然要牺牲兼容性。改输出侧不动输入侧，才既止漏又不破坏存量配置。
+**B' 之所以是正解**：泄漏发生在**输出侧**，而 `toml:"-"` 是**输入侧**的开关 ——
+用输入侧的开关去堵输出侧，必然牺牲兼容性。B' 只在出口处脱敏，入口不动。
+另外两个字段都带 `,omitempty`，清成空串后**键名和值一起消失**，输出里连
+`InfluxDBPassword` 这个键都不会出现（已实测：两个 flag 传空串时，`dumpconfig` 里
+这两个键的 grep 计数为 0）。凭据脱敏也因此和 `KeyStorePassword` 集中在同一处思路下。
 
-两条都**没有做**，本轮按 team-lead 的决定留给独立迁移窗口。
+> 一个易错点：`cmd/geth/config.go` 里并没有 `dumpConfigTOML` 这个生产变量 ——
+> 带这个名字的是 `eth/ethconfig/secrets_test.go:56` 里的**测试本地镜像**
+> （`toml.Config` 的值，不是函数），它存在的目的就是让测试用与生产相同的
+> encoder 设置。要改生产行为，改的是 `dumpConfig()`，不是测试里的那个镜像。
+
+**A / B / B' 三条都还没有实施**，本轮按 team-lead 的决定留给独立迁移窗口。
+如果将来做 B'，闸门要跟代码一起落地（否则等于没修）：
+`eth/ethconfig/secrets_test.go` 里对 `InfluxDBPassword` / `InfluxDBToken` 设哨兵值，
+断言 `dumpConfigTOML.Marshal` 的输出里既没有哨兵值、也没有键名 —— **删掉清零逻辑它就会红**。
 
 **本轮规避（用户侧可执行）**：
 
