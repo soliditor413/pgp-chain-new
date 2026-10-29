@@ -224,12 +224,12 @@ point --datadir at a pgp-chain data directory or wipe this one with 'geth remove
 `WARN 数 > 封块数` 只会在重启重放/回退窗口出现（那时序列才会错开），
 `WARN 数 < 封块数` 则说明有块封出来了却没走到水位守卫 —— 那才是要查的信号。
 
-复算命令（当前日志实测输出粘在下面）：
+复算命令（下面粘的是当时那份日志的实测输出）：
 
 ```console
 $ L=~/.pgp-devnet/logs/geth.log
 $ A=$(grep -o 'Successfully seal and write new block.*number=[0-9]*' $L | grep -o '[0-9]*$')
-$ B=$(grep -o 'fork blockheight[0-9]*' $L | grep -o '[0-9]*$')
+$ B=$(grep -oE 'fork block ?height ?[0-9]+' $L | grep -o '[0-9]*$')
 $ [ "$A" = "$B" ] && echo identical
 identical
 $ echo "$A" | paste -sd+ - | bc; echo "$B" | paste -sd+ - | bc
@@ -237,8 +237,10 @@ $ echo "$A" | paste -sd+ - | bc; echo "$B" | paste -sd+ - | bc
 12845
 ```
 
-注意第二条 grep 的模式是 `fork blockheight`（**连体、没有空格**），这不是笔误，
-是当前代码的真实输出格式，原因见「已知缺口」里的日志格式回归。
+第二条 grep 用的是**容错模式** `fork block ?height ?[0-9]+`，不是笔误：这行日志的格式
+在 `#20` 修前修后不一样（`fork blockheight1` → `fork block height 1`），
+而 `~/.pgp-devnet/logs/geth.log` 是修前那份二进制写的。**同一个模式对两种格式都能匹配**，
+所以你手上无论哪份日志都能直接跑。格式为何变、什么时候变的，见「已知缺口」里的日志格式回归。
 
 这不是巧合。它对应 `Dispatcher.FinishedProposal` 里的水位守卫（`dpos/dispatcher.go`，
 锚点用那句代码、不要用行号 —— 它在 `f7c38120c` 之后从 `:256` 漂到了 `:280`）：
@@ -331,21 +333,28 @@ WARN  PBFT: height already has a confirm, refusing to propose height=1
 
 排查时先把这几行认出来，别当成故障。
 
-### `WARN FinishedProposal received fork blockheight N`
+### `WARN FinishedProposal received fork block height N`
 
 **它是我们自己的出块路径在正常工作，不是错误。**
 
-真实日志行（照抄，注意 `block` 和高度**连在一起**、中间没有空格）：
+这行日志的**格式在 `9e6880e42` 前后不一样**，两版都记在这里，因为按时间排错时你手上的日志
+可能是任意一版：
 
 ```
-WARN [10-29|13:52:03.379] FinishedProposal received fork blockheight1
-WARN [10-29|13:52:06.001] FinishedProposal received fork blockheight2
+当前格式（9e6880e42 之后，= 上游原版）：
+  WARN […] FinishedProposal received fork block height 1
+
+修前格式（9e6880e42 之前）：
+  WARN [10-29|13:52:03.379] FinishedProposal received fork blockheight1
+  WARN [10-29|13:52:06.001] FinishedProposal received fork blockheight2
 ```
 
-`blockheight1` 不是笔误，也不是我抄漏了空格 —— 当前代码就是这么打的。
-原因与影响见「已知缺口」里的**日志格式回归**：上游原版是 `... fork block height 1`
-（`fmt.Sprintln`，带空格），本移植把 helper 换成 `fmt.Sprint` 之后空格没了。
-所以**做 grep 时不要写成 `fork block height`**，那样一行都匹配不到。
+上面那两行**修前**的样例是照抄的，带时间戳；**当前格式那行没带时间戳**，因为它是按
+`dpos/log.go` 的 `sprintArgs`（`strings.TrimSuffix(fmt.Sprintln(a...), "\n")`）推出来的，
+不是从某份日志里抄的 —— 我不拿一个没采过的日志行冒充证据。
+
+**所以 grep 要用容错模式**：`grep -E 'fork block ?height ?[0-9]+'`。
+写成 `fork blockheight` 会漏掉修复后的日志，写成 `fork block height` 会漏掉修复前的。
 
 机理在 `Dispatcher.FinishedProposal` 的水位守卫（`dpos/dispatcher.go`，找那句
 `if height <= d.finishedHeight`，别按行号找 —— 它在 `f7c38120c` 之后已经漂过一次）。
@@ -626,14 +635,15 @@ B 需要正确实现一个接口，写错了什么都不说。这与本项目反
   `ChangeView`），所以**它的 duty 判定是拿重锚后的视图算出来的**，两边从重锚那一刻起就可能
   各自合法地判出"该我出块" —— 这是系统性不同步，不是小概率巧合。这个区别决定测试怎么写：
   前者可以靠长跑碰运气，后者必须**单独造场景**验。
-- **日志格式回归（移植引入，已立项 `#20`，排在 `#13` / R20 之后）。**
-  `dpos/log.go` 的四个 helper 是 `glog.Warn(fmt.Sprint(a...))`，而 `fmt.Sprint` 只在
-  "两个操作数都不是字符串"时才插空格；上游原版走 `fmt.Sprintln`，是
-  `... fork block height N`，现在是 `... fork blockheightN`。**约 300 个调用点被静默改掉了格式**
-  —— 而 `dpos/log.go` 的注释恰好写着"helper 名字保持不变、便于逐行对照原版 review"：
-  名字保住了，语义没保住。
-  影响：M3 与本项目要对齐的 1.9.7 节点日志**不能直接逐行对照**，所有按原文 grep 的排查手册
-  （包括本文）都会失配。本文的做法是**按当前实际格式写证据行**；这条修完之后只需要改
-  本文里那一个字符串，别处不用动。
+- ~~**日志格式回归（移植引入，`#20`）**~~ —— **已修，`9e6880e42`。** 保留这条是因为它是
+  "同一句话在两个地方各写一份、然后漂开"的最好样本：
+  `dpos/log.go` 的四个 helper 曾是 `glog.Warn(fmt.Sprint(a...))`，而 `fmt.Sprint` 只在
+  "两个操作数都不是字符串"时才插空格（`Sprint("viewOffset", 3)` → `viewOffset3`），
+  上游原版走 `fmt.Sprintln`。**约 300 个调用点被静默改掉了格式**，而 `dpos/log.go` 的注释
+  恰好写着"helper 名字保持不变、便于逐行对照原版 review"——名字保住了，语义没保住。
+  修法是把拼参数抽成 `sprintArgs`（`strings.TrimSuffix(fmt.Sprintln(a...), "\n")`）并单独可测。
+  **付过的代价**：修前修后的日志格式不同，任何按原文 grep 的东西都会一半失配，
+  包括本文的证据行（我因此改了两版）。所以本文的 grep 一律用容错模式
+  `fork block ?height ?[0-9]+`；你手上的旧日志多半还是连体格式，别以为是数据坏了。
 - ELA SPV 服务会尝试连 ELA 主网（`startSpv` 对 legacy 链是强制的），devnet 上连不上
   任何 ELA peer，只会在日志里留下连接尝试，不影响空块出块。
