@@ -61,6 +61,18 @@ package dpos
 // proposer's own vote on the miner goroutine, so the two never overlap -- which is
 // why the devnet's 107 blocks and 141 clean-ups show no fatal and are not evidence
 // that this case is unnecessary.
+//
+// One note on the file's name versus its build tag, because they disagree and the
+// next reader will take that for an oversight: the name says race, the file has no
+// //go:build race. The tag is decided by what a case needs in order to fail, not by
+// its subject. The sequential case fails under a plain `go test`, so gating the
+// file would remove a guard from the ordinary run. The concurrent case needs the
+// detector for what it is really for, and a plain `go test` only proves its two
+// sides ran: without -race there is nothing to report a lost lock, so a green
+// there says nothing about the lock. That is written in that case's own comment
+// rather than left to be inferred. The lock is graded by `go test -race`, which is
+// the gate this project runs anyway; this file stays untagged so the behaviour
+// half keeps running in both.
 
 import (
 	"sync"

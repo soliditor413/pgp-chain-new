@@ -260,6 +260,21 @@ func (v *ConsensusView) GetNextNeedConnectArbiters() []peer.PID {
 	return v.producers.GetNextNeedConnectArbiters()
 }
 
+// IsSameProducers compares curProducers with the set this node will adopt next.
+//
+// Same family as IsCurrentProducers below, and the same rules apply: do not delete
+// it for having no caller here, and do not "fix" the in-place sort by copying.
+// Upstream calls it directly from pgp-chain consensus/pbft/pbft.go:318 and
+// network.go:426, and through the Pbft.IsSameProducers forwarder at pbft.go:346
+// from network.go:1136, so M3 revives it either way.
+//
+// It is the more dangerous of the two, and that is the part worth reading twice.
+// IsCurrentProducers sorts p.producers, the set in force, so the reordering only
+// changes the order of one query's answer. This one sorts p.nextProducers -- the
+// set ChangeCurrentProducers is going to adopt -- so the reordering stays behind in
+// the slice that becomes the producer set, and dutyIndex is an index into that
+// slice. Sorting here is not answering a question, it is editing the state the
+// next epoch runs on.
 func (v *ConsensusView) IsSameProducers(curProducers [][]byte) bool {
 	v.producers.mtx.Lock()
 	defer v.producers.mtx.Unlock()
@@ -285,14 +300,22 @@ func (v *ConsensusView) IsSameProducers(curProducers [][]byte) bool {
 
 // IsCurrentProducers compares the current set with curProducers. Do not delete it
 // for having no caller here: upstream calls it from six sites on the producer-set
-// change path (pgp-chain consensus/pbft/network.go:222/:253/:463/:483/:1132,
-// eth/backend.go:476, and Pbft.IsCurrentProducers forwards to it), so M3 revives
-// it. Note what the sort does: it reorders the shared slice in place, and
-// dutyIndex is an index into that slice -- so the ordering is not cosmetic, it
-// decides who is on duty next, and it is only correct while every node produces
-// the same order. That is why this is left exactly as it is: an in-place sort
-// under p.mtx is the ported behaviour, and "tidying" it into a copy would change
-// which producer a node selects.
+// change path (pgp-chain consensus/pbft/network.go:222/:253/:463/:483/:1132 and
+// pgp-chain's eth/backend.go:476, all through the Pbft.IsCurrentProducers
+// forwarder), so M3 revives it.
+//
+// This family has two members, and only one of them is harmless:
+// IsSameProducers above sorts nextProducers, the set that will take effect, so
+// its reordering is left behind in the slice ChangeCurrentProducers adopts. This
+// one sorts p.producers, the set in force, so the reordering is not cosmetic
+// either -- dutyIndex is an index into that slice, which makes the order decide
+// who is on duty next, and it is only correct while every node produces the same
+// order -- but it does not survive into the next epoch. Fixing one and not the
+// other leaves half the family in place.
+//
+// That is why this is left exactly as it is: an in-place sort under p.mtx is the
+// ported behaviour, and "tidying" it into a copy would change which producer a
+// node selects.
 func (v *ConsensusView) IsCurrentProducers(curProducers [][]byte) bool {
 	v.producers.mtx.Lock()
 	defer v.producers.mtx.Unlock()
@@ -446,6 +469,17 @@ func (v *ConsensusView) GetConsensusStatus() uint32 {
 // GetViewState returns the three fields a recovering peer needs as one snapshot.
 // Asking three getters would return a status, an offset and a start time that
 // never belonged to the same view.
+//
+// What it does not return is viewChangeTime; the receiver recomputes it from
+// viewStartTime. That round trip holds only because viewStartTime is always
+// stored at second granularity: ChangeView writes it with sub-second precision
+// first, then calls setChangViewTimeLocked, which overwrites both times from the
+// truncated Unix second. So this function's symmetry rests on one write order
+// inside ChangeView, one line apart. Whoever writes viewStartTime directly and
+// skips that call -- the half-way shape ChangeView itself uses immediately
+// before it -- breaks the round trip for every recovering peer, and nothing will
+// report it: the peer just resumes at a start time that is not the one this node
+// used, with a viewChangeTime that never matched it.
 func (v *ConsensusView) GetViewState() (status uint32, viewOffset uint32, viewStartTime time.Time) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
@@ -481,6 +515,19 @@ func (v *ConsensusView) SetChangViewTime(parentTime uint64) {
 // the duty flag from them; going through the exported setters would release the
 // lock in between, and another goroutine could read the recovered offset with
 // the pre-recovery start time.
+//
+// One lock, but not one atomic transaction over the five fields, and the
+// difference is worth stating because the previous shape invites the wrong
+// conclusion. p.mtx is taken twice with a release in between: once by
+// UpdateWorkingHeight, once by updateDutyIndexLocked through
+// Producers.UpdateDutyIndex. ChangeCurrentProducers takes p.mtx and does not take
+// this lock -- the comment on it says why it must not -- so it can land between
+// the two, and the duty index can end up computed from a working height that
+// someone else just changed. Before R20 the same window was a data race; now it
+// is a legal interleaving. That is better, it is not atomic, and calling it
+// atomic would hide the remaining window from the next reader. Closing it needs
+// one Producers entry point that does both under a single acquisition, which is
+// a separate change rather than a note here.
 func (v *ConsensusView) RecoverFromStatus(status uint32, viewOffset uint32, viewStartTime time.Time, workingHeight uint64, finishedHeight uint64) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
@@ -492,6 +539,21 @@ func (v *ConsensusView) RecoverFromStatus(status uint32, viewOffset uint32, view
 	// Producers, and viewMu orders nothing about it. This nests viewMu ->
 	// producers.mtx, which is the allowed direction.
 	v.producers.UpdateWorkingHeight(workingHeight)
+	// isDposOnDuty is assigned twice, and the second one is not redundant.
+	// GetNextOnDutyProducer reads the dutyIndex field rather than deriving an
+	// index, so this first assignment uses whatever dutyIndex the node carried
+	// into the recovery; the second one, below, runs after UpdateDutyIndex has
+	// recomputed it from the chain's finished height. The two answers can differ,
+	// and the second is the final one. Removing the finishedHeight branch as
+	// "duplicate work" would silently leave isDposOnDuty derived from a stale
+	// dutyIndex -- and IsOnduty is a block-production gate (Seal asks it), so the
+	// symptom would be a node that stops producing, not a wrong number in a log.
+	//
+	// What the finishedHeight == 0 case costs is much smaller, which is why it is
+	// not a reason to change the condition: the duty index is not restored, and
+	// every non-test consumer of it in this tree is a log line -- the End-Recover
+	// summary and ChangeView's view summary. Block production goes through
+	// isDposOnDuty, which was written above unconditionally.
 	v.isDposOnDuty = v.producerIsOnDutyLocked(v.publicKey)
 	if finishedHeight > 0 {
 		v.updateDutyIndexLocked(finishedHeight)

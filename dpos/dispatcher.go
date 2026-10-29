@@ -723,10 +723,16 @@ func (d *Dispatcher) RecoverFromConsensusStatus(status *dmsg.ConsensusStatus) er
 	d.resetVoteMapsLocked()
 	d.mu.Unlock()
 
-	// One call, one critical section. Doing this through the exported setters
+	// One call, one critical section: doing this through the exported setters
 	// would release the view lock between the offset and the start time, and a
 	// reader in that gap sees the recovered offset against the pre-recovery
 	// start time -- a deadline computed from a pair that never existed.
+	//
+	// That is the reason for one call, not a claim that the recovery is atomic.
+	// RecoverFromStatus takes p.mtx twice with a release in between, and
+	// ChangeCurrentProducers takes p.mtx without taking the view lock, so it can
+	// land between them; the comment there spells out what that leaves exposed.
+	// No annotation here should say "atomic", because the code is not.
 	d.consensusView.RecoverFromStatus(status.ConsensusStatus, status.ViewOffset,
 		status.ViewStartTime, status.WorkingHeight, d.GetFinishedHeight())
 	Info("-------[End RecoverFromConsensusStatus]--------", "startTime", d.consensusView.GetViewStartTime(), "WorkingHeight", status.WorkingHeight, "dutyIndex", d.GetConsensusView().GetDutyIndex(), "d.finishedHeight", d.GetFinishedHeight(), "status.ViewOffset", status.ViewOffset)

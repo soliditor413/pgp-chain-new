@@ -206,6 +206,17 @@ func New(legacy *params.LegacyConfig, cfg *Config) *Engine {
 // attachAccount installs the signing account and rebuilds the dispatcher around
 // it.
 //
+// Rebuilds is the operative word: NewDispatcher calls NewConsensusView, so this
+// replaces the view as well as the dispatcher. The old ConsensusView is dropped,
+// not reset -- viewOffset, viewStartTime and isDposOnDuty come back at their
+// construction values, and any epoch-transition state the previous view carried
+// is gone. That is the opposite of dpos.Dispatcher.ResetConsensusForEpochTransition,
+// which keeps the view object and rewrites its fields in place. The two are not
+// interchangeable in either direction, and mixing them is how a node ends up with
+// the dispatcher and the chain head each holding a different view: a caller that
+// fetched the dispatcher before this ran, and then resets it, is resetting a view
+// nothing else reads.
+//
 // The two cannot be set independently: the dispatcher captures the public key at
 // construction because it decides locally whether this node is on duty, and a
 // dispatcher built with a nil key would answer "never on duty" no matter which
