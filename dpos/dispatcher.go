@@ -641,21 +641,57 @@ func (d *Dispatcher) HelpToRecoverAbnormal(id peer.PID, height uint64, currentHe
 
 }
 
+// RecoverAbnormal applies a peer's consensus status to this node's view.
+//
+// The nil check has to stay above the log line. That log line reads
+// status.ConsensusStatus, so a check below it never ran for the case it exists
+// for: passing nil panicked in the function's first statement, and the only trace
+// on a running node would be a log that stops immediately before the line that
+// was supposed to describe the input. Upstream has the same order -- pgp-chain's
+// dpos/dispatcher.go prints the same three fields with fmt.Println at :481 and
+// checks nil at :482 -- so this is inherited, not introduced by the port.
+// Inherited is not a reason to keep it: the goal is wire-level interop with old
+// nodes, not bug-level fidelity, and the fix is statement order.
+//
+// No caller in this tree yet. Upstream enters through
+// pgp-chain/consensus/pbft/network.go:924, inside Pbft.doRecoverLocked (:901),
+// after HelpToRecoverAbnormal at :597 inside Pbft.OnRequestConsensus (:587). The
+// directory is part of that reference: dpos/network.go is a different and much
+// shorter file, so a reader who looks for :924 there finds nothing and reads that
+// as "the call site does not exist".
 func (d *Dispatcher) RecoverAbnormal(status *dmsg.ConsensusStatus, medianTime int64) {
-	Info("RecoverAbnormal", "status", status.ConsensusStatus, "viewOffset", status.ViewOffset, "viewStartTime", status.ViewStartTime)
 	if status == nil {
 		return
 	}
+	Info("RecoverAbnormal", "status", status.ConsensusStatus, "viewOffset", status.ViewOffset, "viewStartTime", status.ViewStartTime)
 	status.ViewStartTime = dtime.Int64ToTime(medianTime)
 	if medianTime != 0 {
 		offset, offsetTime := d.consensusView.calculateOffsetTime(status.ViewStartTime, d.timeSource.AdjustedTime())
 		status.ViewOffset += offset
 		status.ViewStartTime = d.timeSource.AdjustedTime().Add(-offsetTime)
 	}
-	d.RecoverFromConsensusStatus(status)
+	// The error is logged here rather than dropped. Go discards a returned error
+	// silently, and this is the only call site in the tree: dropping it would
+	// turn the nil panic we just removed into a nil skip, which is the same
+	// defect one step further along and harder to notice.
+	if err := d.RecoverFromConsensusStatus(status); err != nil {
+		Error("RecoverAbnormal: the recovered status was not applied", "error", err)
+	}
 }
 
+// RecoverFromConsensusStatus applies a status that came from a peer or from
+// HelpToRecoverAbnormal.
+//
+// It checks nil itself instead of relying on RecoverAbnormal to have done it,
+// because it is exported and upstream has a caller that does not go through us:
+// pgp-chain/third_party/Elastos.ELA/dpos/manager/dposhandlerswitch.go:225 and
+// :230 both call it directly, both in the `if err := ...; err != nil` shape. A
+// returned error is only worth having if call sites look at it, which is why the
+// in-tree caller above logs it.
 func (d *Dispatcher) RecoverFromConsensusStatus(status *dmsg.ConsensusStatus) error {
+	if status == nil {
+		return fmt.Errorf("RecoverFromConsensusStatus: nil consensus status")
+	}
 	Info("RecoverFromConsensusStatus", "status", status.ConsensusStatus, "viewOffset", status.ViewOffset, "viewStartTime", status.ViewStartTime)
 	// setProcessingProsalNil takes proposalMu and releases it before returning, so
 	// it has to happen before mu is taken. Taking mu while holding proposalMu is
@@ -675,11 +711,14 @@ func (d *Dispatcher) RecoverFromConsensusStatus(status *dmsg.ConsensusStatus) er
 	// lock: after R20, DumpInfo takes viewMu, so a deferred unlock would hold mu
 	// across a view lock and across a write to the log sink.
 	//
-	// Unreachable in this tree today -- HelpToRecoverAbnormal and RecoverAbnormal
-	// have no callers until the recovery messages are wired -- and reachable on
-	// the day M3 connects them (upstream calls this from network.go:597 and
-	// :924). Ported-but-not-wired, not dead: the same status as CleanProposals'
-	// changeView branch.
+	// Reached in this tree only from RecoverAbnormal, which itself has no caller
+	// until the recovery messages are wired. Upstream gets here through
+	// pgp-chain/consensus/pbft/network.go:924 (Pbft.doRecoverLocked), which calls
+	// RecoverAbnormal, and also directly from
+	// pgp-chain/third_party/Elastos.ELA/dpos/manager/dposhandlerswitch.go:225 and
+	// :230. Ported-but-not-wired, not dead: the same status as CleanProposals'
+	// changeView branch. The paths carry their directories for the reason given on
+	// RecoverAbnormal.
 	d.mu.Lock()
 	d.resetVoteMapsLocked()
 	d.mu.Unlock()
