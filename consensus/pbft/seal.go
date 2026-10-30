@@ -254,7 +254,7 @@ func (e *Engine) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 		case <-time.After(delay):
 		case <-stop:
 			e.finishRound("stop")
-			e.resetRound(block.NumberU64())
+			e.resetRound()
 			return ErrRoundAborted
 		}
 	}
@@ -292,7 +292,7 @@ func (e *Engine) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 			log.Warn("PBFT: confirm belongs to a different block, ignoring",
 				"height", block.NumberU64(), "confirm", want, "block", pgp.SealHash(header))
 			e.finishRound("stale confirm")
-			e.resetRound(block.NumberU64())
+			e.resetRound()
 			return ErrRoundAborted
 		}
 		if err := e.addConfirmToBlock(header, confirm); err != nil {
@@ -302,24 +302,24 @@ func (e *Engine) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 			// still returned, because a confirm that cannot be serialized is a
 			// fault rather than a lost round.
 			e.finishRound("attach failed")
-			e.resetRound(block.NumberU64())
+			e.resetRound()
 			return err
 		}
 		atomic.StoreInt32(&e.isSealOver, 1)
 	case <-e.unConfirmCh:
 		log.Warn("PBFT: proposal was rejected by the producer set", "height", block.NumberU64())
 		e.finishRound("rejected")
-		e.resetRound(block.NumberU64())
+		e.resetRound()
 		return ErrRoundAborted
 	case <-time.After(deadline):
 		log.Warn("PBFT: seal timed out waiting for a confirm", "height", block.NumberU64())
 		e.finishRound("timeout")
-		e.resetRound(block.NumberU64())
+		e.resetRound()
 		return ErrRoundAborted
 	case <-stop:
 		log.Debug("PBFT: seal interrupted by the miner", "height", block.NumberU64())
 		e.finishRound("stop")
-		e.resetRound(block.NumberU64())
+		e.resetRound()
 		return ErrRoundAborted
 	}
 
@@ -409,27 +409,38 @@ func drainConfirms(ch chan *payload.Confirm) {
 	}
 }
 
-// resetRound releases the view after a round that produced no block.
+// resetRound drops this round's state after a round that produced no block, and
+// deliberately leaves the view where it is.
 //
-// This is the ONLY path that lets a node keep producing after a failed round, so
-// dropping it does not degrade anything gracefully -- it stops the node for good.
-// The view is a two-state machine (dpos.ConsensusView): SetRunning is called by
-// Prepare->startView, and the only two calls that put it back into
-// ConsensusReady are Dispatcher.FinishedProposal (which runs when this node
-// actually sealed a block) and Dispatcher.ResetConsensus. So a round that ends
-// without a block leaves the view Running, and every later Prepare answers
-// ErrConsensusIsRunning for the rest of the node's life.
+// It used to call Dispatcher.ResetConsensus, to get out of the Running state that
+// only two functions could clear. That was the wrong tool, in a way that is easy to
+// miss because the wrongness only shows up on a set of more than one node:
 //
-// ResetConsensus also does the rest of the work a retry needs: it clears the
-// processed proposal and the vote tallies, resets the view offset, refreshes the
-// duty index, and calls ChangeView(force=true), whose listener notification
-// reaches StartMine->miner.RequestNewWork. That wake-up is what actually makes
-// the next attempt happen, instead of waiting for the next chain head.
-func (e *Engine) resetRound(height uint64) {
+//   - ResetConsensus zeroes the view offset and forces a view change on THIS node
+//     only. Upstream reserves it for the set-wide ResetView agreement
+//     (pgp-chain/consensus/pbft/network.go:967, gated on
+//     GetResetViewReqCount() >= minAcceptVoteCount), precisely because a reset has
+//     to be collective. A single node that resets lands one view behind the rest,
+//     and ProcessProposal stashes a proposal from a HIGHER offset but drops one
+//     from a lower offset -- so every later proposal from this node was dropped by
+//     every peer. That is the devnet's second stall, verbatim: proposer at offset 0,
+//     three peers at offset 1, "have different view offset" on all three, forever,
+//     while the proposer retried every ten seconds.
+//
+//   - It is no longer needed to release the view. OnViewChanged does that, once per
+//     rotation, for the producer whose turn it has become. The view loop rotates the
+//     whole set moments after this returns, because the round's deadline is the
+//     view's own change time: Seal waits exactly `GetChangeViewTime() - now`.
+//
+// Upstream's timeout path does not even clean the votes (pgp-chain/consensus/pbft/
+// pbft.go:1245-1253). This keeps that part, because a vote collected for a proposal
+// that will never be sealed must not be counted again in the next round at the same
+// offset.
+func (e *Engine) resetRound() {
 	if e.dispatcher == nil {
 		return
 	}
-	e.dispatcher.ResetConsensus(height)
+	e.dispatcher.CleanProposals(false)
 }
 
 // onConfirm is the dispatcher callback that fires when 2/3 of the producers have

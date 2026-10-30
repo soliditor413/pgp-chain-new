@@ -381,8 +381,16 @@ func TestFailedRoundDoesNotStallTheNode(t *testing.T) {
 
 	// --- the assertion this test exists for -----------------------------------
 
+	// The round no longer resets the view itself -- a per-node reset puts this node
+	// one view behind the set and every peer then drops its proposals (see
+	// Engine.resetRound). What releases it is the rotation, and the assertion this
+	// test exists for is still "the node is not stalled for good", now in two steps.
+	if engine.dispatcher.GetConsensusView().IsReady() {
+		t.Fatal("a failed round cleared the view itself; the release belongs to the rotation")
+	}
+	releaseAfterFailedRound(engine)
 	if !engine.dispatcher.GetConsensusView().IsReady() {
-		t.Fatal("a failed round left the view running: every later Prepare will answer ErrConsensusIsRunning")
+		t.Fatal("the rotation did not release the view: every later Prepare will answer ErrConsensusIsRunning")
 	}
 	retryHeader := newHeader()
 	if err := engine.Prepare(chain, retryHeader); err != nil {
@@ -550,6 +558,7 @@ func TestLateConfirmAfterFinishRoundDoesNotPanic(t *testing.T) {
 
 	// --- and the node still produces a block ---------------------------------
 
+	releaseAfterFailedRound(engine)
 	retryHeader := newHeader()
 	if err := engine.Prepare(chain, retryHeader); err != nil {
 		t.Fatalf("Prepare after late votes: %v", err)
@@ -709,6 +718,7 @@ func TestSealExitsWhenTheMinerStops(t *testing.T) {
 		Number:      big.NewInt(1),
 		GasLimit:    30_000_000,
 	}
+	releaseAfterFailedRound(engine)
 	if err := engine.Prepare(chain, retryHeader); err != nil {
 		t.Fatalf("Prepare after a stop-interrupted round: %v", err)
 	}
@@ -890,4 +900,18 @@ func TestSingleProducerSealsInOneRound(t *testing.T) {
 			}
 		})
 	}
+}
+
+// releaseAfterFailedRound plays the part the view loop plays after a round ends
+// without a block: the rotation fires OnViewChanged, and that callback is what lets
+// the producer the new view points at prepare again.
+//
+// The round itself no longer resets the view. It used to, through
+// Dispatcher.ResetConsensus, which zeroes the view offset on one node -- and a node
+// that resets alone is a node whose proposals every peer drops as stale. See
+// Engine.resetRound for the failure that produced. So "an aborted round leaves the
+// node usable" now has two steps, and the second one is this.
+func releaseAfterFailedRound(engine *Engine) {
+	engine.SetIsCurrent(func() bool { return true })
+	engine.OnViewChanged(true, false)
 }

@@ -344,7 +344,11 @@ func TestPickRecoverStatusPrefersHighestOffset(t *testing.T) {
 		t.Fatalf("countStatuses = %d, want 5", got)
 	}
 
-	picked, median := pickRecoverStatus(m)
+	// Ten seconds past base: every start time in the map is behind the anchor and
+	// inside the slack, i.e. all of them are usable view clocks.
+	anchor := base.Add(10 * time.Second).UnixNano()
+
+	picked, median := pickRecoverStatus(m, anchor)
 	if picked == nil || picked.ViewOffset != 3 {
 		t.Fatalf("picked offset %v, want 3", picked)
 	}
@@ -353,8 +357,62 @@ func TestPickRecoverStatusPrefersHighestOffset(t *testing.T) {
 		t.Fatalf("median start = %d, want %d", median, want)
 	}
 
-	if s, mt := pickRecoverStatus(nil); s != nil || mt != 0 {
+	if s, mt := pickRecoverStatus(nil, anchor); s != nil || mt != 0 {
 		t.Fatalf("empty status map produced %v / %d", s, mt)
+	}
+}
+
+// TestPickRecoverStatusIgnoresAViewThatNeverStarted covers the cold start of a
+// freshly generated set.
+//
+// A producer that has never opened a view still answers a recovery request, with
+// an unset view start time. That decodes as the unix epoch, and feeding it to the
+// offset arithmetic gives (now - 1970) / signTolerance -- hundreds of millions of
+// offsets, computed against each node's own `now`, so the set ends up disagreeing
+// about whose turn it is. The devnet showed exactly that: three producers landed
+// on 149446496/149446497 while the fourth stayed at 0.
+//
+// The contract asserted here: a start time that is not a clock is excluded from
+// the median, and when nothing usable is left the anchor comes back instead, which
+// Dispatcher.RecoverAbnormal turns into offset 0 with the view anchored at now.
+func TestPickRecoverStatusIgnoresAViewThatNeverStarted(t *testing.T) {
+	now := time.Now()
+	anchor := now.UnixNano()
+
+	m := map[uint32]map[string]*dmsg.ConsensusStatus{
+		0: {
+			"virgin":  {ViewOffset: 0, ViewStartTime: time.Time{}},     // never set
+			"epoch":   {ViewOffset: 0, ViewStartTime: time.Unix(0, 0)}, // set to zero
+			"running": {ViewOffset: 0, ViewStartTime: now.Add(-3 * time.Second)},
+		},
+	}
+	if _, median := pickRecoverStatus(m, anchor); median != now.Add(-3*time.Second).UnixNano() {
+		t.Fatalf("median = %d, want the one real view clock %d",
+			median, now.Add(-3*time.Second).UnixNano())
+	}
+
+	// Nothing usable at all: the anchor has to come back, not a median of epochs.
+	allUnusable := map[uint32]map[string]*dmsg.ConsensusStatus{
+		7: {
+			"virgin": {ViewOffset: 7, ViewStartTime: time.Time{}},
+			"epoch":  {ViewOffset: 7, ViewStartTime: time.Unix(0, 0)},
+		},
+	}
+	status, median := pickRecoverStatus(allUnusable, anchor)
+	if status == nil || status.ViewOffset != 7 {
+		t.Fatalf("status = %v, want the bucket's status at offset 7", status)
+	}
+	if median != anchor {
+		t.Fatalf("median = %d, want the anchor %d", median, anchor)
+	}
+
+	// A clock from the future is a broken clock, not a clock: a node cannot know a
+	// view started after now.
+	future := map[uint32]map[string]*dmsg.ConsensusStatus{
+		0: {"ahead": {ViewOffset: 0, ViewStartTime: now.Add(time.Hour)}},
+	}
+	if _, median := pickRecoverStatus(future, anchor); median != anchor {
+		t.Fatalf("median = %d, want the anchor %d", median, anchor)
 	}
 }
 

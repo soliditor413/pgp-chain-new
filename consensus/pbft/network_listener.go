@@ -75,6 +75,13 @@ const (
 	// recoverWaitTimeout bounds how long a recovery exchange waits for peer
 	// statuses before proceeding with whatever arrived.
 	recoverWaitTimeout = 3 * time.Second
+
+	// startupRecoverWait is how long StartRecovery waits for a producer majority
+	// before it starts warning. Upstream uses two minutes for the same wait
+	// (pgp-chain/consensus/pbft/pbft.go:1023); the value is not consensus
+	// critical, it only decides how long the useful state is "starting up"
+	// rather than "misconfigured".
+	startupRecoverWait = 2 * time.Minute
 )
 
 // blockReader is the block-body half of the chain.
@@ -454,13 +461,27 @@ func (e *Engine) OnVoteAccepted(id dpeer.PID, vote *payload.DPOSProposalVote) {
 		return
 	}
 
-	if _, ok := e.blockPool.GetBlock(vote.ProposalHash); !ok {
-		log.Debug("OnVoteAccepted: proposal unknown, holding the vote", "hash", vote.ProposalHash.String())
-		e.dispatcher.AddPendingVote(vote)
-		return
-	}
+	// The vote names the PROPOSAL it belongs to; the pool is keyed by the block's
+	// seal hash. Those are two different values -- a proposal hash covers the
+	// sponsor and the view offset as well as the block -- so looking the vote's hash
+	// up in the pool never matched, every vote took the "unknown" branch below and
+	// was parked in pendingVotes, and the proposer held its own peers' votes while
+	// its round waited for a quorum. That is the devnet's third stall: the proposer
+	// timed out at height 1 with 0 of the 2 votes it needed while all three peers
+	// had voted and the votes had arrived.
+	//
+	// Upstream does not consult the pool here at all. It compares the vote against
+	// the proposal currently being processed
+	// (pgp-chain/consensus/pbft/network.go:722, tryGetCurrentProposal) and asks the
+	// sender for the proposal when it has none. The request half does not exist in
+	// this port -- the transport carries no RequestProposal message -- so a vote for
+	// a proposal we are not processing is parked, which is upstream's "not have
+	// proposal, push vote into pending vote" branch.
 	processing := e.dispatcher.GetProcessingProposal()
-	if processing == nil {
+	if processing == nil || !processing.Hash().IsEqual(vote.ProposalHash) {
+		log.Debug("OnVoteAccepted: proposal not being processed, holding the vote",
+			"hash", vote.ProposalHash.String())
+		e.dispatcher.AddPendingVote(vote)
 		return
 	}
 	if _, ok := e.blockPool.GetConfirm(processing.BlockHash); ok {
@@ -509,6 +530,33 @@ func (e *Engine) OnBadNetwork() {
 	log.Warn("DPoS network went bad")
 }
 
+// processPrecociousProposal replays the proposal that arrived while our view was
+// behind the proposer's.
+//
+// ProcessProposal stashes such a proposal instead of rejecting it outright, and
+// this is the other half of that arrangement: the moment our view catches up, the
+// proposal belongs to the current round and has to be handled, or the set never
+// collects the quorum that is waiting on our vote. See
+// Dispatcher.UpdatePrecociousProposals for why nothing else pops the stash.
+//
+// The zero PID is upstream's (pgp-chain/consensus/pbft/pbft.go:1185). It is not a
+// placeholder for an unknown peer: the proposal did not arrive from anyone just
+// now, it was stored earlier, and ProcessProposal only uses the id to tell "this is
+// our own proposal" from "this came from a peer". Zero means neither, which is
+// correct -- we already handled it once.
+func (e *Engine) processPrecociousProposal() {
+	if e.dispatcher == nil || e.account == nil {
+		return
+	}
+	proposal := e.dispatcher.UpdatePrecociousProposals()
+	if proposal == nil {
+		return
+	}
+	log.Info("PBFT: replaying a proposal that arrived ahead of our view",
+		"offset", proposal.ViewOffset, "block", proposal.BlockHash.String())
+	e.OnProposalReceived(dpeer.PID{}, proposal)
+}
+
 // OnRecover asks the set where it is, then adopts the majority answer.
 func (e *Engine) OnRecover() {
 	if e.dispatcher == nil || e.account == nil {
@@ -518,6 +566,69 @@ func (e *Engine) OnRecover() {
 		return
 	}
 	e.recoverAbnormalState()
+}
+
+// StartRecovery is the cold-start kick: wait until enough producers are actually
+// connected, then run the recovery exchange.
+//
+// Without it a freshly started producer never leaves the "waiting for consensus
+// status recovery" state and never produces a block. Nothing else calls
+// OnRecover at startup: its two callers are Network.recover, which fires when the
+// network goes bad after having been good, and OnConfirmReceived, which needs a
+// confirm from a peer -- and a set that has never finalised a height has none to
+// send. The result is a deadlock between "produce" (gated on recovered) and
+// "recover" (gated on a peer event that only happens after someone produces).
+//
+// Upstream has the same kick in finishInitCurrentProducers -> p.Recover()
+// (pgp-chain/consensus/pbft/pbft.go:263-271 and :1010-1045), including the part
+// that matters here: it waits for a peer majority before recovering, because at
+// process start the TCP layer has just been handed its dial list and has not
+// connected anyone yet. recoverAbnormalState refuses to run with fewer peers than
+// a majority (and only logs at Error), so an immediate call would be a no-op.
+//
+// One deliberate difference from upstream: on timeout upstream marks the engine
+// recovered and lets it produce alone (pbft.go:1035-1041). This port keeps
+// waiting and only warns. A producer set of N>1 cannot finalise without a
+// quorum -- legacyMajorityCount of 4 is 2 votes -- so "produce alone" does not
+// make progress, it makes N competing chains, and the bench would then have to
+// explain a fork instead of a stall. A single-producer set never reaches this
+// code: startPBFTNetwork leaves its transport nil and StartMining releases the
+// gate itself.
+func (e *Engine) StartRecovery() {
+	if e.dispatcher == nil || e.account == nil {
+		return
+	}
+	go func() {
+		deadline := time.Now().Add(startupRecoverWait)
+		for {
+			select {
+			case <-e.stopCh:
+				return
+			default:
+			}
+			need := e.minAcceptVoteCount()
+			have := e.activePeerCount()
+			want := need
+			if want < 1 {
+				want = 1
+			}
+			if have >= want && want > 0 && e.IsCurrent() {
+				log.Info("PBFT: producers connected, starting recovery",
+					"peers", have, "need", need)
+				e.OnRecover()
+				return
+			}
+			if time.Now().After(deadline) {
+				// Keep waiting, loudly. See the note above on why this does not
+				// adopt upstream's produce-anyway timeout.
+				log.Warn("PBFT: still waiting for producers before recovery",
+					"peers", have, "need", want,
+					"hint", "check --pbft.net.port reachability and --pbft.net.magic on every producer")
+				deadline = time.Now().Add(startupRecoverWait)
+			}
+			time.Sleep(time.Second)
+		}
+	}()
 }
 
 // OnResponseResetViewReceived tallies reset-view requests and resets once enough
@@ -849,7 +960,7 @@ func (e *Engine) finishRecoverAndApply() {
 	var status *dmsg.ConsensusStatus
 	var medianTime int64
 	if count > 0 {
-		status, medianTime = pickRecoverStatus(e.statusMap)
+		status, medianTime = pickRecoverStatus(e.statusMap, e.dispatcher.GetNowTime().UnixNano())
 	}
 	e.statusMap = make(map[uint32]map[string]*dmsg.ConsensusStatus)
 	e.statusMapMu.Unlock()
@@ -873,9 +984,43 @@ func countStatuses(m map[uint32]map[string]*dmsg.ConsensusStatus) int {
 	return n
 }
 
+// recoverClockSlack is how far ahead of our own clock a peer's view start time
+// may be and still be read as a clock rather than as a placeholder.
+const recoverClockSlack = time.Minute
+
+// usableViewStart reports whether t is a real view clock.
+//
+// A producer that has never opened a view answers a recovery request anyway, and
+// what it answers with is the zero view state: an unset view start time, which
+// serialises to the zero time.Time and decodes on our side as the unix epoch (or
+// as whatever a sub-second median of the two lands on). That value is not a
+// clock coordinate, and treating it as one is not a rounding error: recovery
+// derives viewOffset from (now - start) / signTolerance, so "1970" against 2026
+// is an offset in the hundreds of millions, and each node computes it against its
+// own `now`. Two nodes then differ by one offset and disagree about whose turn it
+// is, which is a set that cannot form a quorum.
+//
+// So the rule is: a start time at or before the epoch, or in the future, is not a
+// view clock and is excluded from the median. Upstream has no such check and does
+// not need one on a chain that has been producing: its members always carry a
+// real view start time. A freshly generated devnet is the case it never sees.
+func usableViewStart(t time.Time, anchor int64) bool {
+	if t.Unix() <= 0 {
+		return false
+	}
+	return t.UnixNano() <= anchor+recoverClockSlack.Nanoseconds()
+}
+
 // pickRecoverStatus returns the status from the highest view offset present and
-// the median start time across that bucket.
-func pickRecoverStatus(m map[uint32]map[string]*dmsg.ConsensusStatus) (*dmsg.ConsensusStatus, int64) {
+// the median start time across that bucket, in unix nanoseconds.
+//
+// When no peer in that bucket reports a usable view clock, the anchor is returned
+// instead of a median. That is the right answer rather than a fallback: if nobody
+// in the set has an open view, there is no view clock to align to, so the set has
+// to start one, and starting it now with a zero offset is what makes every member
+// compute the same duty. Dispatcher.RecoverAbnormal turns an anchor-based
+// medianTime into exactly that -- offset 0, view start anchored at now.
+func pickRecoverStatus(m map[uint32]map[string]*dmsg.ConsensusStatus, anchor int64) (*dmsg.ConsensusStatus, int64) {
 	var maxOffset uint32
 	var seen bool
 	for offset := range m {
@@ -892,7 +1037,15 @@ func pickRecoverStatus(m map[uint32]map[string]*dmsg.ConsensusStatus) (*dmsg.Con
 		if status == nil {
 			status = v
 		}
+		if !usableViewStart(v.ViewStartTime, anchor) {
+			continue
+		}
 		startTimes = append(startTimes, v.ViewStartTime.UnixNano())
+	}
+	if len(startTimes) == 0 {
+		// The bucket has answers but none of them is a view clock, so there is
+		// nothing to align to. Anchor at now: see this function's comment.
+		return status, anchor
 	}
 	sort.Slice(startTimes, func(i, j int) bool { return startTimes[i] < startTimes[j] })
 	return status, medianInt64(startTimes)

@@ -67,6 +67,10 @@ func newDPOSTransport(network dpos.DPOSNetwork, producers func() [][]byte) *dpos
 // (recoverAbnormalState requires activePeerCount >= majority) while the network
 // is perfectly healthy. That failure looks exactly like a consensus stall.
 func (e *Engine) AttachNetwork(network dpos.DPOSNetwork) {
+	e.transportMu.Lock()
+	e.network = network
+	e.transportMu.Unlock()
+
 	e.SetTransport(newDPOSTransport(network, e.currentProducers))
 	e.SetAnnounceAddr(func() { e.AnnounceDAddr() })
 	e.SetPeerCounter(func() int { return len(network.GetActivePeers()) })

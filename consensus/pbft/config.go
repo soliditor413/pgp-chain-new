@@ -16,6 +16,47 @@
 
 package pbft
 
+// Defaults for the two DPoS network settings that have no safe zero value.
+//
+// They are declared here, in the package that consumes them, because they are
+// read from two places that must not drift: the flag defaults in cmd/utils and
+// the fallback in eth.startPBFTNetwork. Two copies of "the default" is how a
+// rig ends up with one node on 3 and another on 300.
+const (
+	// DefaultNetMagic is pgp-chain mainnet's DPoS magic
+	// (pgp-chain/params/config.go:106, Pbft.Magic = 202511).
+	//
+	// Its only job is to be equal on every producer: dpos/p2p/hub.Intercept
+	// compares it against the magic in the incoming version message, and equal
+	// means "this connection belongs to the local DPoS service". A mismatch does
+	// not raise an error -- the connection is instead treated as a sub-service,
+	// fails the state.index lookup in handleInbound, and is closed at Debug
+	// level (dpos/p2p/hub/hub.go:320).
+	//
+	// Zero would technically work just as well as 202511, since it too can be
+	// agreed on. It is rejected as the default because it is indistinguishable
+	// from an uninitialised field: a bug that drops the config entirely then
+	// looks exactly like a deliberate zero, and the symptom is the silent
+	// no-connection above.
+	DefaultNetMagic uint32 = 202511
+
+	// DefaultMaxNodePerHost is pgp-chain mainnet's value
+	// (pgp-chain/params/config.go:107, Pbft.MaxNodePerHost = 300).
+	//
+	// It caps inbound connections per source IP in the DPoS server
+	// (dpos/p2p/server.go:584: hostConnManger[ip] < MaxNodePerHost). Zero is not
+	// "unlimited" -- it rejects every inbound connection and logs it only at
+	// Debug -- so this default has to be non-zero, and it has to be generous
+	// enough for a bench that runs the whole producer set on one host.
+	//
+	// A low cap (3, say) is not a security boundary worth having: a peer that
+	// shares an IP still has to complete the PID handshake to be accepted, so
+	// the cap bounds connection count, not identity. What it does do is fail a
+	// 4-node single-host rig intermittently, when a producer reconnects before
+	// the previous socket is reaped.
+	DefaultMaxNodePerHost uint32 = 300
+)
+
 // Config holds the per-node parameters the engine needs to sign, listen and
 // announce itself.
 //
@@ -80,9 +121,18 @@ type Config struct {
 
 	// Magic is the network magic of the DPoS channel. Every producer must use the
 	// same value; a mismatch is rejected during the peer handshake.
+	//
+	// "Rejected" overstates how visible it is: dpos/p2p/hub.Intercept compares the
+	// magic against the one in the incoming version message and, on a mismatch,
+	// treats the connection as a sub-service rather than refusing it
+	// (dpos/p2p/hub/hub.go:383). The handoff then fails the state.index lookup and
+	// closes the socket, logged at Debug (hub.go:320). Two nodes with different
+	// magics therefore both look healthy and never connect. DefaultNetMagic is
+	// non-zero for exactly this reason.
 	Magic uint32
 
-	// MaxNodePerHost caps how many arbiters may share one IP.
+	// MaxNodePerHost caps how many arbiters may share one IP. Default
+	// DefaultMaxNodePerHost; zero rejects every inbound connection.
 	MaxNodePerHost uint32
 
 	// NodeVersion is exchanged in the DPoS version message.

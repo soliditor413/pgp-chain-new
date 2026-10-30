@@ -156,6 +156,42 @@ func (d *Dispatcher) ProcessProposal(id peer.PID, proposal *payload.DPOSProposal
 	return nil, false, true
 }
 
+// UpdatePrecociousProposals returns a stashed proposal whose view has now become
+// current, so the caller can process it in the round it belongs to.
+//
+// ProcessProposal refuses to mix view offsets -- counting votes across views is how
+// a quorum gets forged -- so a proposal that arrives from a view ahead of ours is
+// not rejected outright: it is stashed in precociousProposals. Nothing took it back
+// out in this port. Upstream pops one on every view change
+// (pgp-chain/consensus/pbft/pbft.go:1182-1186: this call, then OnProposalReceived),
+// and that step is what lets a set whose members are one view apart converge: the
+// laggard stashes the proposal, rotates into its view, replays it and votes, which
+// is the second vote the proposer's quorum was missing.
+//
+// Without it the failure is not a slower round, it is a set that cannot vote. The
+// devnet showed it once Prepare stopped stalling: every proposal was answered with
+// "have different view offset" on three nodes, stashed, and never revisited, so the
+// proposer timed out at height 1 with one vote -- its own -- on every attempt.
+//
+// Status and offset come from one GetViewState call on purpose. Reading IsRunning
+// and GetViewOffset separately can pair a status from one view with an offset from
+// another, and deciding whether those two belong together is this function's whole
+// job. Taking the view snapshot before mu is also what keeps the lock order trivial:
+// mu is never held across a viewMu acquisition here.
+func (d *Dispatcher) UpdatePrecociousProposals() *payload.DPOSProposal {
+	status, offset, _ := d.consensusView.GetViewState()
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	for k, v := range d.precociousProposals {
+		if status == ConsensusRunning && v.ViewOffset == offset {
+			delete(d.precociousProposals, k)
+			return v
+		}
+	}
+	return nil
+}
+
 // GetFinishedHeight returns the highest height a confirm has finalised.
 //
 // It is read from the miner goroutine on every Prepare and Seal, while

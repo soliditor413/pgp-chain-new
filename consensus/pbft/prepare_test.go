@@ -29,9 +29,11 @@ package pbft
 // side effects".
 
 import (
+	"errors"
 	"fmt"
 	"math/big"
 	"testing"
+	"time"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/consensus/pgp"
@@ -215,5 +217,75 @@ func TestPrepareDoesRewriteWhenItAccepts(t *testing.T) {
 	}
 	if diff := before.diff(header); diff == "" {
 		t.Fatal("the header is unchanged after an accepted Prepare, so the side-effect check above proves nothing")
+	}
+}
+
+// TestPrepareRefusesAHeightThatIsNotThisProducersTurn is the gate whose absence
+// stalled the devnet at height 1.
+//
+// Sequence it prevents, observed on all four bench nodes:
+//
+//	Prepare    passes every other gate, marks the view Running, hands back a header
+//	commitWork builds an empty block for it
+//	Seal       returns ErrSignerNotOnduty, before finishRound/resetRound
+//	Prepare    now answers ErrConsensusIsRunning at every height, forever
+//
+// Nothing clears the Running mark without an imported block (FinishedProposal and
+// ResetConsensus both need one, and ResetConsensus only fires for a block that
+// arrives), so the height is lost permanently and no block can arrive. Gating in
+// Prepare keeps a round from being opened for work this node cannot seal.
+func TestPrepareRefusesAHeightThatIsNotThisProducersTurn(t *testing.T) {
+	accounts, producerKeys := newProducerSet(t, 4)
+	chain := &sealTestChain{genesis: &types.Header{
+		Number:     big.NewInt(0),
+		Time:       uint64(time.Now().Add(-100 * time.Second).Unix()),
+		Difficulty: new(big.Int).Set(diffInTurn),
+		UncleHash:  types.CalcUncleHash(nil),
+	}}
+
+	newEngine := func(t *testing.T, account int) *Engine {
+		t.Helper()
+		engine := New(&params.LegacyConfig{VerifySeal: true, Producers: producerKeys}, &Config{Enable: true})
+		engine.attachAccount(accounts[account])
+		engine.MarkRecovered()
+		engine.AttachChain(chain)
+		t.Cleanup(func() { _ = engine.Close() })
+		return engine
+	}
+
+	// Control: block 1 belongs to producer 0 (duty index (1-1) % 4 = 0), which is
+	// why the on-duty arm must still be accepted. Without this half, a Prepare that
+	// refused everything would pass the test below.
+	onDuty := newEngine(t, 0)
+	header := newPrepareTestHeader()
+	header.ParentHash = chain.genesis.Hash()
+	if err := onDuty.Prepare(chain, header); err != nil {
+		t.Fatalf("Prepare refused the producer whose turn it is: %v", err)
+	}
+	if !onDuty.IsOnduty() {
+		t.Fatal("producer 0 is not on duty for block 1; the duty schedule changed")
+	}
+
+	offDuty := newEngine(t, 1)
+	header = newPrepareTestHeader()
+	header.ParentHash = chain.genesis.Hash()
+	err := offDuty.Prepare(chain, header)
+	if !errors.Is(err, ErrSignerNotOnduty) {
+		t.Fatalf("Prepare returned %v for producer 1 at block 1, want ErrSignerNotOnduty", err)
+	}
+	// The miner logs this class at debug and pages nobody: a peer's turn is not a
+	// fault. If this stops holding, every non-producing height becomes an ERROR on
+	// three quarters of the set.
+	if !IsBenignPrepareError(err) {
+		t.Fatalf("%v is not classified as benign, so the miner will log it as a fault", err)
+	}
+	// The view stays Running on purpose. That is upstream's order (Start runs before
+	// the duty check), and it is what keeps the view loop alive so the turn can
+	// rotate: the escape is OnViewChanged -> SetReady, covered in
+	// onviewchanged_test.go. Pinning it here documents which of the two behaviours
+	// changed, so a future "cleanup" that moves the gate above startView is a test
+	// failure and not a silent stall.
+	if !offDuty.dispatcher.GetConsensusView().IsRunning() {
+		t.Fatal("the duty gate left the view not running, so nothing rotates the turn")
 	}
 }

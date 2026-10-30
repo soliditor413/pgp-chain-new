@@ -30,6 +30,7 @@ import (
 	"github.com/elastos/Elastos.ELA/events"
 	elamsgp2pmsg "github.com/elastos/Elastos.ELA/p2p/msg"
 
+	"github.com/ethereum/go-ethereum/consensus/pbft"
 	"github.com/ethereum/go-ethereum/dpos"
 	"github.com/ethereum/go-ethereum/dpos/elamsg"
 	"github.com/ethereum/go-ethereum/eth/protocols/eth64"
@@ -38,10 +39,9 @@ import (
 	"github.com/ethereum/go-ethereum/spv"
 )
 
-// defaultMaxNodePerHost is pgp-chain's cap: a producer set is expected to span
-// hosts, and three per host is enough for a dev rig without letting one machine
-// impersonate a majority.
-const defaultMaxNodePerHost = 3
+// defaultMaxNodePerHost and the default magic live in consensus/pbft so the flag
+// defaults and this fallback cannot disagree. See pbft.DefaultMaxNodePerHost for
+// why the value is upstream's 300 and why zero is not "unlimited".
 
 // startPBFTNetwork builds and starts the DPoS network for a producing node.
 //
@@ -102,7 +102,14 @@ func (s *Ethereum) startPBFTNetwork() error {
 	// rejects every peer -- and logs it at Debug, which is why a rig configured
 	// from a file rather than flags would look like a firewall problem.
 	if cfg.MaxNodePerHost == 0 {
-		cfg.MaxNodePerHost = defaultMaxNodePerHost
+		cfg.MaxNodePerHost = pbft.DefaultMaxNodePerHost
+	}
+	// Same reasoning as MaxNodePerHost, different failure: a zero magic is not
+	// rejected by the handshake, it makes every connection look like a
+	// sub-service and get closed at Debug (dpos/p2p/hub/hub.go:320). See
+	// pbft.DefaultNetMagic.
+	if cfg.Magic == 0 {
+		cfg.Magic = pbft.DefaultNetMagic
 	}
 	// The version string is echoed in the DPoS handshake and shows up in peer
 	// dumps; a blank one makes an operator unable to tell nodes apart.
@@ -120,6 +127,12 @@ func (s *Ethereum) startPBFTNetwork() error {
 	}
 
 	publicKey := account.PublicKeyBytes()
+
+	// Before the network is built, because the packages this turns on are
+	// process-global and their default is silence. Without it the DPoS TCP layer
+	// reports a refused peer, a magic mismatch or a per-host cap only into a
+	// disabled logger -- see dpos/p2plog.go.
+	dpos.InitP2PLog()
 
 	network, err := dpos.NewNetwork(&dpos.NetworkConfig{
 		IPAddress:      cfg.IPAddress,
@@ -198,8 +211,52 @@ func (s *Ethereum) startPBFTNetwork() error {
 	go routes.Start()
 	network.Start()
 
+	// Hand the announced peer set to the TCP server. Without this subscriber the
+	// announcement reaches dpos.Routes (which builds DAddr records) but nothing
+	// ever calls Network.UpdatePeers, so ConnectPeers never runs and no DPoS
+	// connection is attempted. See pbft.WatchPeerSet.
+	engine.WatchPeerSet()
+
+	// Announce the connect set once, now that the routes and the TCP server are
+	// running.
+	//
+	// Upstream does this at the end of finishInitCurrentProducers
+	// (pgp-chain/consensus/pbft/network.go:263-271), i.e. as soon as the producer
+	// set is known. This port reads the set from Legacy.Producers, so it is known
+	// before the network even exists, and this is the equivalent moment.
+	//
+	// Skipping it is not a slow start, it is a deadlock, and a silent one. Nothing
+	// else calls Network.ConnectPeers on a quiet chain: the engine's other
+	// announce call site is OnBlockReceived's recovery branch
+	// (consensus/pbft/network_listener.go:588), which needs a block from a peer,
+	// and there are no peers precisely because nobody announced. A fresh N-node
+	// bench therefore sits at height 0 forever while every node logs a healthy
+	// startup.
+	//
+	// It is also what makes the pre-seeded address database work: ConnectPeers
+	// only asks addrManager for a dial target, and does not care whether that
+	// address arrived over ELAMSG or was in peers.json at startup.
+	if !engine.AnnounceDAddr() {
+		log.Warn("PBFT: could not announce the producer connect set", "producers", len(chainCfg.Legacy.Producers))
+	}
+
+	// And kick the cold-start recovery, which is what actually releases the
+	// engine's production gate. Without it every producer sits at
+	// "waiting for consensus status recovery" forever: the announce above gets
+	// the TCP connections up, but nothing calls OnRecover until a peer sends a
+	// confirm, and a set that has never finalised a height has none to send.
+	// See pbft.Engine.StartRecovery.
+	engine.StartRecovery()
+
+	// The magic and the per-host cap are printed on purpose. Both fail silently
+	// when they disagree or when they are zero -- a mismatched magic closes every
+	// connection at Debug level, and a zero cap rejects every inbound peer -- so
+	// the one line an operator can actually compare across nodes is this one.
 	log.Info("DPoS network started",
 		"listen", fmt.Sprintf("%s:%d", cfg.IPAddress, cfg.Port),
+		"magic", cfg.Magic,
+		"maxNodePerHost", cfg.MaxNodePerHost,
+		"pid", peer.PID(publicKey).String(),
 		"producers", len(chainCfg.Legacy.Producers),
 		"dataDir", cfg.DataDir)
 	return nil

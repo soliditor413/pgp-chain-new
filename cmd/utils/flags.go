@@ -40,6 +40,7 @@ import (
 	bparams "github.com/ethereum/go-ethereum/beacon/params"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/fdlimit"
+	"github.com/ethereum/go-ethereum/consensus/pbft"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/rawdb"
 	"github.com/ethereum/go-ethereum/core/txpool/blobpool"
@@ -258,20 +259,25 @@ var (
 	// A chain property in pgp-chain (params.PbftConfig.Magic), and it has to be
 	// the same on every producer. Exposed here because this tree has no per-network
 	// PbftConfig to read it from yet.
+	//
+	// The default is pgp-chain mainnet's magic rather than 0: see
+	// pbft.DefaultNetMagic for why zero makes a dropped config indistinguishable
+	// from a configured one.
 	PbftNetMagicFlag = &cli.Uint64Flag{
 		Name:     "pbft.net.magic",
 		Usage:    "DPoS network magic; must be identical on every producer",
 		Category: flags.EthCategory,
-		Value:    0,
+		Value:    uint64(pbft.DefaultNetMagic),
 	}
 	// Caps how many producers may share one IP. The DPoS server refuses the
-	// (n+1)-th connection from the same host, which is what stops a single
-	// machine from filling a producer set on a shared rig.
+	// (n+1)-th connection from the same host. See pbft.DefaultMaxNodePerHost for
+	// why the default is upstream's 300 and not something tight enough to break a
+	// single-host bench.
 	PbftMaxNodePerHostFlag = &cli.UintFlag{
 		Name:     "pbft.net.maxnodeperhost",
 		Usage:    "Maximum number of producers allowed to share one IP address",
 		Category: flags.EthCategory,
-		Value:    3,
+		Value:    uint(pbft.DefaultMaxNodePerHost),
 	}
 	ChapelFlag = &cli.BoolFlag{
 		Name:     "chapel",
@@ -2290,8 +2296,11 @@ func setPbft(ctx *cli.Context, cfg *ethconfig.Config) {
 	if cfg.Pbft.Port == 0 {
 		cfg.Pbft.Port = uint16(PbftNetPortFlag.Value)
 	}
+	if cfg.Pbft.Magic == 0 {
+		cfg.Pbft.Magic = pbft.DefaultNetMagic
+	}
 	if cfg.Pbft.MaxNodePerHost == 0 {
-		cfg.Pbft.MaxNodePerHost = uint32(PbftMaxNodePerHostFlag.Value)
+		cfg.Pbft.MaxNodePerHost = pbft.DefaultMaxNodePerHost
 	}
 }
 

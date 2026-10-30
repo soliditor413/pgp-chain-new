@@ -118,21 +118,60 @@ func (e *Engine) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 	if head != nil && head.Number != nil {
 		headHeight = head.Number.Uint64()
 	}
-	e.startView(parent.Time, headHeight)
 
+	// Decide the round's clock anchor before opening the view, not after.
+	//
+	// The two orders differ by a window that is not theoretical. Opening the view
+	// on parent.Time first and re-anchoring afterwards leaves the view pointing at
+	// a parent that can be years old (a fresh chain's genesis, a node that was
+	// offline) while the view loop is already running: its first tick sees
+	// changeViewTime long past, calls ChangeView, and ChangeView counts the views
+	// in between -- (now - parent.Time) / signTolerance, which on a cold start is
+	// tens of millions of offsets and pushes duty onto a producer the rest of the
+	// set disagrees with. Anchoring once, correctly, removes the window instead of
+	// racing it.
 	header.Time = parent.Time + e.period
+	anchorTime := parent.Time
 	if header.Time < nowTime {
-		// We are late: the parent is older than one period ago. Re-anchor the view
-		// on the current time so the round's deadline is measured from now, and
-		// stamp the block with the current time so it is not born stale.
+		// We are late: the parent is older than one period ago. Stamp the block
+		// with the current time so it is not born stale, and anchor the round on it
+		// too so the deadline is measured from now.
 		header.Time = nowTime
-		e.dispatcher.ResetView(nowTime)
+		anchorTime = nowTime
+	}
+	e.startView(anchorTime, headHeight)
+
+	// Whose turn it is decides whether this header may be sealed at all, and only
+	// now is the answer final: startView recomputes the duty index from the head
+	// height for this very round, and StartRecovery may have left a recovered view
+	// offset behind. Upstream has this gate at exactly this point, after Start and
+	// after the timestamp is settled (pgp-chain/consensus/pbft/pbft.go:1105-1107).
+	//
+	// Without it a producer whose turn it is not still opens a round -- the view
+	// is marked Running a few lines above -- and then Seal refuses with
+	// ErrSignerNotOnduty, which returns before finishRound/resetRound. The view
+	// then stays Running with no round behind it, and every later Prepare answers
+	// ErrConsensusIsRunning: the height is lost until some block is imported, and
+	// no block can be imported because nobody can produce. The devnet sat in
+	// exactly that state at height 1, for 45 seconds, on all four producers.
+	//
+	// The error is benign by classification (IsBenignPrepareError), because a
+	// peer's turn is not a fault: the arm that recovers is OnViewChanged, which
+	// clears the Running mark once the view rotates to this node.
+	if !e.IsOnduty() {
+		return ErrSignerNotOnduty
 	}
 	return nil
 }
 
-// startView opens a round: align the view clock with the parent's timestamp,
+// startView opens a round: align the view clock with the round's anchor time
+// (the parent's timestamp, or now when the parent is more than one period old),
 // recompute whose turn it is, and mark consensus running.
+//
+// The anchor is a parameter rather than read from the chain here because it has
+// to be the same instant the header was stamped with. A view clock anchored to a
+// parent the header does not use is a deadline for a round that never started --
+// see the call site.
 //
 // The view loop that drives view changes is started once, on the first round, and
 // no-ops until the view is running. That is deliberately different from

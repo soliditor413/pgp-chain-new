@@ -206,6 +206,7 @@ func TestSealHonoursStopDuringPreDelay(t *testing.T) {
 		Number:      big.NewInt(1),
 		GasLimit:    30_000_000,
 	}
+	releaseAfterFailedRound(engine)
 	if err := engine.Prepare(chain, retry); err != nil {
 		t.Fatalf("Prepare after a pre-delay-interrupted round: %v", err)
 	}

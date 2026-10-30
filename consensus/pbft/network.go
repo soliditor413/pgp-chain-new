@@ -32,6 +32,8 @@ package pbft
 // T7.
 
 import (
+	"fmt"
+
 	"github.com/elastos/Elastos.ELA/dpos/dtime"
 	dpeer "github.com/elastos/Elastos.ELA/dpos/p2p/peer"
 	"github.com/elastos/Elastos.ELA/events"
@@ -68,6 +70,44 @@ func (e *Engine) AnnounceDAddr() bool {
 		NextPeers:    next,
 	})
 	return true
+}
+
+// WatchPeerSet forwards the announced peer set to the DPoS TCP server.
+//
+// This is the second half of AnnounceDAddr, and without it the whole address
+// machinery is inert. Upstream does the same forwarding from its own subscriber
+// (pgp-chain/consensus/pbft/pbft.go:277-283): ETDirectPeersChanged carries PIDs,
+// dpos.Routes consumes it to build DAddr records, and someone has to hand the
+// same PIDs to Network.UpdatePeers so the TCP server knows whom to dial. In this
+// tree that someone was missing -- UpdatePeers was implemented and never called
+// -- so a four-node bench announced its peer set, logged
+// "received ETDirectPeersChanged", and never opened a single DPoS connection.
+//
+// The forwarding runs on its own goroutine because events.Notify holds the bus
+// lock while calling subscribers, and UpdatePeers blocks on the server's query
+// channel: doing it inline would stall every other subscriber, including the
+// ones that deliver blocks.
+//
+// It is a method rather than a constructor side effect so a test (or a
+// single-node rig with no network) never installs a subscriber it cannot remove.
+func (e *Engine) WatchPeerSet() {
+	events.Subscribe(func(ev *events.Event) {
+		if ev.Type != dpos.ETDirectPeersChanged {
+			return
+		}
+		info, ok := ev.Data.(*dpeer.PeersInfo)
+		if !ok {
+			log.Warn("WatchPeerSet: unexpected payload", "type", fmt.Sprintf("%T", ev.Data))
+			return
+		}
+		e.transportMu.RLock()
+		n := e.network
+		e.transportMu.RUnlock()
+		if n == nil {
+			return
+		}
+		go n.UpdatePeers(info.CurrentPeers, info.NextPeers)
+	})
 }
 
 // GetTimeSource is the median time source the engine already shares with its

@@ -136,6 +136,11 @@ type Engine struct {
 	// the single-node acceptance run. See transport.go.
 	transportMu sync.RWMutex
 	transport   Transport
+	// network is the same object as a dpos.DPOSNetwork, kept alongside the
+	// transport because ConnectPeers is not part of the Transport interface:
+	// Transport carries DPoS messages, while UpdatePeers tells the TCP server
+	// whom to dial. See WatchPeerSet.
+	network dpos.DPOSNetwork
 
 	// recovered is false between Start and the completion of the consensus
 	// status exchange, during which production would race a peer that already
@@ -486,12 +491,56 @@ func (e *Engine) SpvHeightAt(height uint64) uint64 {
 // set, i.e. the one that applies to blocks whose header.Nonce is zero.
 func (e *Engine) Producers() []string { return e.legacy.Producers }
 
-// OnViewChanged implements dpos.ViewListener. When this node becomes the
-// proposer, the miner is poked so it rebuilds work for the new view instead of
-// waiting for the next block interval.
+// OnViewChanged implements dpos.ViewListener: a view change just happened and
+// this hook decides whether the node may now build a block.
+//
+// The SetReady below is not bookkeeping -- it is the only way back to "may
+// prepare" without a round having finished, and without it the set deadlocks on
+// the first height. Prepare marks the view Running on every producer that asks
+// (it has to: the view loop that times out a stalled round only exists once a
+// round is open), and Prepare refuses to start a second round while one is
+// Running. A round that ends without a block -- because it was someone else's
+// turn, because the proposal was rejected, because the view timed out -- leaves
+// that mark behind, so the next turn would be refused by a mark nobody clears.
+// FinishedProposal and ResetConsensus do clear it, but both need an imported
+// block, and importing a block is what production is for. So the rotation itself
+// has to clear it, which is exactly what upstream does here
+// (pgp-chain/consensus/pbft/pbft.go:1182-1197).
+//
+// CleanProposals(true) rides along and is not decoration: every vote collected
+// during the view that just ended belongs to a view offset that no longer exists
+// and must not be counted in the new one. This is also the first caller in the
+// tree to pass true, the branch dpos.Dispatcher.CleanProposals documents as
+// ported-but-not-wired until the view-change path landed.
+//
+// Forced resets are excluded, and that is not an oversight: force is used by
+// Dispatcher.FinishedProposal and Dispatcher.ResetConsensus, both of which have
+// already called SetReady and rebuilt the view from a real block. Clearing the
+// Running mark a second time there would let the miner prepare a second round on
+// top of a height that just became final.
 func (e *Engine) OnViewChanged(isOnDuty bool, force bool) {
 	log.Debug("PBFT view changed", "onDuty", isOnDuty, "force", force)
-	if isOnDuty && e.StartMine != nil {
+	if e.dispatcher == nil {
+		return
+	}
+	// Replay before cleaning, which is upstream's order (pbft.go:1182-1197). A
+	// proposal that was ahead of our view is now current, and it is the second vote
+	// a proposer one view ahead of us is waiting for. Cleaning first would be
+	// harmless -- CleanProposals(true) only drops proposals from lower offsets --
+	// but the order is kept so a future reader comparing the two files sees the
+	// same three steps in the same sequence.
+	e.processPrecociousProposal()
+	if force {
+		return
+	}
+	e.dispatcher.CleanProposals(true)
+	if !isOnDuty || !e.IsCurrent() {
+		// Our turn has not come yet, or the chain is still catching up: the view
+		// stays Running and the next rotation will ask again.
+		return
+	}
+	e.dispatcher.GetConsensusView().SetReady()
+	if e.StartMine != nil {
 		e.StartMine()
 	}
 }
