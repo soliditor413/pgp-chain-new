@@ -17,7 +17,7 @@ func newProgressTestSyncer(t *testing.T, head uint64) (*chainSyncer, *fakeChain)
 	t.Helper()
 
 	chain := &fakeChain{head: &types.Header{Number: new(big.Int).SetUint64(head)}}
-	h := newHandler(fakeBackend{chain: chain}, 860621)
+	h := newHandler(fakeBackend{chain: chain}, 860621, nil)
 	// newHandler leaves syncer nil (only start() sets it, and start() also
 	// launches the loop). Progress treats a nil syncer as "not running yet", so
 	// it has to be set explicitly for these tests to exercise the bookkeeping.

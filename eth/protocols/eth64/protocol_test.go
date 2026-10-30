@@ -230,7 +230,7 @@ func TestBodyDecodesPGPShape(t *testing.T) {
 // the syncer, and Reset must be able to release it (that is the entry point for
 // a future rule that makes the block executable).
 func TestSyncerBoundaryLatch(t *testing.T) {
-	h := newHandler(nil, 860621)
+	h := newHandler(nil, 860621, nil)
 	defer h.Close()
 	s := newChainSyncer(h)
 
@@ -287,7 +287,7 @@ func TestSyncerDoesNotLatchOnShutdown(t *testing.T) {
 	}
 
 	// Case 1: shutdown sentinel, handler still open.
-	h := newHandler(nil, 860621)
+	h := newHandler(nil, 860621, nil)
 	s := newChainSyncer(h)
 	s.stopAtBoundary(peer, 1923, header, fmt.Errorf("block %d: %w", 1923, core.ErrChainStopped))
 	if s.blocked.Load() {
@@ -315,7 +315,7 @@ func TestDispatchDiscardsUnknownCode(t *testing.T) {
 	defer local.Close()
 
 	peer := NewPeer(ETH64, "test-peer", local)
-	h := newHandler(nil, 860621)
+	h := newHandler(nil, 860621, nil)
 	defer h.Close()
 
 	done := make(chan error, 1)
@@ -354,7 +354,7 @@ func TestDispatchRejectsOversizedMessage(t *testing.T) {
 	defer local.Close()
 
 	peer := NewPeer(ETH64, "test-peer", local)
-	h := newHandler(nil, 860621)
+	h := newHandler(nil, 860621, nil)
 	defer h.Close()
 
 	done := make(chan error, 1)
@@ -553,7 +553,7 @@ func TestSyncerInsertOutcomes(t *testing.T) {
 
 			go servePeer(peer, remote, chain.byNumber)
 
-			h := newHandler(fakeBackend{chain: chain}, 860621)
+			h := newHandler(fakeBackend{chain: chain}, 860621, nil)
 			defer h.Close()
 			s := newChainSyncer(h)
 			s.syncToHead(peer)
@@ -581,7 +581,7 @@ func TestSyncerInsertOutcomes(t *testing.T) {
 // chain from 0 reaches hours after start-up. A permanent latch turned that into
 // "restart the node by hand" — observed in the field.
 func TestSyncerRefusalCooldown(t *testing.T) {
-	h := newHandler(nil, 860621)
+	h := newHandler(nil, 860621, nil)
 	defer h.Close()
 	s := newChainSyncer(h)
 	now := time.Now()
@@ -619,7 +619,7 @@ func TestSyncerRefusalCooldown(t *testing.T) {
 // future call site that forgets stopAtBoundary would reintroduce the 10 second
 // retry loop this latch was added to stop.
 func TestSyncerLatchWithoutRetryTimeStaysParked(t *testing.T) {
-	h := newHandler(nil, 860621)
+	h := newHandler(nil, 860621, nil)
 	defer h.Close()
 	s := newChainSyncer(h)
 

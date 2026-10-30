@@ -12,6 +12,7 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/lru"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/dpos/elamsg"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p"
 )
@@ -252,6 +253,26 @@ func (p *Peer) deliverBodies(bodies []*types.Body) {
 func (p *Peer) Close() {
 	p.closeOnce.Do(func() { close(p.closed) })
 }
+
+// SendELAMessage sends one DPoS address-routing envelope.
+//
+// Together with the embedded rw this makes *Peer satisfy dpos.IPeer, which is
+// the interface dpos.Routes routes DAddr replies through. It is deliberately the
+// only DPoS method on the peer: everything else DPoS needs goes over its own TCP
+// server, not over devp2p.
+func (p *Peer) SendELAMessage(msg *elamsg.ElaMsg) {
+	if err := p.send(ELAMSG, msg); err != nil {
+		p.Log().Debug("Cannot send ELAMSG", "err", err)
+	}
+}
+
+// Disconnect is the dpos.IPeer side of Close.
+//
+// dpos.IPeer requires Disconnect() because Elastos' peer interface calls it when
+// a record looks forged. Mapping it onto Close is correct here: the p2p layer owns
+// the actual socket and tears it down when Run returns, so all this side can
+// legitimately do is mark the peer unusable.
+func (p *Peer) Disconnect() { p.Close() }
 
 // peerSet is a thread safe collection of eth/64 peers. Peers are selected for
 // sync by total difficulty.

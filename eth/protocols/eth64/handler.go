@@ -12,6 +12,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/types"
+	"github.com/ethereum/go-ethereum/dpos/elamsg"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/p2p"
 	"github.com/ethereum/go-ethereum/p2p/enode"
@@ -48,11 +49,47 @@ type Backend interface {
 	Chain() ChainReader
 }
 
+// DPOSHooks is what eth/64 must hand to the layers above it: the two peer
+// lifecycle edges and the ELAMSG envelope.
+//
+// It exists so that this package does NOT import dpos. The ELAMSG type lives in
+// dpos/elamsg precisely to keep the Elastos DPoS p2p stack out of the protocol
+// layer (see that package's doc comment), but the DPoS EVENT TYPES
+// (dpos.ETNewPeer and friends) live in dpos, and notifying with a look-alike
+// number is not an option: Elastos.ELA/events has an ETDirectPeersChanged of its
+// own on a different numbering space, so a hardcoded literal here would deliver
+// to nobody and the only symptom would be producers that never peer.
+//
+// So the translation lives one layer up, in eth/handler_eth64.go, which may
+// import dpos freely.
+//
+// A nil hooks value is legal and means "this node does not run DPoS": a BSC or
+// Rialto chain registers eth/64 only for legacy history and has no producer set.
+type DPOSHooks interface {
+	// PeerUp is called once per connection after the handshake and peer
+	// registration succeed, i.e. when the peer is usable.
+	PeerUp(peer *Peer)
+
+	// PeerDown is called when a registered peer goes away, on every exit path.
+	//
+	// It is called from the connection's own goroutine while that goroutine is
+	// unwinding, so an implementation that blocks delays the teardown. The eth
+	// layer dispatches it to a new goroutine for that reason.
+	PeerDown(peer *Peer)
+
+	// ElaMsg is called with a decoded ELAMSG payload.
+	//
+	// The peer is passed because a DAddr reply goes back to the peer that asked;
+	// the ELAMSG envelope carries no sender.
+	ElaMsg(peer *Peer, msg *elamsg.ElaMsg)
+}
+
 // handler owns the eth/64 peer set and the single sync loop.
 type handler struct {
 	backend Backend
 	network uint64
 	peers   *peerSet
+	hooks   DPOSHooks
 
 	closeCh   chan struct{}
 	closeOnce sync.Once
@@ -60,11 +97,12 @@ type handler struct {
 	syncer    *chainSyncer
 }
 
-func newHandler(backend Backend, network uint64) *handler {
+func newHandler(backend Backend, network uint64, hooks DPOSHooks) *handler {
 	return &handler{
 		backend: backend,
 		network: network,
 		peers:   newPeerSet(),
+		hooks:   hooks,
 		closeCh: make(chan struct{}),
 	}
 }
@@ -73,8 +111,8 @@ func newHandler(backend Backend, network uint64) *handler {
 //
 // The handler (peer set + syncer) is created once and shared by every peer, so
 // BestPeer sees all of them.
-func MakeProtocols(backend Backend, network uint64) []p2p.Protocol {
-	h := newHandler(backend, network)
+func MakeProtocols(backend Backend, network uint64, hooks DPOSHooks) []p2p.Protocol {
+	h := newHandler(backend, network, hooks)
 	h.start()
 	// Publish this handler so eth_syncing can ask the syncer how far behind it
 	// is. The eth package already imports this one (eth/handler_eth64.go), so
@@ -128,6 +166,13 @@ func (h *handler) run(p2pPeer *p2p.Peer, rw p2p.MsgReadWriter) error {
 	defer func() {
 		peer.Close()
 		if registered {
+			// PeerDown before Unregister, and outside the peer-set lock, so the
+			// subscriber sees a peer that is still in the set: dpos.Routes keys
+			// its per-peer request cache by the peer object and has to be able
+			// to find and drop that entry.
+			if h.hooks != nil {
+				h.hooks.PeerDown(peer)
+			}
 			if err := h.peers.Unregister(peer.ID()); err != nil {
 				peer.Log().Debug("Failed to unregister peer", "err", err)
 			}
@@ -143,6 +188,9 @@ func (h *handler) run(p2pPeer *p2p.Peer, rw p2p.MsgReadWriter) error {
 		return err
 	}
 	registered = true
+	if h.hooks != nil {
+		h.hooks.PeerUp(peer)
+	}
 	// Nudge the syncer so a fresh peer is used immediately.
 	h.syncer.trigger()
 
@@ -195,10 +243,32 @@ func (h *handler) dispatch(peer *Peer) error {
 		case NewBlockMsg:
 			h.handleNewBlock(peer, msg)
 
+		case ELAMSG:
+			// 0x08 is the DPoS address-routing channel on a pgp-chain connection.
+			// It carries peer.PID to IP:port mappings -- nothing else -- and the
+			// independent DPoS TCP server (:20338) is what actually exchanges
+			// consensus messages. See docs/design/m4-network-layer-breakdown.md.
+			//
+			// An undecodable payload is dropped rather than returned as an error,
+			// which is a deliberate deviation from pgp-chain (eth/handler.go:750
+			// returns ErrDecode). Not killing the connection is the property
+			// TestDispatchKeepsTheConnectionOnABadELAMSG pins, and it costs
+			// nothing: the routing layer simply never learns that address.
+			hooks := h.hooks
+			if hooks == nil {
+				msg.Discard()
+				break
+			}
+			elaMsg := new(elamsg.ElaMsg)
+			if err := msg.Decode(&elaMsg); err != nil {
+				peer.Log().Debug("Discarding undecodable ELAMSG", "err", err)
+				break
+			}
+			hooks.ElaMsg(peer, elaMsg)
+
 		default:
-			// 0x08 is ELAMSG on pgp-chain (dpos traffic) and would be
-			// NewPooledTransactionHashes on eth/68. Never return an error here:
-			// one dpos broadcast must not kill the connection.
+			// Never return an error here: one dpos broadcast must not kill the
+			// connection.
 			discardedMeter.Mark(1)
 			peer.Log().Trace("Discarding unsupported eth64 message", "code", msg.Code, "size", msg.Size)
 			if err := msg.Discard(); err != nil {
@@ -217,6 +287,41 @@ func (h *handler) dispatch(peer *Peer) error {
 // is at most one such handler per process - MakeProtocols is called once, from
 // Ethereum.Protocols - so "the current one" is exactly the right model.
 var currentHandler atomic.Pointer[handler]
+
+// BroadcastElaMsg relays one DPoS address envelope to every connected eth/64
+// peer. It is the outbound half of the DAddr channel: dpos.Routes asks for it
+// through its RelayAddr hook when it has an Inv to gossip.
+//
+// Telling everyone is correct here, unlike for consensus traffic. An address
+// record is public by construction -- it is the IP:port a producer wants the
+// world to dial -- and the point of the Inv is to reach peers this node is not
+// (yet) peered with on the DPoS side, which is exactly the set a producer-only
+// unicast would miss.
+//
+// No-op before MakeProtocols has run, which is the shape of a node whose chain
+// does not carry legacy history.
+func BroadcastElaMsg(msg *elamsg.ElaMsg) {
+	h := currentHandler.Load()
+	if h == nil || msg == nil {
+		return
+	}
+	for _, peer := range h.peers.Peers() {
+		peer.SendELAMessage(msg)
+	}
+}
+
+// PeerCount is the number of established eth/64 peers.
+//
+// It is exported for the DPoS node's peer counter: dpos.Routes only gossips to
+// peers in its cache, and the cache is filled by PeerUp, so this is also a
+// reasonable "is the devp2p side alive" probe for a status endpoint.
+func PeerCount() int {
+	h := currentHandler.Load()
+	if h == nil {
+		return 0
+	}
+	return h.peers.Len()
+}
 
 // SyncProgress is how far behind the eth/64 peer set the chain is.
 type SyncProgress struct {
