@@ -96,6 +96,11 @@ type Engine struct {
 	chainMu sync.RWMutex
 	chain   consensus.ChainHeaderReader
 
+	// isCurrent is the "chain caught up" probe dpos.Routes gates announcing on.
+	// Guarded by chainMu because it is installed by the assembly layer after the
+	// downloader exists, which is after the engine is already serving.
+	isCurrent func() bool
+
 	// confirmCh and unConfirmCh carry the round result from the dispatcher's
 	// callback (called from the vote path, possibly a network goroutine) to
 	// Seal, which blocks waiting for it.

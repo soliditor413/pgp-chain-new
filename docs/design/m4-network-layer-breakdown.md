@@ -569,3 +569,83 @@ elacom "github.com/elastos/Elastos.ELA/common"  // 别名
 ### 10.6 与原计划的一处偏差
 
 原文把「`blockPool.GetBlock` 返回的 DBlock 需要一层适配」列为待办，实际不需要新代码：`legacy.go` 的 `dBlock` 就是那层适配，`OnGetBlock` 只需 `block.(*dBlock)` 再取 `.Block`。真正需要新写的是 `blockReader` / `blockInserter` 两个接口 —— 因为链那一侧（`*core.BlockChain`）还没有任何东西包过它。
+
+---
+
+## 十一、实施记录：T7 引擎侧（已交付）＋ 一个前置缺口（未解决）
+
+### 11.1 T7 拆成了两半
+
+T7 原文是"四处接线"。实际做下来，其中三处是**引擎侧**、不依赖任何 eth 层决策，已经做完；第四处（`routeCfg` 的 `RelayAddr`）卡在一个 T7 原文没提到的前置缺口上。
+
+已交付（本节）：
+
+| 文件 | 内容 |
+|---|---|
+| `consensus/pbft/dpos_transport.go` | `dposTransport`（8 方法全部落地）+ `Engine.AttachNetwork` 一次装配三个钩子 |
+| `consensus/pbft/network.go` | `AnnounceDAddr` / `GetTimeSource` / `SetIsCurrent` / `IsCurrent` |
+| `consensus/pbft/transport.go` | `BroadcastConfirm` 增加 `height` 参数 |
+| `consensus/pbft/engine.go` | `isCurrent func() bool` 字段 |
+| `consensus/pbft/dpos_transport_test.go` | 7 条测试 |
+
+### 11.2 一个必须纠正的实现细节：broadcast 不是 network 广播
+
+上游 `Pbft.BroadMessage` **不是** `network.BroadcastMessage`，而是遍历 `GetCurrentProducers()` 逐个 `SendMessageToPeer`。
+
+这不是风格差异。`dpos.Network.UpdatePeers` 把 **current + next 两批** PID 都交给 `p2pServer.ConnectPeers`，所以"已连接的 peer"⊋"当前生产者"。用 network 级广播会把投票发给下一轮才上任的节点，甚至发给不在集合里的连接——既浪费也可能泄露投票收集状态。
+
+`dposTransport` 因此每次都遍历 `dispatcher.GetConsensusView().GetProducers()`（而不是构造时捕获的 `e.producers`，否则跨 epoch 会把消息发给上一届）。
+
+测试手法：`stubDPOSNetwork.BroadcastMessage` **直接 panic**。一旦有人把实现改成 network 广播，测试立刻炸而不是静默通过。
+
+### 11.3 `BroadcastConfirm` 为什么要加 `height` 参数
+
+`payload.Confirm` 里**没有高度字段**（它靠 seal hash 提交到一个区块），而线上 `ConfirmMsg` 是 `(confirm, height)` 两段。上游 `broadConfirmMsg(confirm, height)` 也是显式传的——实际上上游那个函数没有任何调用者。
+
+本仓 `seal.go:332` 是调用者，那里 `block.NumberU64()` 就在手边，所以改成显式传参是零成本的；让 transport 自己从 blockPool 反查高度则需要它持有一个它本来不该拥有的池。
+
+### 11.4 判据与负向验证
+
+| 判据 | 结果 |
+|---|---|
+| `go build ./consensus/... ./dpos/... ./eth/` | rc=0 |
+| `go vet ./consensus/pbft/ ./dpos/...` | rc=0 |
+| `gofmt -l consensus/pbft/ dpos/` | 空 |
+| `go test ./consensus/pbft/ ./dpos/...` | 全绿 |
+| `go test -race ./consensus/pbft/ ./dpos/` | ok（pbft 2.40s） |
+
+负向验证 2 条，都真跑过并还原：
+
+1. **事件常量用错**：把 `events.Notify(dpos.ETDirectPeersChanged, …)` 换成立字面值 `events.EventType(6)`（即 `Elastos.ELA/events` 里同名常量的编号）→ `TestAnnounceDAddrReachesSubscribers` 2s 超时 FAIL，报 `ETDirectPeersChanged never reached a subscriber`。这正是 `dpos/event.go` 注释里写的那个坑，现在有测试兜住。
+2. **改用 network 广播**：`broadcast` 里加一条 `t.network.BroadcastMessage(msg)` 早退分支 → `TestDPOSTransportBroadcastsToProducerSetOnly` panic FAIL，栈顶是 `stubDPOSNetwork.BroadcastMessage`。
+
+### 11.5 前置缺口：ELAMSG 中继在 eth 层**完全不存在**
+
+这是本轮最重要的发现，也是 T7 剩下那一半（`routeCfg`）真正卡住的地方。
+
+**证据链**：
+
+1. `dpos/routes.go:514` **无守卫**调用 `r.cfg.RelayAddr(iv, m)`。`RelayAddr` 为 nil 直接 panic。
+2. `dpos.Routes` 只从 `ETElaMsg` 事件拿数据（`routes.go:172-173`）。
+3. 全仓 `grep`：`events.Notify(dpos.ETElaMsg, …)` **零调用者**；`dpos.IPeer` **零实现者**；`SendELAMessage` 只在 `routes.go` 内部被调、在 `routes_test.go` 里有个假实现。
+4. `eth/protocols/eth64/handler.go:198-206` 对入站 0x08 的处理是"打 Trace + Discard"，注释明写 `0x08 is ELAMSG on pgp-chain (dpos traffic)`。
+5. 上游对应位置在 `pgp-chain/eth/handler.go:748-756`：解 `dpos.ElaMsg` → `events.Notify(dpos.ETElaMsg, &dpos.MsgEvent{ElaMsg, Peer})`；出站靠 `pgp-chain/eth/peer.go:155` 的 `SendELAMessage`。
+
+**为什么这条不能绕过**：DAddr 中继是 4 个节点互相知道**对方 TCP 地址**的唯一途径。
+
+- `dpos/p2p.Config` 里**没有任何静态 seed 字段**（只有 `DataDir` 存地址簿）。
+- `server.ConnectPeers` 只记 PID 集合，真正拨号靠 `addrManager`；`addrManager` 只有 `server.AddAddr` 能填。
+- `AddAddr` 的唯一调用链是 `OnCipherAddr` → 解密 → `Network.AddDirectLinkAddr` → `server.AddAddr`。
+- 也就是说：**没有 ELAMSG 中继 → 没有地址 → 4 节点台架里 producer 之间永远连不上 TCP → 共识一条消息都发不出去**。
+
+所以 T9 的判据 1/2/3 全都过不了，而现象是"`[UpdatePeers] self account:` 打出来了，但一个 peer 都连不上"——很容易被误判成防火墙或端口问题。
+
+### 11.6 建议的下一步（需要你选）
+
+| 方案 | 内容 | 代价 |
+|---|---|---|
+| A | 先补 ELAMSG 中继（`eth/peer.go` 加 `SendELAMessage`、`eth/handler.go` 或 eth64 handler 加入站解码 → `ETElaMsg`、加一个 `BroadcastDAddr`），再做 `routeCfg` 装配 | 要动 `eth/` 与 `eth/protocols/eth64` 两层，是本轮最大的一块，但这是上游真实路径 |
+| B | M4 台架先跳过 DAddr：给 `dpos/p2p` 加一个"静态地址表"配置项（`--dpos.peer-addr=pid@host:port`），直接 `AddAddr` | 小，但**多出一个上游没有的运维面**，且它只服务自测，M5 与真链互通时还得回头做 A |
+| C | A + B 都做：B 用于 T9 先把共识跑起来，A 并行补齐 | 最稳，工量最大 |
+
+我的建议是 **C，但顺序反过来**：先 B 把 T9 台架跑通（证明共识层在 4 节点下真的能出块，这是 M4 的验收目标），再补 A（证明与真链的发现机制一致）。理由：B 只有几十行且可测；而如果先做 A，一旦台架仍不通，就会分不清是共识层的问题还是中继层的问题。

@@ -49,7 +49,7 @@ type stubTransport struct {
 func (s *stubTransport) BroadcastBlock(*types.Block)                      {}
 func (s *stubTransport) BroadcastProposal(*payload.DPOSProposal)          {}
 func (s *stubTransport) BroadcastVote(*emsg.Vote)                         {}
-func (s *stubTransport) BroadcastConfirm(*payload.Confirm)                {}
+func (s *stubTransport) BroadcastConfirm(*payload.Confirm, uint64)        {}
 func (s *stubTransport) BroadcastResetView(*emsg.ResetView)               {}
 func (s *stubTransport) BroadcastRaw(msg elap2p.Message)                  { s.record(nil, msg) }
 func (s *stubTransport) BroadcastRawExcept(m elap2p.Message, _ dpeer.PID) { s.record(nil, m) }

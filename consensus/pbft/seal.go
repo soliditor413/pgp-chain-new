@@ -329,7 +329,7 @@ func (e *Engine) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 		if transport != nil {
 			transport.BroadcastBlock(finalBlock)
 			if confirm, ok := e.blockPool.GetConfirmByHeight(block.NumberU64()); ok {
-				transport.BroadcastConfirm(confirm)
+				transport.BroadcastConfirm(confirm, block.NumberU64())
 			}
 		}
 		e.blockPool.CleanFinalConfirmedBlock(block.NumberU64())

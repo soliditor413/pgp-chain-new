@@ -57,7 +57,14 @@ type Transport interface {
 
 	// BroadcastConfirm sends a confirm carrying the 2/3 signature set. Peers
 	// that missed the vote round learn the block is final from this alone.
-	BroadcastConfirm(confirm *payload.Confirm)
+	//
+	// height is an argument rather than a field because the ConfirmMsg on the
+	// wire carries it separately: payload.Confirm has no height of its own (it
+	// commits to a block by seal hash), and a peer needs the height before it
+	// does any signature work, to reject a future confirm early. Deriving it
+	// inside the transport would mean resolving the seal hash against a block
+	// pool the transport does not own.
+	BroadcastConfirm(confirm *payload.Confirm, height uint64)
 
 	// BroadcastResetView asks the producer set to abandon the current view. It
 	// is only sent once the view offset has run past maxViewOffset, i.e. when
