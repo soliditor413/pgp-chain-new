@@ -437,7 +437,7 @@ rc=1
 
    ```
    $ before=$(ls -d "${TMPDIR:-/tmp}"/pgp-gate.* 2>/dev/null | wc -l | tr -d ' ')
-   $ rm -rf "${TMPDIR:-/tmp}"/pgp-gate.*
+   $ rm -rf "${TMPDIR:-/tmp}"/pgp-gate.* 2>/dev/null
    $ after=$(ls -d "${TMPDIR:-/tmp}"/pgp-gate.* 2>/dev/null | wc -l | tr -d ' ')
    $ echo "residue: $before -> $after"
    $ [ "$after" -eq 0 ] || echo "FAIL cleanup left $after behind"
@@ -445,15 +445,47 @@ rc=1
                                           # criterion's name
    ```
 
+   （`rm` 后面那个 `2>/dev/null` 不只是为了好看：`rm` 的错误行**没有结尾换行**，
+   留着会和下一行粘在一起——本节下面 `LEAK` 那条就栽在这上面。）
+
    **能红的是带 `[ "$after" -eq 0 ]` 的那一行；其余几行只是给人看和留上下文。**
-   两侧都实测过，下面是从上面那组命令逐字跑出来的输出：
+   两侧都实测过（`c96bb0594` 的工作树上真跑，不是手写）。两段的起点是**各自摆的**，
+   摆法就是下面这两行（`T=${TMPDIR:-/tmp}`）：
 
    ```
+   $ mkdir -p "$T/pgp-gate.AAA" "$T/pgp-gate.BBB"; chmod 500 "$T/pgp-gate.BBB"   # 情形 A 的起点：2 个，其中一个删不掉
+   $ chmod 700 "$T"/pgp-gate.*; rm -rf "$T"/pgp-gate.*; mkdir -p "$T/pgp-gate.CCC"   # 情形 B 的起点：1 个普通的
+   ```
+
+   各自的真实输出：
+
+   ```
+   ########## 情形 A：起点 2 个残留，其中一个 chmod 500 删不掉
    residue: 2 -> 1
    FAIL cleanup left 1 behind
    was 2 before the delete
-   residue: 2 -> 0
+   ########## 情形 B：起点 1 个普通残留
+   residue: 1 -> 0
+   was 1 before the delete
    ```
+
+   **这里必须说清"两段是怎么跑出来的"，因为上一版就是在这里错的。**
+   把同一组命令**连跑两遍而不重摆起点**，真实输出是（同样实测）：
+
+   ```
+   --- 第 1 遍（原样，不重摆起点）
+   residue: 2 -> 1
+   FAIL cleanup left 1 behind
+   was 2 before the delete
+   --- 第 2 遍（原样，不重摆起点）
+   residue: 1 -> 1
+   FAIL cleanup left 1 behind
+   was 1 before the delete
+   ```
+
+   第二遍的 `before` 只能是第一遍的 `after`（这里 `1`），而 `chmod 500` 那个目录
+   一遍删不掉、两遍也删不掉，所以 `after` 还是 `1`。上一版记的是 `residue: 2 -> 0`——
+   **两个数都不对**：`2` 是把它当成了重新摆过起点，`0` 是根本没量。
 
    注意`FAIL`那行**没有** `(was 2)`：上下文是单独一行打出来的，**不进判据的名字**。
    写进名字里，下一个人会以为 `2` 这个值和红不红有关，然后去构造一个
@@ -491,9 +523,19 @@ rc=1
    **第一次注入点选错了**：`chmod 500` 放在 `mktemp` 之后，连闸门写 `$TMP` 的权限
    一起掐掉了，于是脚本在 G1 就失败——**测的变成"目录不可写"，不是"清理失败"**。
    注入点必须在 trap 里。
+   **而且被注入的那个目录里得先有东西**：空目录 `chmod 500` 之后 `rm -rf` 仍然成功
+   （删空目录只要求父目录可写，实测 `rc=0`、目录消失），于是"注入让判据变红"这一步
+   本身就没发生，测出来是绿的而你以为测过了。对 `gate.sh` 不构成问题（写 `slots.txt`
+   在那之前），但照抄这个注入法的人会拿到假绿。这是注入法的第二个失败面——
+   第一个是位置，第二个是目标为空。
    另外这个测试自己也抓到一处真缺陷：`rm` 的错误输出**没有结尾换行**，于是
    `LEAK` 被粘在它后面（`... Operation not permittedLEAK cleanup left ...`），
    而测试用 `^LEAK` 锚定，**报了 0 行而 LEAK 其实一直在打**。消息现在以换行开头。
+
+   **这条判据的强度是"至少一行 `LEAK`"，不是"恰好一行"。** 信号路径下会打两遍：
+   `INT TERM` 那条 trap 打一次，它里面的 `exit 2` 又触发 `EXIT` 再打一次
+   （实测 `grep -c '^LEAK'` → **2**，`rc=2`）。所以写成 `== 1` 的测试会在信号路径上
+   假红——**而假红比不红贵**：它会让人去改一条本来正确的检查。
 
    **它只覆盖当前 `TMPDIR`。** 在别的 `TMPDIR` 下产生的残留（另一个 shell、`sudo`、
    `launchd`、别的用户、容器）对这一整段**不可见**，既数不到也删不掉——上面那个例子
@@ -538,6 +580,23 @@ rc=1
 6. **`exit 2` 的时候没有账目。** G0 读不到输入、或任何 `cannot` 分支触发时，
    脚本在吐判定之前就退出了，所以末行不会有 `gates accounted for`。
    这是有意的：`exit 2` 的含义是**没有产生判定**，不是"产生了零条判定"。
+7. **观测，不是契约：这台沙箱会间歇拒掉子进程，`gate.sh` 于是报 `exit 2`。**
+   在没有子进程沙箱的机器上这条永远不会出现，所以它不属于 `gate.sh` 的行为，
+   属于**我跑它时所在的环境**。现象是同一个脚本连跑多次，偶发两种输出：
+
+   ```
+   CANNOT could not count marker 'ERROR'
+   CANNOT gap count is not a number: []
+   ```
+
+   伴随一行 `Brokered program policy check unavailable`。同一台机器上压过两组数：
+   `gate.sh` 连跑 10 次失败 2 次；单条 `grep` 压测 60 次失败 0 次。
+   所以不是某一条命令坏了，是**整脚本跑起来、子进程密度变高之后才偶发**。
+   （一次压测的数，不是长时间统计——给的是量级，不是概率。）
+
+   要读对这件事：**这不是闸门有时会自己返回 2**，而是 fail-closed 在真环境下
+   被验证了一次——工具真的读不到数时，它没有猜一个数出来，直接说读不到。
+   遇到这两行先重跑，**别去改闸门**，也**别把 `exit 2` 加进"正常退出码"那一栏**。
 
 ### 一次截断日志里同时出现的两条信号，守的不是同一件事
 
