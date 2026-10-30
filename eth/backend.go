@@ -365,6 +365,15 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	if config.Pbft.KeyStore != "" && !filepath.IsAbs(config.Pbft.KeyStore) {
 		config.Pbft.KeyStore = stack.ResolvePath(config.Pbft.KeyStore)
 	}
+	// Same treatment for the DPoS address database. Only this function has the
+	// node's datadir, and a relative path that reached dpos.NewNetwork unresolved
+	// would put a per-node file in the process working directory, where two
+	// producers started from the same shell would share one address book.
+	if config.Pbft.DataDir == "" {
+		config.Pbft.DataDir = stack.ResolvePath("network/dpos")
+	} else if !filepath.IsAbs(config.Pbft.DataDir) {
+		config.Pbft.DataDir = stack.ResolvePath(config.Pbft.DataDir)
+	}
 	eth.engine, eth.pbftEngine, err = ethconfig.CreateConsensusEngine(chainConfig, chainDb, ethAPI, genesisHash, &config.Pbft)
 	if err != nil {
 		return nil, err
@@ -557,6 +566,14 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		// hook; without it a producer that becomes on-duty mid-height waits for
 		// the next chain head instead of sealing immediately.
 		eth.pbftEngine.StartMine = eth.miner.RequestNewWork
+
+		// Build the DPoS stack here rather than in Start(): the transport has to
+		// be installed before the miner can produce a block for the round that is
+		// already in flight, or that round's proposal is sealed locally and
+		// reaches nobody (transport.go:69 warns about exactly this).
+		if err := eth.startPBFTNetwork(); err != nil {
+			return nil, err
+		}
 	}
 	if chainConfig.Legacy == nil {
 		// A legacy header's Extra is the serialized PBFT confirm and nothing

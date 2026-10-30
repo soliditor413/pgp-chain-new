@@ -204,10 +204,15 @@ var (
 	//
 	// The names are copied from pgp-chain verbatim so an existing arbiter
 	// configuration can be moved across by hand without translation.
-	// --pbft.net.* and --pbft.maxnodeperhost are deliberately NOT defined yet:
-	// the engine does not read those Config fields, and a flag that is accepted
-	// and then ignored is worse than a missing one. They arrive with the DPoS
-	// network layer (M4).
+	//
+	// --pbft.net.* drives the independent DPoS TCP server (the channel that
+	// carries consensus messages) and the address this node advertises to the
+	// other producers. It is not the devp2p port: devp2p is only used to gossip
+	// address records (ELAMSG 0x08), and the two must not be confused.
+	//
+	// Every producer in a set must agree on --pbft.net.magic. A mismatch is
+	// rejected in the DPoS handshake, and the symptom is a set that never
+	// connects while every log line looks healthy.
 	PbftEnableFlag = &cli.BoolFlag{
 		Name:     "pbft.enable",
 		Usage:    "Produce PBFT blocks on the pgp-chain legacy history",
@@ -232,6 +237,41 @@ var (
 		Name:     "pbft.miner.address",
 		Usage:    "Coinbase to seal with; defaults to --miner.etherbase",
 		Category: flags.EthCategory,
+	}
+	// The address this producer advertises to the rest of the set. It is what the
+	// others dial on --pbft.net.port, so on a multi-host rig it must be the
+	// address those hosts can actually reach, not 127.0.0.1.
+	PbftNetAddressFlag = &cli.StringFlag{
+		Name:     "pbft.net.address",
+		Usage:    "IP address this producer advertises to the other producers",
+		Category: flags.EthCategory,
+		Value:    "127.0.0.1",
+	}
+	// 20679 is pgp-chain's default, kept so an existing arbiter config carries
+	// over unchanged.
+	PbftNetPortFlag = &cli.UintFlag{
+		Name:     "pbft.net.port",
+		Usage:    "DPoS direct TCP port for consensus messages",
+		Category: flags.EthCategory,
+		Value:    20679,
+	}
+	// A chain property in pgp-chain (params.PbftConfig.Magic), and it has to be
+	// the same on every producer. Exposed here because this tree has no per-network
+	// PbftConfig to read it from yet.
+	PbftNetMagicFlag = &cli.Uint64Flag{
+		Name:     "pbft.net.magic",
+		Usage:    "DPoS network magic; must be identical on every producer",
+		Category: flags.EthCategory,
+		Value:    0,
+	}
+	// Caps how many producers may share one IP. The DPoS server refuses the
+	// (n+1)-th connection from the same host, which is what stops a single
+	// machine from filling a producer set on a shared rig.
+	PbftMaxNodePerHostFlag = &cli.UintFlag{
+		Name:     "pbft.net.maxnodeperhost",
+		Usage:    "Maximum number of producers allowed to share one IP address",
+		Category: flags.EthCategory,
+		Value:    3,
 	}
 	ChapelFlag = &cli.BoolFlag{
 		Name:     "chapel",
@@ -2225,6 +2265,33 @@ func setPbft(ctx *cli.Context, cfg *ethconfig.Config) {
 	}
 	if ctx.IsSet(PbftMinerAddressFlag.Name) {
 		cfg.Pbft.MinerAddress = ctx.String(PbftMinerAddressFlag.Name)
+	}
+	if ctx.IsSet(PbftNetAddressFlag.Name) {
+		cfg.Pbft.IPAddress = ctx.String(PbftNetAddressFlag.Name)
+	}
+	if ctx.IsSet(PbftNetPortFlag.Name) {
+		cfg.Pbft.Port = uint16(ctx.Uint(PbftNetPortFlag.Name))
+	}
+	if ctx.IsSet(PbftNetMagicFlag.Name) {
+		cfg.Pbft.Magic = uint32(ctx.Uint64(PbftNetMagicFlag.Name))
+	}
+	if ctx.IsSet(PbftMaxNodePerHostFlag.Name) {
+		cfg.Pbft.MaxNodePerHost = uint32(ctx.Uint(PbftMaxNodePerHostFlag.Name))
+	}
+	// Precedence for the DPoS network settings: an explicit flag wins, then the
+	// config file, then the flag's default. Without this last step a node started
+	// without --pbft.net.port would carry Port 0, which asks the kernel for an
+	// ephemeral port and then advertises an address the set cannot dial. The same
+	// fallback cannot be left to the engine: a zero MaxNodePerHost is not
+	// "unlimited" to the DPoS server, it rejects every peer.
+	if cfg.Pbft.IPAddress == "" {
+		cfg.Pbft.IPAddress = PbftNetAddressFlag.Value
+	}
+	if cfg.Pbft.Port == 0 {
+		cfg.Pbft.Port = uint16(PbftNetPortFlag.Value)
+	}
+	if cfg.Pbft.MaxNodePerHost == 0 {
+		cfg.Pbft.MaxNodePerHost = uint32(PbftMaxNodePerHostFlag.Value)
 	}
 }
 

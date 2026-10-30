@@ -42,8 +42,9 @@ import (
 // both sets to ConnectPeers). Using the network-level broadcast would deliver
 // votes to peers that cannot count them. See dpos_transport.go.
 type stubDPOSNetwork struct {
-	mu   sync.Mutex
-	sent []recordedSend
+	mu    sync.Mutex
+	sent  []recordedSend
+	peers int
 }
 
 type recordedSend struct {
@@ -66,7 +67,12 @@ func (s *stubDPOSNetwork) BroadcastMessage(elap2p.Message) {
 }
 
 func (s *stubDPOSNetwork) UpdatePeers(currentPeers, nextPeers []dpeer.PID) {}
-func (s *stubDPOSNetwork) GetActivePeers() []p2p.Peer                      { return nil }
+
+func (s *stubDPOSNetwork) GetActivePeers() []p2p.Peer {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return make([]p2p.Peer, s.peers)
+}
 
 func (s *stubDPOSNetwork) sends() []recordedSend {
 	s.mu.Lock()
@@ -299,5 +305,48 @@ func TestIsCurrentDefaultsToFalse(t *testing.T) {
 	engine.SetIsCurrent(func() bool { return true })
 	if !engine.IsCurrent() {
 		t.Fatal("IsCurrent ignored the installed probe")
+	}
+}
+
+// TestAttachNetworkInstallsAllThreeHooks pins the reason AttachNetwork exists.
+//
+// Three independent setters would let an assembly layer install a transport and
+// forget the peer counter. The node then broadcasts normally, looks connected,
+// and never recovers -- because recoverAbnormalState refuses to start when
+// activePeerCount is 0 -- so it never seals. That failure is a silent stall, not
+// an error, which is exactly the kind of wiring mistake worth a test.
+func TestAttachNetworkInstallsAllThreeHooks(t *testing.T) {
+	subscribeAnnounce()
+	for len(announceEvents) > 0 {
+		<-announceEvents
+	}
+
+	engine, _ := newListenerEngine(t)
+	network := &stubDPOSNetwork{peers: 3}
+	engine.AttachNetwork(network)
+
+	if !engine.HasTransport() {
+		t.Fatal("AttachNetwork did not install a transport")
+	}
+	if got := engine.activePeerCount(); got != 3 {
+		t.Fatalf("peer counter reports %d, want 3 (it is not wired to the network)", got)
+	}
+	if engine.announce == nil {
+		t.Fatal("AttachNetwork did not install the announce hook")
+	}
+
+	// The hook must reach dpos.Routes, i.e. fire ETDirectPeersChanged.
+	engine.announceAddr()
+	select {
+	case <-announceEvents:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the announce hook installed by AttachNetwork reached no subscriber")
+	}
+
+	// And the transport must address the producer set rather than the network:
+	// one send per current producer, none via the network broadcast.
+	engine.getTransport().BroadcastRaw(&emsg.ResetView{})
+	if n, want := len(network.sends()), 1; n != want {
+		t.Fatalf("AttachNetwork's transport made %d sends, want %d (one per producer)", n, want)
 	}
 }

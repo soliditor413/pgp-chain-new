@@ -208,6 +208,10 @@ var (
 		utils.PbftKeyStoreFlag,
 		utils.PbftKeyStorePasswordFlag,
 		utils.PbftMinerAddressFlag,
+		utils.PbftNetAddressFlag,
+		utils.PbftNetPortFlag,
+		utils.PbftNetMagicFlag,
+		utils.PbftMaxNodePerHostFlag,
 	}, utils.NetworkFlags, utils.DatabaseFlags)
 
 	rpcFlags = []cli.Flag{

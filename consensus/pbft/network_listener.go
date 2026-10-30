@@ -86,7 +86,11 @@ const (
 type blockReader interface {
 	GetBlock(hash common.Hash, number uint64) *types.Block
 	GetBlockByHash(hash common.Hash) *types.Block
-	CurrentBlock() *types.Block
+
+	// CurrentHeader, not CurrentBlock: *core.BlockChain.CurrentBlock returns a
+	// *types.Header in this fork, and CurrentHeader is the name that says so.
+	// Only the number is used, and a header is all the number lives in.
+	CurrentHeader() *types.Header
 }
 
 // blockInserter is the write half of the chain.
@@ -572,10 +576,11 @@ func (e *Engine) OnBlockReceived(id dpeer.PID, b *dmsg.BlockMsg, confirmed bool)
 		time.Sleep(delay)
 	}
 
-	head := e.blocks.CurrentBlock()
-	if head == nil {
+	head := e.blocks.CurrentHeader()
+	if head == nil || head.Number == nil {
 		return
 	}
+	headNumber := head.Number.Uint64()
 	if block.NumberU64() > 0 && e.blocks.GetBlock(block.ParentHash(), block.NumberU64()-1) == nil {
 		log.Warn("OnBlockReceived: unknown ancestor", "height", block.NumberU64(),
 			"peers", e.activePeerCount())
@@ -584,8 +589,8 @@ func (e *Engine) OnBlockReceived(id dpeer.PID, b *dmsg.BlockMsg, confirmed bool)
 		}
 		return
 	}
-	if block.NumberU64() > head.NumberU64()+1 {
-		log.Warn("OnBlockReceived: gap too large", "block", block.NumberU64(), "head", head.NumberU64())
+	if block.NumberU64() > headNumber+1 {
+		log.Warn("OnBlockReceived: gap too large", "block", block.NumberU64(), "head", headNumber)
 		return
 	}
 	if e.blocks.GetBlockByHash(block.Hash()) != nil {

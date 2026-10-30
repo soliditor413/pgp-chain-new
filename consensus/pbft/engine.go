@@ -432,6 +432,20 @@ func (e *Engine) OnBlockImported(header *types.Header) {
 // IsProductionEnabled reports whether this node may produce blocks.
 func (e *Engine) IsProductionEnabled() bool { return e.cfg.productionEnabled() }
 
+// DPOSAccount returns the producer key the engine signs with, or nil when no
+// keystore could be opened.
+//
+// The assembly layer needs it to build dpos.Config: the DAddr records Routes
+// gossips are signed with the same arbiter key the engine seals with, and the PID
+// they are filed under is its public key. Opening the keystore a second time in
+// eth/backend.go would duplicate the password handling that attachAccount's
+// comment says should stay in one place, and would let the two copies disagree
+// after a restart.
+//
+// It is a getter, not a setter: the only ways to obtain an account stay
+// dpos.GetDposAccount and this package's tests.
+func (e *Engine) DPOSAccount() daccount.Account { return e.account }
+
 // IsProducer reports whether the configured key belongs to the producer set.
 func (e *Engine) IsProducer() bool {
 	if e.account == nil || e.dispatcher == nil {
