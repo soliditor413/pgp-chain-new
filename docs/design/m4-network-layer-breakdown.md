@@ -1,24 +1,24 @@
 # M4 网络层移植拆解（A 方案）
 
-> 输入约束（用户 2026-10-30）：① `pgp-chain` 的 chainbridge 部分**不移植**；② producer 间走自建直连 TCP；③ 签名私钥用 ELA 主链账户格式。
-> 本文是**编码前的判定书**：逐文件给「保留 / 改写 / 丢弃」，按 T 编号排任务，开放问题单列待批。
+> 输入约束（用户 2026-10-30）：① `pgp-chain` 的 chainbridge 部分**不移植**；② producer 间走自建直连 TCP；③ 签名私钥用 ELA 主链账户格式。  
+> 本文是**编码前的判定书**：逐文件给「保留 / 改写 / 丢弃」，按 T 编号排任务，开放问题单列待批。  
 > 基线：`bsc` `HEAD=9b6aca40d`、工作树干净、`go build ./dpos/... ./consensus/pbft/... ./spv/...` → `rc=0`。
 
 ---
 
 ## 零、一句话结论
 
-M4 = **1096 行移植**（`network.go` 451 + `routes.go` 645）+ **24 个 listener 适配方法** + **4 处接线**。
+M4 = **1096 行移植**（`network.go` 451 + `routes.go` 645）+ **24 个 listener 适配方法** + **4 处接线**。  
 chainbridge 的**业务**整块丢弃，但它的**消息 codec** 一个都不能少——这不是风格问题，少注册一个 CMD 就直接断连（§1.2）。
 
-| 项 | 现状 | M4 后 |
-|---|---|---|
-| `dpos/network.go` | 不存在 | 移植 + 裁剪（删 8 个 case、1 个接口项） |
-| `dpos/routes.go` | 不存在 | 645 行**全量**移植，零裁剪 |
-| `ETDirectPeersChanged` | 不存在（全仓 0 命中） | 新增 1 个常量 |
-| `Transport` 实现 | `SetTransport` **零调用者** | 装配层注入，M4 第一个能跑的东西 |
+| 项                      | 现状                       | M4 后                            |
+| ---------------------- | ------------------------ | ------------------------------- |
+| `dpos/network.go`      | 不存在                      | 移植 + 裁剪（删 8 个 case、1 个接口项）      |
+| `dpos/routes.go`       | 不存在                      | 645 行**全量**移植，零裁剪               |
+| `ETDirectPeersChanged` | 不存在（全仓 0 命中）             | 新增 1 个常量                        |
+| `Transport` 实现         | `SetTransport` **零调用者**  | 装配层注入，M4 第一个能跑的东西               |
 | `NetworkEventListener` | `Engine` 只有 2 个 `On*` 方法 | 24 个方法，新增 `network_listener.go` |
-| chainbridge | 已按 D10 只留 codec | 不动 |
+| chainbridge            | 已按 D10 只留 codec          | 不动                              |
 
 ---
 
@@ -28,11 +28,11 @@ chainbridge 的**业务**整块丢弃，但它的**消息 codec** 一个都不�
 
 用户说"chainbridge 没用"，这句话在**业务层**成立，但 chainbridge 的包里寄生着三样 DPoS 共识自己要用的东西。切的时候必须逐个搬，不能整目录删。
 
-| 寄生点 | 位置 | 谁在用 | 处置 |
-|---|---|---|---|
-| `CmdProducers = "producers"` | `chainbridge-core/dpos_msg/message.go:8` | `dpos/msg/producersmsg.go:35` | ✅ **已搬到** `bsc/dpos/msg/commands.go:41` |
-| `ETESCStateChanged = 2005` | `chainbridge-core/dpos_msg/event.go:11` | `pgp-chain/spv/blocklistener.go:121/126`（SPV 链状态切 DPOS/POW） | ⚠️ bsc 侧两半都在、缺中间那根线，见 O6 |
-| `crypto.Keypair` 接口 | `chainbridge-core/crypto/keypair.go:23-36` | `dpos/account.go:23` `GetBridgeAccount`、`pbft.go:112` `bridgeAccount` | ❌ **整个丢弃**，唯一消费者是 `GetBridgeArbiters()`，见 §1.3 |
+| 寄生点                          | 位置                                         | 谁在用                                                                   | 处置                                             |
+| ---------------------------- | ------------------------------------------ | --------------------------------------------------------------------- | ---------------------------------------------- |
+| `CmdProducers = "producers"` | `chainbridge-core/dpos_msg/message.go:8`   | `dpos/msg/producersmsg.go:35`                                         | ✅ **已搬到** `bsc/dpos/msg/commands.go:41`        |
+| `ETESCStateChanged = 2005`   | `chainbridge-core/dpos_msg/event.go:11`    | `pgp-chain/spv/blocklistener.go:121/126`（SPV 链状态切 DPOS/POW）           | ⚠️ bsc 侧两半都在、缺中间那根线，见 O6                       |
+| `crypto.Keypair` 接口          | `chainbridge-core/crypto/keypair.go:23-36` | `dpos/account.go:23` `GetBridgeAccount`、`pbft.go:112` `bridgeAccount` | ❌ **整个丢弃**，唯一消费者是 `GetBridgeArbiters()`，见 §1.3 |
 
 `CmdProducers` 那一行是关键证据：`ProducersMsg` 本体（89 行，`SpvHeight`/`ChangeHeight`/`Producers`）**完全不含跨链语义**，它只是恰好把 CMD 字符串常量放在了 chainbridge 的包里。所以它是**共识消息**，必须留。
 
@@ -49,7 +49,10 @@ default:
 
 所以只要对端是 1.9.7 节点、只要它可能发 `arbiter` / `req_arbiter` / `req_a_sig` / `ret_a_sig` 中任意一条，bsc 就必须能**解出这条消息**——哪怕解出来后什么都不做。
 
-`createMessage` 的 case 全集是 **24 条**（`awk 'NR>=397 && NR<=451' dpos/network.go | grep -c "case "` → 24），其中 4 条是仲裁人消息。所以移植后的正确数字是 **20 条**，不是"删到只剩共识"。这个 24→20 是 T1 断言表的基准，也是 T3 判据的锚点。
+**数字（实施后修正过一次，这是修正版）**：`createMessage` 的 case 全集是 **24 条**，其中 4 条是仲裁人消息。移植后 **`createMessage` 一条都不删，仍是 24 条**——那 4 条改用本仓的 `dmsg.CmdXxx` 常量与 `dpos/msg/layer2.go` 的类型注册，于是既不依赖 chainbridge 包，CMD 又还在表里。真正删掉的是 `processMessage` 里对应的 4 个**分发分支**。
+
+> 一句话：**24 → 20 只发生在 `processMessage`，不发生在 `createMessage`。**
+> 本文第一版写成"移植后应在 `createMessage` 里降到 20 条"，那是错的——按那个做，每个 1.9.7 节点都会在第一次发仲裁人消息时被断连。T1 的表驱动测试现在两边都锁：`messageForCMD` 必须 24 条全非 nil，`processMessage` 必须对那 4 条不分发。
 
 `bsc/dpos/msg/layer2.go` 已经把这个决定落地了，`:20-26` 的注释就是理由原文。这与你这次给的约束完全一致：**业务不移植，codec 保留**。
 
@@ -59,33 +62,33 @@ default:
 
 `grep -rl chainbridge --include=*.go . | grep -v third_party | wc -l` → **26**，分类如下（16 + 3 + 3 + 2 + 1 + 1 = 26，可复核）：
 
-| 类别 | 数量 | 文件 | 处置 |
-|---|---|---|---|
-| **业务实现** | 16 | `chainbridge-core/` 下全部：`chainbridge.go`、`api.go`、`relayer/`、`engine/`、`config/`、`blockstore/`、`keystore/`(5)、`bridgelog/`、`chains/evm/{listener,voter,chain,evmclient}` | ❌ 全丢 |
-| **消息 codec** | 6 | `chainbridge-core/dpos_msg/{darbiter,requirearbiter,reqarbiterssignature,feedbackArbitersSignature,message,event}.go`（**不在那 26 个里**，因为包内不 import 自己的路径） | 🔀 4 个 codec 已搬进 `bsc/dpos/msg/layer2.go`；`message.go` 常量已搬进 `commands.go`；`event.go` 见 O6 |
-| **入口装配** | 3 | `cmd/pgp/main.go`、`eth/backend.go`、`core/state_transition.go` | ❌ 丢（bsc 有自己的装配层） |
-| **PBFT 侧泄漏** | 3 | `consensus/pbft/pbft.go:112/169/178/197`（`bridgeAccount`）、`consensus/pbft/layer2Listener.go`、`dpos/account.go:23` | 🔀 **裁剪**，见 §2 |
-| **待处理** | 2 | `dpos/network.go`（要删 8 个 case）、`spv/blocklistener.go`（`ETESCStateChanged` 的 TODO） | 🔀 见 T3 / O6 |
-| **已解决** | 1 | `dpos/msg/producersmsg.go` | ✅ `CmdProducers` 已本地化 |
-| **ABI 工具** | 1 | `chainbridge_abi/utils.go` | ❌ 丢 |
+| 类别           | 数量 | 文件                                                                                                                                                                       | 处置                                                                                         |
+| ------------ | -- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------ | ------------------------------------------------------------------------------------------ |
+| **业务实现**     | 16 | `chainbridge-core/` 下全部：`chainbridge.go`、`api.go`、`relayer/`、`engine/`、`config/`、`blockstore/`、`keystore/`(5)、`bridgelog/`、`chains/evm/{listener,voter,chain,evmclient}` | ❌ 全丢                                                                                       |
+| **消息 codec** | 6  | `chainbridge-core/dpos_msg/{darbiter,requirearbiter,reqarbiterssignature,feedbackArbitersSignature,message,event}.go`（**不在那 26 个里**，因为包内不 import 自己的路径）                  | 🔀 4 个 codec 已搬进 `bsc/dpos/msg/layer2.go`；`message.go` 常量已搬进 `commands.go`；`event.go` 见 O6 |
+| **入口装配**     | 3  | `cmd/pgp/main.go`、`eth/backend.go`、`core/state_transition.go`                                                                                                            | ❌ 丢（bsc 有自己的装配层）                                                                           |
+| **PBFT 侧泄漏** | 3  | `consensus/pbft/pbft.go:112/169/178/197`（`bridgeAccount`）、`consensus/pbft/layer2Listener.go`、`dpos/account.go:23`                                                        | 🔀 **裁剪**，见 §2                                                                             |
+| **待处理**      | 2  | `dpos/network.go`（`processMessage` 删 4 个分支）、`spv/blocklistener.go`（`ETESCStateChanged` 的 TODO）                                                                              | 🔀 `network.go` 已在 T3 完成；`spv` 见 O6                                                         |
+| **已解决**      | 1  | `dpos/msg/producersmsg.go`                                                                                                                                               | ✅ `CmdProducers` 已本地化                                                                      |
+| **ABI 工具**   | 1  | `chainbridge_abi/utils.go`                                                                                                                                               | ❌ 丢                                                                                        |
 
 ### 1.4 `layer2Listener.go` 的 91 行里，只有 7 个方法该活下来
 
 这个文件名骗人——它跟 Arbitrum/OP 的 "L2" 无关，指的是**跨链桥的仲裁人层**。91 行里：
 
-| 方法 | 行 | 判定 | 理由 |
-|---|---|---|---|
-| `SendMsgProposal` | `:12-17` | 🔀 改名 | bsc 走 `Transport.BroadcastProposal` |
-| `SendMsgToPeer` | `:19-23` | ❌ 删 | 全仓唯一调用者是 `chainbridge.go:347/575`，零共识调用者 |
-| `SignData` | `:25-27` | ✅ 留 | `e.account.Sign` |
-| `DecryptArbiter` | `:29-36` | ❌ 删 | 唯一调用者 `chainbridge.go:464` |
-| `GetProducer` | `:38-43` | ✅ 留 | 网络层要认自己 |
-| `HasProducerMajorityCount` | `:45-50` | ✅ 留 | 转 `dispatcher.GetConsensusView()` |
-| `GetBridgeArbiters` | `:52-54` | ❌ 删 | 8 个调用者**全在** `chainbridge-core/` 内 |
-| `GetTotalProducerCount` | `:56-58` | ✅ 留 | 转 `consensusView.GetTotalProducersCount` |
-| `GetTotalArbitersCount` | `:60-62` | ❌ 删 | 调用者：`chainbridge.go`(4 处) + `chains/evm/chain.go:64` + `eth/bpos_network.go:58`，全是跨链/BPoS |
-| `IsSyncFinished` | `:64-66` | ✅ 留 | 转 `IsRecovered()` |
-| `OnLayer2Msg` | `:68-91` | ❌ 删 | 4 个 case 全是 `dpos_msg` 仲裁人消息，纯 `events.Notify` 转发 |
+| 方法                         | 行        | 判定    | 理由                                                                                        |
+| -------------------------- | -------- | ----- | ----------------------------------------------------------------------------------------- |
+| `SendMsgProposal`          | `:12-17` | 🔀 改名 | bsc 走 `Transport.BroadcastProposal`                                                       |
+| `SendMsgToPeer`            | `:19-23` | ❌ 删   | 全仓唯一调用者是 `chainbridge.go:347/575`，零共识调用者                                                  |
+| `SignData`                 | `:25-27` | ✅ 留   | `e.account.Sign`                                                                          |
+| `DecryptArbiter`           | `:29-36` | ❌ 删   | 唯一调用者 `chainbridge.go:464`                                                                |
+| `GetProducer`              | `:38-43` | ✅ 留   | 网络层要认自己                                                                                   |
+| `HasProducerMajorityCount` | `:45-50` | ✅ 留   | 转 `dispatcher.GetConsensusView()`                                                         |
+| `GetBridgeArbiters`        | `:52-54` | ❌ 删   | 8 个调用者**全在** `chainbridge-core/` 内                                                        |
+| `GetTotalProducerCount`    | `:56-58` | ✅ 留   | 转 `consensusView.GetTotalProducersCount`                                                  |
+| `GetTotalArbitersCount`    | `:60-62` | ❌ 删   | 调用者：`chainbridge.go`(4 处) + `chains/evm/chain.go:64` + `eth/bpos_network.go:58`，全是跨链/BPoS |
+| `IsSyncFinished`           | `:64-66` | ✅ 留   | 转 `IsRecovered()`                                                                         |
+| `OnLayer2Msg`              | `:68-91` | ❌ 删   | 4 个 case 全是 `dpos_msg` 仲裁人消息，纯 `events.Notify` 转发                                         |
 
 **这张表是 1.3 里"PBFT 侧泄漏"那一行的展开**，也是 M4 唯一能靠删代码省工的地方：91 → ~30 行。
 
@@ -93,17 +96,17 @@ default:
 
 ## 二、逐文件判定表
 
-| 源（pgp-chain） | 行数 | 判定 | 落点 | 必须改动 |
-|---|---|---|---|---|
-| `dpos/routes.go` | 645 | **全量移植** | `bsc/dpos/routes.go` | 无 chainbridge 依赖（imports 只有 6 个 Elastos 包，已核）。改 3 处：`fmt.Println(:153)` → `Debug`；`routes.go:276` 空 `if` 块加注释（O7）；`New()` 里的全局 `events.Subscribe` 不返回句柄，见 O8 |
-| `dpos/network.go` | 451 | **移植 + 裁剪** | `bsc/dpos/network.go` | ①删 `:261-280` 4 个 `dpos_msg` case（`processMessage`）；②删 `:435-442` 4 个 `dpos_msg` case（`createMessage`）——**保留 `:286` 与 `:445` 的 `CmdProducers`**；③删接口方法 `:94 OnLayer2Msg`；④合并重复 import（`:23 peer` 与 `:24 dpeer` 是同一个包）；⑤改 `Stop()`（见 T4，不是开放问题，是已定缺陷修复）；⑥删 `:368` 的 `fmt.Println(">>>>>>> ...")` |
-| `dpos/message.go` | 53 | ✅ 已完成 | `bsc/dpos/message.go`(40) | — |
-| `dpos/msg/producersmsg.go` | 89 | ✅ 已完成 | `bsc/dpos/msg/producersmsg.go` | `CmdProducers` 已本地化 |
-| `consensus/pbft/layer2Listener.go` | 91 | 🔀 只留 7 个方法 | 并入 `consensus/pbft/network.go`（新） | 见 §1.4 |
-| `consensus/pbft/network.go` | 1148 | 🔀 只搬 3 段 | 部分已在 `seal.go`/`view.go`/`transport.go` | 待搬：`AnnounceDAddr`(`:160-171`)、`AddDirectLinkPeer`(`:953-958`)、`StartServer`/`StopServer`(`:973-985`)、`GetActivePeersCount`(`:959-971`) |
-| `consensus/pbft/pbft.go` | — | 🔀 裁 3 处 | `engine.go`/`config.go` | 删 `bridgeAccount`(`:112/:169/:197`)、删 `GetBridgeAccount` 调用(`:178`) |
-| `chainbridge-core/**` | 288+ | ❌ **不移植** | — | 见 §1.3 |
-| `eth/bpos_network.go` | — | ❌ 不移植 | — | BPoS 验证人网络，与 PBFT 无关 |
+| 源（pgp-chain）                       | 行数   | 判定          | 落点                                      | 必须改动                                                                                                                                                                                                                                                                                            |
+| ---------------------------------- | ---- | ----------- | --------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `dpos/routes.go`                   | 645  | **全量移植**    | `bsc/dpos/routes.go`                    | 无 chainbridge 依赖（imports 只有 6 个 Elastos 包，已核）。改 3 处：`fmt.Println(:153)` → `Debug`；`routes.go:276` 空 `if` 块加注释（O7）；`New()` 里的全局 `events.Subscribe` 不返回句柄，见 O8                                                                                                                                    |
+| `dpos/network.go`                  | 451  | **移植 + 裁剪** | `bsc/dpos/network.go`                   | ①删 `:261-280` 4 个 `dpos_msg` case（`processMessage`）；②删 `:435-442` 4 个 `dpos_msg` case（`createMessage`）——**保留 `:286` 与 `:445` 的 `CmdProducers`**；③删接口方法 `:94 OnLayer2Msg`；④合并重复 import（`:23 peer` 与 `:24 dpeer` 是同一个包）；⑤改 `Stop()`（见 T4，不是开放问题，是已定缺陷修复）；⑥删 `:368` 的 `fmt.Println(">>>>>>> ...")` |
+| `dpos/message.go`                  | 53   | ✅ 已完成       | `bsc/dpos/message.go`(40)               | —                                                                                                                                                                                                                                                                                               |
+| `dpos/msg/producersmsg.go`         | 89   | ✅ 已完成       | `bsc/dpos/msg/producersmsg.go`          | `CmdProducers` 已本地化                                                                                                                                                                                                                                                                             |
+| `consensus/pbft/layer2Listener.go` | 91   | 🔀 只留 7 个方法 | 并入 `consensus/pbft/network.go`（新）       | 见 §1.4                                                                                                                                                                                                                                                                                          |
+| `consensus/pbft/network.go`        | 1148 | 🔀 只搬 3 段   | 部分已在 `seal.go`/`view.go`/`transport.go` | 待搬：`AnnounceDAddr`(`:160-171`)、`AddDirectLinkPeer`(`:953-958`)、`StartServer`/`StopServer`(`:973-985`)、`GetActivePeersCount`(`:959-971`)                                                                                                                                                         |
+| `consensus/pbft/pbft.go`           | —    | 🔀 裁 3 处    | `engine.go`/`config.go`                 | 删 `bridgeAccount`(`:112/:169/:197`)、删 `GetBridgeAccount` 调用(`:178`)                                                                                                                                                                                                                             |
+| `chainbridge-core/**`              | 288+ | ❌ **不移植**   | —                                       | 见 §1.3                                                                                                                                                                                                                                                                                          |
+| `eth/bpos_network.go`              | —    | ❌ 不移植       | —                                       | BPoS 验证人网络，与 PBFT 无关                                                                                                                                                                                                                                                                            |
 
 **总待搬：1096 行**（`network.go` 451 + `routes.go` 645），其中 `network.go` 裁掉约 20 行 → **净约 1076 行**。
 
@@ -111,34 +114,38 @@ default:
 
 ## 三、T 编号任务清单
 
-依赖顺序：T1 → T2 → T3 → (T4 可与 T5 并行) → T6 → T7 → T8 → T9。
+依赖顺序：T1 → T2 → T3 → (T4 可与 T5 并行) → T6 → T7 → T8 → T9。  
 每个 T 都给了**可机械复验的判据**，不接受"看起来对"。
 
-### T1 — 固化 chainbridge 边界（零编码，纯断言）
+### T1 — 固化 chainbridge 边界（零编码，纯断言）✅ 已完成
 
-- **动作**：写 `dpos/msg/cmd_table_test.go`，把 §1.2 的结论变成测试。
-- **内容**：一张 CMD 期望表（移植前 24 条、移植后 20 条，差集恰好是 `arbiter`/`req_arbiter`/`req_a_sig`/`ret_a_sig`），断言 `createMessage` 对每一条都能返回非 nil 消息、对 `"unknown_cmd"` 返回 error。
-- **判据**：`go test ./dpos/msg/ -run TestCmdTable` 绿；从表里删掉一条 `arbiter` 必须红（负向验证至少做一次）。
+- **动作**：写 `dpos/network_cmd_table_test.go`，把 §1.2 的结论变成测试。为了让判据可机械复验，`createMessage` 的 switch 被抽成纯函数 `messageForCMD(cmd string) elap2p.Message`（`createMessage` 变成"查表 + 校验"两步，校验仍归 `CheckAndCreateMessage`）——这样测试不必伪造 header、checksum 和 `net.Conn`。
+- **内容**：三件事，缺一不可
+  1. `wireCommands` 手写 24 条表（**不**从被测代码派生），逐条断言 `messageForCMD` 非 nil，并回读 `.CMD()` 等于输入（防两个 case 返回同一类型）；
+  2. `messageForCMD` 对 `""` / `unknown_cmd` / 大小写变体返回 nil；
+  3. 4 个仲裁人命令能被解码，但 `processMessage` **不得**把它们分发给 listener——用嵌入 `NetworkEventListener` 接口的 `undispatchableListener` 实现：任何方法一被调用就 nil 解引用 panic，测试捕获后报"chainbridge business is not ported"。
+- **判据**：`go test ./dpos/ -run 'TestWireCommand|TestMessageForCMD|TestChainbridgeMessages'` 绿，且两个负向验证各红一次（见 §八 实施记录）。
 - **为什么先做**：这是唯一能防"以后有人手滑删 layer2.go"的护栏，而它是 O(1) 成本。
 
-### T2 — 补 `ETDirectPeersChanged` 与 `peer.PeersInfo`
+### T2 — 补 `ETDirectPeersChanged` 与 `peer.PeersInfo` ✅ 已完成
 
 - **动作**：`bsc/dpos/event.go` 加常量（ET1012，接在 `ETNextValidators=1011` 后）；确认 `peer.PeersInfo` 来自 `Elastos.ELA/dpos/p2p/peer` 而非自建。
 - **证据**：`pgp-chain/consensus/pbft/network.go:168` 发的 payload 就是 `&peer.PeersInfo{CurrentPeers, NextPeers}`，`routes.go:147` 直接断言 `e.Data.(*peer.PeersInfo)`。类型必须逐字一致，否则断言 panic。
 - **一个必须知道的细节**：`peer.PeersInfo` 有**三个**字段（模块版 `dpos/p2p/peer/peer.go:63-67`）：`CurrentPeers`、`NextPeers`、**`CRPeers`**。上游 `AnnounceDAddr` 只填前两个，`CRPeers` 留 `nil`，`routes.go:148-152` 也只读前两个。移植时**照抄这个不对称**，不要"补全" `CRPeers`——它是跨链仲裁人候选集，属于被丢弃的 chainbridge 域。
+- **一个坑（已避开）**：`Elastos.ELA/events` **也**有 `ETDirectPeersChanged`（`events.go:47`，值 6）。不要用它，否则 `AnnounceDAddr` 的 Notify 到不了 `routes.go` 的订阅者——两边编号空间不同。本仓一律用 `dpos.ETDirectPeersChanged`（1012）。
 - **判据**：`go build ./dpos/...` 绿；`grep -c ETDirectPeersChanged dpos/event.go` → 1。
 
-### T3 — 移植 `dpos/network.go`
+### T3 — 移植 `dpos/network.go` ✅ 已完成
 
 - **动作**：按 §2 的改动项搬。**先搬不带裁剪的版本让它编译过，再逐条删**——直接搬裁剪版会把"删错了"和"搬错了"两种错误混在一起。
 - **判据**：
   1. `go build ./dpos/...` 绿
   2. `grep -c "dpos_msg" dpos/network.go` → **0**
-  3. `grep -c "OnLayer2Msg" dpos/network.go` → **0**
-  4. `createMessage` 的 case 数 = 20（T1 的表对上）
+  3. `OnLayer2Msg` 只允许出现在注释里：`grep -n "OnLayer2Msg" dpos/network.go | grep -vE ":[0-9]+:\s*//" | wc -l` → **0**（当前命中 1 条，是 `:91` 的说明注释"OnLayer2Msg is NOT here"，刻意保留）
+  4. `messageForCMD` 的 case 数 = **24**（4 个仲裁人的 codec 保留）；`processMessage` 的 case 数 = **20**（4 个仲裁人不分发）。两个数都要，只查一个会把 §1.2 的错误再做一遍
   5. `go vet ./dpos/` 无 "duplicate import"
 
-### T4 — 修 `Network.Stop()` 的阻塞（与 T3 同一提交）
+### T4 — 修 `Network.Stop()` 的阻塞（与 T3 同一提交）✅ 已完成
 
 `pgp-chain/dpos/network.go:155-158`：
 
@@ -154,7 +161,7 @@ func (n *Network) Stop() error {
 - **动作**：改 `sync.Once` + `close(n.quit)`，`Start()` 的 select 用 `<-n.quit`（已是）。
 - **判据**：新增 `TestNetworkStopTwiceDoesNotBlock`——`Stop()` 调两次，第二次必须在 100ms 内返回；`go test -race` 绿。
 
-### T5 — 移植 `dpos/routes.go`
+### T5 — 移植 `dpos/routes.go` ✅ 已完成
 
 - **动作**：全量搬，只改 §2 列的三处。
 - **特别处理 `routes.go:274-280`**：
@@ -182,32 +189,33 @@ if len(state.peerCache) < minPeersToAnnounce {
 
 **新增文件 `consensus/pbft/network_listener.go`**，逐方法映射：
 
-| # | 方法 | 转发到 | 备注 |
-|---|---|---|---|
-| 1 | `OnPing` | `dtime` 时间偏移 / 忽略 | 上游也基本空转 |
-| 2 | `OnPong` | 同上 | |
-| 3 | `OnBlock` | `blockPool.AddBlock` + `chain.InsertChain` | 需 `confirmed=false` |
-| 4 | `OnInv` | 回 `GetBlock` | |
-| 5 | `OnGetBlock` | `blockPool.GetBlock` → 回块 | |
-| 6 | `OnGetBlocks` | `blockPool` 范围查询 | |
-| 7 | `OnResponseBlocks` | 空实现 | 上游 `network.go:216-220` 的 case **整段注释**，天然空转 |
-| 8 | `OnRequestConsensus` | 回 `ConsensusStatus` | |
-| 9 | `OnResponseConsensus` | `dispatcher.RecoverFromConsensusStatus` | `dispatcher.go:746` 已有 |
-| 10 | `OnRequestProposal` | `blockPool` / 已提提案查询 | |
-| 11 | `OnIllegalProposalReceived` | 黑名单（M6） | 暂记日志 |
-| 12 | `OnIllegalVotesReceived` | 同上 | |
-| 13 | `OnProposalReceived` | → `ProcessProposal` | **已有**，见 `bsc/consensus/pbft/prepare.go` |
-| 14 | `OnVoteAccepted` | → `ProcessVote` | **已有** |
-| 15 | `OnVoteRejected` | → `ProcessVote` | **已有** |
-| 16 | `OnChangeView` | `e.onChangeView()`(:101) | **已有** |
-| 17 | `OnBadNetwork` | 记日志 + 触发 re-announce | |
-| 18 | `OnRecover` | `e.MarkRecovered()`(:109) | **已有**，R9 的关口 |
-| 19 | `OnResponseResetViewReceived` | `e` 的 resetview 处理 | |
-| 20 | `OnBlockReceived` | `chain.InsertChain`，`confirmed` 决定是否跳 confirm 校验 | **语义最重的一个** |
-| 21 | `OnConfirmReceived` | `e.onConfirm(confirm)`(:437) | **已有** |
-| 22 | `OnSmallCroTxReceived` | no-op + `Debug` | D10：业务不移植 |
-| 23 | `OnFailedWithdrawTxReceived` | no-op + `Debug` | 同上 |
-| 24 | `OnProducersMsg` | `dispatcher` + `spv.SetCurrentProducers` | 连 `#27` 的 `ETUpdateProducers` 线 |
+| #  | 方法                            | 转发到                                              | 备注                                           |
+| -- | ----------------------------- | ------------------------------------------------ | -------------------------------------------- |
+| 1  | `OnPing`                      | `dtime` 时间偏移 / 忽略                                | 上游也基本空转                                      |
+| 2  | `OnPong`                      | 同上                                               |                                              |
+| 3  | `OnBlock`                     | `blockPool.AddBlock` + `chain.InsertChain`       | 需 `confirmed=false`                          |
+| 4  | `OnInv`                       | 回 `GetBlock`                                     |                                              |
+| 5  | `OnGetBlock`                  | `blockPool.GetBlock` → 回块                        |                                              |
+| 6  | `OnGetBlocks`                 | `blockPool` 范围查询                                 |                                              |
+| 7  | `OnResponseBlocks`            | 空实现                                              | 上游 `network.go:216-220` 的 case **整段注释**，天然空转 |
+| 8  | `OnRequestConsensus`          | 回 `ConsensusStatus`                              |                                              |
+| 9  | `OnResponseConsensus`         | `dispatcher.RecoverFromConsensusStatus`          | `dispatcher.go:746` 已有                       |
+| 10 | `OnRequestProposal`           | `blockPool` / 已提提案查询                             |                                              |
+| 11 | `OnIllegalProposalReceived`   | 黑名单（M6）                                          | 暂记日志                                         |
+| 12 | `OnIllegalVotesReceived`      | 同上                                               |                                              |
+| 13 | `OnProposalReceived`          | → `ProcessProposal`                              | **已有**，见 `bsc/consensus/pbft/prepare.go`     |
+| 14 | `OnVoteAccepted`              | → `ProcessVote`                                  | **已有**                                       |
+| 15 | `OnVoteRejected`              | → `ProcessVote`                                  | **已有**                                       |
+| 16 | `OnChangeView`                | `e.onChangeView()`(:101)                         | **已有**                                       |
+| 17 | `OnBadNetwork`                | 记日志 + 触发 re-announce                             |                                              |
+| 18 | `OnRecover`                   | `e.MarkRecovered()`(:109)                        | **已有**，R9 的关口                                |
+| 19 | `OnResponseResetViewReceived` | `e` 的 resetview 处理                               |                                              |
+| 20 | `OnBlockReceived`             | `chain.InsertChain`，`confirmed` 决定是否跳 confirm 校验 | **语义最重的一个**                                  |
+| 21 | `OnConfirmReceived`           | `e.onConfirm(confirm)`(:437)                     | **已有**                                       |
+| 22 | `OnSmallCroTxReceived`        | no-op + `Debug`                                  | D10：业务不移植                                    |
+| 23 | `OnFailedWithdrawTxReceived`  | no-op + `Debug`                                  | 同上                                           |
+| 24 | `OnProducersMsg`              | `dispatcher` + `spv.SetCurrentProducers`         | 连 `#27` 的 `ETUpdateProducers` 线              |
+
 
 - **判据**：`var _ dpos.NetworkEventListener = (*Engine)(nil)` 编译期断言通过；`go build ./...` 绿。
 - **风险**：13/14/15/16/18/21 标"已有"的 6 个，签名**未必**和接口一致（接口用 `dpeer.PID` + `*payload.*`，`Engine` 现有方法可能是 `*types.Header` 等）。逐个对签名是这一步的主要时间成本，不要假设能直接复用。
@@ -216,12 +224,12 @@ if len(state.peerCache) < minPeersToAnnounce {
 
 四处接线，都是"写对了才动"的：
 
-| 接线 | 位置 | 内容 |
-|---|---|---|
-| `SetTransport` | `eth/ethconfig/config.go:312` 附近 / `eth/backend.go` | 构造 `dposTransport` 实现 `Transport` 5 方法（`BroadcastBlock/Proposal/Vote/Confirm/ResetView`），内部 `network.BroadcastMessage(emsg)`。**必须在 miner 启动前**（`transport.go:68-71` 的注释说明晚了会静默丢当前轮的提案） |
-| `AnnounceDAddr` | 新 `consensus/pbft/network.go` | 照 `pgp-chain:160-171`，发 `ETDirectPeersChanged` + `peer.PeersInfo` |
-| `routeCfg` | `eth/backend.go`（bsc 侧对应装配点） | `Config{PID, Addr, TimeSource, Sign, IsCurrent, RelayAddr, OnCipherAddr}`，见 O2/O3 |
-| `AnnounceAddr` | `pbft.New` 的 `NetworkConfig` | `func() { events.Notify(dpos.ETAnnounceAddr, nil) }` |
+| 接线              | 位置                                                  | 内容                                                                                                                                                                                     |
+| --------------- | --------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `SetTransport`  | `eth/ethconfig/config.go:312` 附近 / `eth/backend.go` | 构造 `dposTransport` 实现 `Transport` 5 方法（`BroadcastBlock/Proposal/Vote/Confirm/ResetView`），内部 `network.BroadcastMessage(emsg)`。**必须在 miner 启动前**（`transport.go:68-71` 的注释说明晚了会静默丢当前轮的提案） |
+| `AnnounceDAddr` | 新 `consensus/pbft/network.go`                       | 照 `pgp-chain:160-171`，发 `ETDirectPeersChanged` + `peer.PeersInfo`                                                                                                                      |
+| `routeCfg`      | `eth/backend.go`（bsc 侧对应装配点）                        | `Config{PID, Addr, TimeSource, Sign, IsCurrent, RelayAddr, OnCipherAddr}`，见 O2/O3                                                                                                      |
+| `AnnounceAddr`  | `pbft.New` 的 `NetworkConfig`                        | `func() { events.Notify(dpos.ETAnnounceAddr, nil) }`                                                                                                                                   |
 
 - **判据**：启动日志里出现 `[UpdatePeers] self account:` 与 `received ETDirectPeersChanged peers` 两行（上游 `network.go:299` / `routes.go:153` 就打印这两行——它们是最好的"网络活着"探针）。
 
@@ -234,13 +242,13 @@ if len(state.peerCache) < minPeersToAnnounce {
 
 判据照 `pbft-port-design.md:243-250`，逐条：
 
-| # | 判据 | 复验方式 |
-|---|---|---|
-| 1 | 4 节点 4 生产者、阈值 `int(4*2/3)=2` | 启动日志里的 `producers` 数与 `GetMajorityCount()` |
-| 2 | 200 块无分叉 | 4 节点 `eth_blockNumber` 差 ≤ 1，且无 reorg 日志 |
-| 3 | `kill -9` 一个生产者后 ≤ 2 个 view 补上 | 计时：kill 时刻到链高恢复增长 |
-| 4 | `pbft_getArbiterPeersInfo` 返回 3 个 `2WayConnection` | 每个存活节点都查一遍 |
-| 5 | 回滚 `--pbft.enable=false` 后节点退化为 follower | 不 panic、`Prepare` 返回 `ErrProductionNotSupported` |
+| # | 判据                                                 | 复验方式                                             |
+| - | -------------------------------------------------- | ------------------------------------------------ |
+| 1 | 4 节点 4 生产者、阈值 `int(4*2/3)=2`                       | 启动日志里的 `producers` 数与 `GetMajorityCount()`       |
+| 2 | 200 块无分叉                                           | 4 节点 `eth_blockNumber` 差 ≤ 1，且无 reorg 日志         |
+| 3 | `kill -9` 一个生产者后 ≤ 2 个 view 补上                     | 计时：kill 时刻到链高恢复增长                                |
+| 4 | `pbft_getArbiterPeersInfo` 返回 3 个 `2WayConnection` | 每个存活节点都查一遍                                       |
+| 5 | 回滚 `--pbft.enable=false` 后节点退化为 follower           | 不 panic、`Prepare` 返回 `ErrProductionNotSupported` |
 
 ---
 
@@ -312,11 +320,14 @@ if chainConfig.Pbft != nil {
 **影响**：漏了 `SetPayloadVersion` → 与 1.9.7 节点的 `version` 消息字段数不同 → 握手失败 → **M5 互通直接归零**，而 M4 台架（bsc↔bsc）**测不出来**。
 
 **建议**：
+
 1. `eth/backend.go` 的 `Legacy != nil` 分支里无条件 `emsg.SetPayloadVersion(emsg.DPoSV2Version)`，与上游 `:190` 逐字对齐；
 2. `pbft.Config` 增 `DPoSV2StartHeight uint32`（纯透传，默认 0），**不放 `params.ChainConfig`**，理由：它是死开关，放 ChainConfig 会触发 D9 的 "stored config mismatch"；
 3. T8 的测试锁死版本值，防回退。
 
 **待你确认**：接受"进 `pbft.Config` 而非 `ChainConfig`"这个偏离上游的选择，还是宁可冒 D9 的风险也照上游放 ChainConfig？
+
+选建议1: `eth/backend.go` 的 `Legacy != nil` 分支里无条件 `emsg.SetPayloadVersion(emsg.DPoSV2Version)`，与上游 `:190` 逐字对齐；
 
 ### O2 — `routes.Config.IsCurrent` 在 bsc 绑什么
 
@@ -338,6 +349,8 @@ engine.IsCurrent = func() bool {
 **建议**：`dpos.Config.IsCurrent = func() bool { return e.chain.SyncProgress()... }` 或直接绑 `downloader.Progress()` 的 `CurrentBlock >= HighestBlock`，**去掉 `IsBadBlock` 分支**（bsc 没有这个概念，且它是"最高块是坏块"的兜底，属于 recover 场景，M4 不追求）。
 
 **待你确认**：M4 阶段是否可以简化成"`CurrentBlock >= HighestBlock`"，把 bad-block 兜底推到 M6？
+
+确认：可以
 
 ### O3 — `NetworkConfig.GetCurrentHeight`（即 `PingNonce`/`PongNonce`）绑什么
 
@@ -363,20 +376,22 @@ T6 表里标"已有"的 6 个方法（`ProcessProposal`/`ProcessVote`/`onChangeV
   - 单独 listener：干净，但 `Engine` 要让出 `network`/`dispatcher` 的访问权
 - **我倾向单独 `dposListener`**，理由：`Engine` 已经背了 geth 的 `consensus.Engine` 接口，再背一个 24 方法的 DPoS 接口，两个接口的语义会互相污染。
 
+好的。单独dposListener
+
 ### O6 — `ETESCStateChanged`（2005）在 bsc 的落点（**已查清，不需你决策，只需点头**）
 
 **证据**：`chainbridge-core/dpos_msg/event.go:11` 定义 `ETESCStateChanged events.EventType = 2005`，消费者是 `pgp-chain/spv/blocklistener.go:121/126`（`events.Notify(dpos_msg.ETESCStateChanged, ChainState_DPOS / ChainState_POW)`）。
 
 bsc 侧的两半**都已经在了**，只差中间那根线：
 
-| 半 | 位置 | 现状 |
-|---|---|---|
-| 状态常量 | `bsc/spv/spv_module.go:123-124` `ChainState_DPOS = iota` / `ChainState_POW` | ✅ 已有 |
-| notify 调用点 | `bsc/spv/blocklistener.go:390`、`:395` | ⚠️ 是 `// TODO(spv-porter): notify dpos_msg.ETESCStateChanged with ChainState_DPOS.` 两行注释 |
-| 事件常量 | — | ❌ 缺 |
+| 半          | 位置                                                                          | 现状                                                                                       |
+| ---------- | --------------------------------------------------------------------------- | ---------------------------------------------------------------------------------------- |
+| 状态常量       | `bsc/spv/spv_module.go:123-124` `ChainState_DPOS = iota` / `ChainState_POW` | ✅ 已有                                                                                     |
+| notify 调用点 | `bsc/spv/blocklistener.go:390`、`:395`                                       | ⚠️ 是 `// TODO(spv-porter): notify dpos_msg.ETESCStateChanged with ChainState_DPOS.` 两行注释 |
+| 事件常量       | —                                                                           | ❌ 缺                                                                                      |
 
 - **建议**：`bsc/dpos/event.go` 加 `ETESCStateChanged = 1013`，把 `spv/blocklistener.go:390/395` 的 TODO 换成真实 `events.Notify`。**注意这会引入 `spv → dpos` 的依赖边**——`dpos/event.go:14-19` 的注释说这条边已经存在（SPV 是 `ETNextProducers` 的生产者），所以不新增环。
-- **待你确认**：只确认"这条依赖边可以加一个常量"，不需要更多判断。
+- **待你确认**：只确认"这条依赖边可以加一个常量"，不需要更多判断。 可以
 
 ### O7 — `routes.go:276` 空 `if` 块（见 T5，这里只留证）
 
@@ -395,12 +410,12 @@ bsc 侧的两半**都已经在了**，只差中间那根线：
 
 ## 六、本轮没有解决、但必须记账的
 
-| 项 | 状态 | 为什么现在不解决 |
-|---|---|---|
-| R12（未来父块门禁） | 冻结 | 等 devnet 的 `D` 分布数据，与网络层无关 |
-| R18（M3 互通台架） | 冻结 | 等 M3 的台架结果；M4 依赖 M3 的 ELAMSG 通路先通 |
-| `#27` 六条落点线 | 未结 | `network.go:173-176`、`:500-512`、`pbft.go:304/312`、`network.go:1122`、`ETUpdateProducers`、`spv/nextturn_dposinfo.go:261` —— 其中 `ETUpdateProducers` 那条由本拆解 T6 #24 收口，其余待 M4 编码时逐条核 |
-| `eth/bpos_network.go` | 判为不移植 | BPoS 验证人网络，与 PBFT 生产者集无关；若 M5 互通需要再评估 |
+| 项                     | 状态    | 为什么现在不解决                                                                                                                                                                        |
+| --------------------- | ----- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| R12（未来父块门禁）           | 冻结    | 等 devnet 的 `D` 分布数据，与网络层无关                                                                                                                                                      |
+| R18（M3 互通台架）          | 冻结    | 等 M3 的台架结果；M4 依赖 M3 的 ELAMSG 通路先通                                                                                                                                               |
+| `#27` 六条落点线           | 未结    | `network.go:173-176`、`:500-512`、`pbft.go:304/312`、`network.go:1122`、`ETUpdateProducers`、`spv/nextturn_dposinfo.go:261` —— 其中 `ETUpdateProducers` 那条由本拆解 T6 #24 收口，其余待 M4 编码时逐条核 |
+| `eth/bpos_network.go` | 判为不移植 | BPoS 验证人网络，与 PBFT 生产者集无关；若 M5 互通需要再评估                                                                                                                                           |
 
 ---
 
@@ -409,3 +424,70 @@ bsc 侧的两半**都已经在了**，只差中间那根线：
 按 T1→T9 的顺序，**T1–T5 不需要任何开放问题结论就能开工**（纯移植 + 边界断言），第一次需要你拍板的是 **O1**（T8 之前）和 **O2**（T7 之前）。
 
 如果你想尽快看到代码，我建议：**先批 T1–T5**（约 1100 行移植 + 边界测试，不碰任何开放问题），O1/O2 在 T5 完成后再定。
+
+---
+
+## 八、实施记录：T1–T5（已交付）
+
+### 8.1 产出清单
+
+| 文件 | 行数 | 内容 |
+|---|---|---|
+| `dpos/network.go` | 484 | 移植 + 裁剪。`NetworkConfig`/`Network`/`createMessage`/`processMessage`/`UpdatePeers` 等 |
+| `dpos/routes.go` | 671 | **全量**移植（零 chainbridge 依赖，无裁剪） |
+| `dpos/event.go` | +20 | `ETDirectPeersChanged = 1012` |
+| `dpos/network_test.go` | 115 | T4 的 3 条 Stop 回归 |
+| `dpos/network_cmd_table_test.go` | 145 | T1 的 3 条 wire 表断言 |
+| `dpos/routes_test.go` | 152 | T5 的 2 条 announce 断言 |
+
+### 8.2 一个与原计划相反的结论（重要）
+
+原文 §1.2 第一版写"移植后 `createMessage` 应降到 20 条"。**实施时发现那是错的**：按那个做，每个 1.9.7 节点第一次发 `arbiter` 就会把 DPoS 连接断掉——正是 D10 要防的事。
+
+正确的落地是：
+
+| 位置 | case 数 | 说明 |
+|---|---|---|
+| `messageForCMD`（旧 `createMessage` 的 switch） | **24** | 4 个仲裁人用 `dmsg.CmdXxx` + `dpos/msg/layer2.go` 的类型注册，**不依赖 chainbridge 包**，但 CMD 留在表里 |
+| `processMessage` | **20** | 4 个仲裁人**不分发**，解出来即丢 |
+
+也就是"24 → 20 只发生在 `processMessage`"。§1.2 已按此改写，T3 判据 4 同时查两个数。
+
+### 8.3 判据与负向验证（每条都真跑过）
+
+| 判据 | 结果 |
+|---|---|
+| `build_rc`（`go build ./...`） | 0 |
+| `go vet ./dpos/` | 0 |
+| `go test ./dpos/...` | 3 个包全绿（dpos 1.01s） |
+| `go test ./dpos/ -race -run '...'` | ok 2.21s |
+| `grep -c dpos_msg dpos/network.go` | **0** |
+| `OnLayer2Msg` 非注释命中 | **0**（总计 1，是 `:91` 的解释性注释） |
+| `messageForCMD` case 数 | **24** |
+| `processMessage` case 数 | **20** |
+| `grep -c 'dpos/p2p/peer"' dpos/network.go` | **1**（`peer` 与 `dpeer` 已合并） |
+
+三条负向验证，确认断言不是摆设：
+
+1. **删 codec**：从 `messageForCMD` 移除 `case dmsg.CmdDArbiter` → `TestWireCommandTableIsComplete` FAIL，报错精确到 `messageForCMD("arbiter") = nil; a 1.9.7 peer can send this and the DPoS connection would be dropped`。
+2. **加回分发**：给 `processMessage` 加一个 `CmdDArbiter` 分支 → `TestChainbridgeMessagesAreDecodedButNotDispatched` FAIL，报 `processMessage dispatched "arbiter" to the listener (...nil pointer dereference); chainbridge business is not ported, so the case must be absent`。
+3. **修好门禁**：把 `routes.go` 的空 `if` 块填上 `continue` → `TestAnnounceWithFewPeers` FAIL，报 `only 0 of 2 DAddr relays observed with 3 peers; the announce gate at routes.go must stay empty (m4 O7)`。
+4. **恢复旧 Stop**：把 `stopOnce + close` 换回 `n.quit <- struct{}{}` → `TestNetworkStopIsIdempotent` 卡在 `chan send`（`network.go:185`），40s 超时 FAIL。
+
+四次改动都已还原并复跑通过。
+
+### 8.4 实施中新增的两处结构改动
+
+1. **`createMessage` 拆成 `messageForCMD` + 校验**。原函数是"switch 然后 `CheckAndCreateMessage`"，没法在单测里调（需要 header、checksum、`net.Conn`）。拆开后 `createMessage` = 查表 + 校验，行为不变，但 wire 表变成可断言对象。这是为 T1 判据服务的，不是风格偏好。
+2. **`Network.quit` 从 `chan bool` 改成 `chan struct{}` + `sync.Once`**。见 T4。顺带把 `fmt.Println(">>>>>>> cfg.DPoSV2StartHeight <<<<<<<<")` 这类 stdout 调试输出全部去掉。
+
+### 8.5 还没做、等 O1/O2 的
+
+| 任务 | 卡在哪 | 现状 |
+|---|---|---|
+| T6（24 个 listener 方法） | 只卡 O5 的形态选择（放 `Engine` 还是独立 `dposListener`） | 未开工 |
+| T7（`SetTransport` + `AnnounceDAddr` + `routeCfg`） | **O2**（`IsCurrent` 绑 downloader 还是要保 bad-block 兜底）、O3、O4 | 未开工 |
+| T8（`SetPayloadVersion`） | **O1**（`DPoSV2StartHeight` 放 `pbft.Config` 还是 `ChainConfig`） | 未开工 |
+| T9（4 节点台架） | 依赖 T6–T8 | 未开工 |
+
+`dpos.NetworkEventListener` 现在是 24 个方法、**零实现者**，`NewNetwork` 会接住任何满足它的类型。在 T6 落地前，网络层能编译、能构造，但没人接消息。

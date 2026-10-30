@@ -32,4 +32,24 @@ const (
 	ETUpdateProducers  events.EventType = 1009
 	ETOnDutyEvent      events.EventType = 1010
 	ETNextValidators   events.EventType = 1011
+
+	// ETDirectPeersChanged carries *peer.PeersInfo{CurrentPeers, NextPeers} and
+	// is the seam between the two DPoS channels:
+	//
+	//	pbft.AnnounceDAddr  --Notify-->  Routes.PeersChanged  --UpdatePeers--> Network
+	//
+	// i.e. it turns "who should I be peered with" into "dial these PIDs on the
+	// independent TCP server".
+	//
+	// Elastos.ELA/events defines a constant of the same name (events.go:47,
+	// value 6, an iota slot). This package deliberately does not use that one:
+	// per the file comment above, dpos numbers its events from 1000 to stay out
+	// of the Elastos internal range, and every producer and consumer in this
+	// tree uses THIS constant, so the two numbering schemes never meet. Take the
+	// Elastos value here and AnnounceDAddr's Notify would reach no subscriber.
+	//
+	// peer.PeersInfo has three fields; producers fill only the first two and
+	// leave CRPeers nil. Keep that asymmetry -- CRPeers is the chainbridge
+	// arbiter candidate set, which is not ported (D10).
+	ETDirectPeersChanged events.EventType = 1012
 )
