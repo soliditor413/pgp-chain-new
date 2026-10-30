@@ -342,6 +342,23 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 		log.Info("Unprotected transactions allowed")
 	}
 	ethAPI := ethapi.NewBlockChainAPI(eth.APIBackend)
+
+	// Pin the DPoS wire version before anything can open a DPoS connection.
+	//
+	// The switch is process-wide (consensus/pbft/wireversion.go) and it selects
+	// the field layout of the version/ping/pong messages. A pgp-chain 1.9.7 peer
+	// expects V2, and a mismatch does not produce an error on either side: each
+	// side reads a payload of the "wrong" length, fails the checksum and drops the
+	// peer, so the only symptom is a producer set that never connects.
+	//
+	// pgp-chain does this unconditionally for any node carrying a PBFT config
+	// (eth/backend.go:190). The condition here is the same question asked with
+	// this tree's vocabulary: Legacy != nil means "this chain runs PBFT".
+	if chainConfig.Legacy != nil {
+		pbft.SetWireVersionV2()
+		log.Info("DPoS wire version pinned", "payloadVersion", pbft.WireVersion())
+	}
+
 	// The arbiter keystore path is per-node and may be relative; only this
 	// function has the node's datadir, so it is resolved here rather than in
 	// cmd/utils' setPbft.

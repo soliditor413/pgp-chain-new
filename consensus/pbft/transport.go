@@ -21,6 +21,8 @@ import (
 
 	"github.com/elastos/Elastos.ELA/core/types/payload"
 	emsg "github.com/elastos/Elastos.ELA/dpos/p2p/msg"
+	"github.com/elastos/Elastos.ELA/dpos/p2p/peer"
+	elap2p "github.com/elastos/Elastos.ELA/p2p"
 
 	"github.com/ethereum/go-ethereum/core/types"
 )
@@ -61,6 +63,27 @@ type Transport interface {
 	// is only sent once the view offset has run past maxViewOffset, i.e. when
 	// view rotation alone is no longer making progress.
 	BroadcastResetView(msg *emsg.ResetView)
+
+	// BroadcastRaw sends an arbitrary DPoS message to the producer set.
+	//
+	// The five methods above cover the consensus round, where naming the message
+	// buys a doc comment and a type check. The sync path does not fit that shape:
+	// it carries Inventory, GetBlock, ResponseBlocks, RequestConsensus and
+	// ResponseConsensus, none of which is a round message, and one method per
+	// message would double the interface for no extra safety. pbft.engine's
+	// OnInv / OnGetBlock / OnBlockReceived are the callers.
+	BroadcastRaw(msg elap2p.Message)
+
+	// BroadcastRawExcept is BroadcastRaw minus one peer, used by the block relay
+	// path (a block just received is not sent back to its sender).
+	BroadcastRawExcept(msg elap2p.Message, except peer.PID)
+
+	// SendToPeer sends one DPoS message to one producer.
+	//
+	// Required because the sync path is request/response: OnInv answers one peer
+	// with one GetBlock, OnGetBlock answers with one BlockMsg. Broadcasting those
+	// would make every producer answer the same request.
+	SendToPeer(pid peer.PID, msg elap2p.Message) error
 }
 
 // SetTransport installs the network implementation.

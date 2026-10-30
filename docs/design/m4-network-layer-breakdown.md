@@ -481,13 +481,91 @@ bsc 侧的两半**都已经在了**，只差中间那根线：
 1. **`createMessage` 拆成 `messageForCMD` + 校验**。原函数是"switch 然后 `CheckAndCreateMessage`"，没法在单测里调（需要 header、checksum、`net.Conn`）。拆开后 `createMessage` = 查表 + 校验，行为不变，但 wire 表变成可断言对象。这是为 T1 判据服务的，不是风格偏好。
 2. **`Network.quit` 从 `chan bool` 改成 `chan struct{}` + `sync.Once`**。见 T4。顺带把 `fmt.Println(">>>>>>> cfg.DPoSV2StartHeight <<<<<<<<")` 这类 stdout 调试输出全部去掉。
 
-### 8.5 还没做、等 O1/O2 的
+### 8.5 还没做的
 
 | 任务 | 卡在哪 | 现状 |
 |---|---|---|
-| T6（24 个 listener 方法） | 只卡 O5 的形态选择（放 `Engine` 还是独立 `dposListener`） | 未开工 |
-| T7（`SetTransport` + `AnnounceDAddr` + `routeCfg`） | **O2**（`IsCurrent` 绑 downloader 还是要保 bad-block 兜底）、O3、O4 | 未开工 |
-| T8（`SetPayloadVersion`） | **O1**（`DPoSV2StartHeight` 放 `pbft.Config` 还是 `ChainConfig`） | 未开工 |
-| T9（4 节点台架） | 依赖 T6–T8 | 未开工 |
+| T7（`SetTransport` + `AnnounceDAddr` + `routeCfg`） | **O2 已定**（绑 downloader 进度，放弃 bad-block 兜底），O3、O4 未定 | 未开工 |
+| T9（4 节点台架） | 依赖 T7 | 未开工 |
 
-`dpos.NetworkEventListener` 现在是 24 个方法、**零实现者**，`NewNetwork` 会接住任何满足它的类型。在 T6 落地前，网络层能编译、能构造，但没人接消息。
+`dpos.NetworkEventListener` 现在有实现者了（`*pbft.Engine`），见 §十。T8 见 §九。
+
+---
+
+## 九、实施记录：T8（O1 落地，已交付）
+
+O1 的决定是「`DPoSV2StartHeight` 无条件视为已过」，即 DPoS 线格式**恒定 V2**。落地方式：
+
+| 文件 | 内容 |
+|---|---|
+| `consensus/pbft/wireversion.go` | `SetWireVersionV2()` / `WireVersion()` / `DPoSWireVersionV2` 三个薄封装 |
+| `consensus/pbft/config.go` | 新增 `DPoSV2StartHeight uint32` 字段，注释写清它是**死开关**、不进 `ChainConfig`（D9） |
+| `eth/backend.go` | `chainConfig.Legacy != nil` 时调用 `pbft.SetWireVersionV2()`，并打一条 `DPoS wire version pinned` 日志 |
+| `consensus/pbft/wireversion_test.go` | 2 条断言：设完读回来是 V2；本地常量 == `dposmsg.DPoSV2Version`（防上游常量漂移） |
+
+要点：`SetPayloadVersion` 影响的是 `dpos/msg/version.go:60/67/74/97` 的**字段布局**，不是可选优化。上游 `pgp-chain/eth/backend.go:190` 本来就是无条件 `SetPayloadVersion(DPoSV2Version)`，`peer.go:814` 的 `if` 只是重复一次。所以这里「无条件设 V2」不是简化，是**对齐上游唯一真实行为**。
+
+漏掉它的后果是 M5 与真链互通时字段错位、全量解不出消息 —— 而 M4 台架是 bsc↔bsc，两边都漏，测不出来。
+
+---
+
+## 十、实施记录：T6（24 个 listener 方法，已交付）
+
+### 10.1 产出
+
+| 文件 | 内容 |
+|---|---|
+| `consensus/pbft/network_listener.go` | 24 个回调 + 恢复状态机 + 链读写窄接口 + 辅助函数 |
+| `consensus/pbft/network_listener_test.go` | 8 条测试（含 2 条同步路径、1 条恢复状态机、1 条纯函数算术） |
+| `consensus/pbft/transport.go` | +3 方法：`BroadcastRaw` / `BroadcastRawExcept` / `SendToPeer` |
+| `consensus/pbft/engine.go` | +字段：`reqMu` / `requestedBlocks` / `requestedProposals` / `notHandledProposal` / `statusMap` / `recoverStarted` / `blocks` / `inserter` / `peerCount` / `announce` |
+
+形态选择（O5）：**放在 `*Engine` 上**，不另建 `dposListener` 类型。理由是上游的监听器本来就是 `*Pbft` 自己，而恢复路径要同时读 dispatcher、blockPool 和链头，独立类型只能把它们全部转发一遍，多一层而没有任何隔离收益。
+
+### 10.2 三处必须新增的接缝
+
+| 接缝 | 为什么必须新增 |
+|---|---|
+| `Transport` 从 5 方法扩到 8 | 同步路径是**请求/响应**：`OnInv` 要单播一个 `GetBlock` 给发方，`OnGetBlock` 要单播回去。广播会让 N 个 producer 同时答同一个请求 |
+| `blockReader` / `blockInserter` 两个窄接口 | `consensus.ChainHeaderReader` 只读，而同步路径要 `GetBlockByHash` / `InsertChain`。`core` imports `consensus`，所以不能直接命名 `*core.BlockChain`；这和 D3 是同一手法 |
+| `SetPeerCounter` | 恢复与块同步都要判「peers 够不够多数」，而 peer 数只有网络对象知道 |
+
+### 10.3 两处刻意留空
+
+1. **`OnGetBlocks` / `OnResponseBlocks` 空实现**。上游也是空的（`network.go:579-585`，「范围同步从来没写完」），保留空函数是为了让这两个 CMD 能解码、连接不断。
+2. **`OnSmallCroTxReceived` / `OnFailedWithdrawTxReceived` 只打日志**。chainbridge 业务不移植（D10）；消息解码后直接丢。
+
+### 10.4 判据与负向验证
+
+| 判据 | 结果 |
+|---|---|
+| `go build ./eth/ ./consensus/... ./dpos/...` | rc=0 |
+| `go vet ./consensus/pbft/ ./dpos/...` | rc=0 |
+| `gofmt -l consensus/pbft/ dpos/` | 空 |
+| `go test ./consensus/pbft/ ./dpos/...` | 全绿 |
+| `go test -race ./consensus/pbft/ ./dpos/` | ok（pbft 3.31s / dpos 2.53s） |
+| `grep -c 'func (e *Engine) On' network_listener.go` | **24** |
+| `var _ dpos.NetworkEventListener = (*Engine)(nil)` | 编译期成立 |
+
+负向验证 1 条：
+
+- **去掉 `OnInv` 的 producer 守卫** → `TestOnInvIgnoresNonProducers` FAIL，报 `a node outside the producer set answered OnInv (1 messages)`。已还原。
+
+另有一处**不需要负向验证**：`OnGetBlock` 里把池里的 `dpos.DBlock` 断言成 `*types.Block` 这种写法，编译器直接拒绝（`impossible type assertion: *types.Block does not implement dpos.DBlock (missing method GetHash)`），不需要靠测试兜。
+
+### 10.5 编译期踩到的一个坑（记下来免得重犯）
+
+`network_listener.go` 一开始同时写了：
+
+```go
+"github.com/elastos/Elastos.ELA/common"          // 裸名 → 占用 common
+elacom "github.com/elastos/Elastos.ELA/common"  // 别名
+```
+
+两个 import 指向同一个包，裸名那个赢下了 `common` 这个标识符，于是 geth 的 `common.Hash` / `common.BytesToHash` / `common.Bytes2Hex` 全部不可达，报错是 `common.Hash (value of type func(data []byte) Uint256) is not a type` —— 看起来像 geth 的问题，实际是自己遮蔽了自己。
+
+修法：**只给 Elastos 的 common 起别名**（`elacom`），geth 的保持裸名 `common`，因为本文件里 geth 侧全是 `common.Hash` 这种写法，反过来别名会让文件读起来是反的。
+
+### 10.6 与原计划的一处偏差
+
+原文把「`blockPool.GetBlock` 返回的 DBlock 需要一层适配」列为待办，实际不需要新代码：`legacy.go` 的 `dBlock` 就是那层适配，`OnGetBlock` 只需 `block.(*dBlock)` 再取 `.Block`。真正需要新写的是 `blockReader` / `blockInserter` 两个接口 —— 因为链那一侧（`*core.BlockChain`）还没有任何东西包过它。

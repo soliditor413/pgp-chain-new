@@ -87,6 +87,24 @@ type Config struct {
 
 	// NodeVersion is exchanged in the DPoS version message.
 	NodeVersion string
+
+	// DPoSV2StartHeight is carried for parity with pgp-chain's
+	// --pbft.dposv2startheight, but it decides nothing here and is not exposed as
+	// a flag.
+	//
+	// It exists upstream to raise the DPoS payload version to V2 once the chain
+	// passes a height (dpos/p2p/peer/peer.go:814). That gate is dead in practice:
+	// pgp-chain/eth/backend.go:190 calls SetPayloadVersion(DPoSV2Version)
+	// unconditionally, so the per-peer branch only re-does what already happened.
+	// This port keeps the unconditional call (pbft.SetWireVersionV2) and therefore
+	// never reads this field -- see wireversion.go for why the version has to be
+	// pinned before the first handshake.
+	//
+	// It is NOT on ChainConfig (D9): the value that actually matters is a
+	// process-wide switch, not a chain parameter, and putting a dead field into
+	// ChainConfig would mean a config that can disagree with itself at no
+	// diagnostic benefit.
+	DPoSV2StartHeight uint32
 }
 
 // productionEnabled reports whether this node was configured to produce blocks.

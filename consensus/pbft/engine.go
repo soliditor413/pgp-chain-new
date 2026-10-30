@@ -59,6 +59,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/dpos"
+	dmsg "github.com/ethereum/go-ethereum/dpos/msg"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
 )
@@ -141,6 +142,45 @@ type Engine struct {
 	// StartMine is injected by the node wiring. It asks the miner to build a new
 	// work item, which is how a view change hands the turn to the next producer.
 	StartMine func()
+
+	// ---- DPoS message state (see network_listener.go) ----
+	//
+	// These are the bookkeeping maps the inbound handlers need. They are all
+	// guarded by reqMu because DPoS messages are delivered from the network
+	// goroutine while the miner reads the same state.
+	reqMu              sync.Mutex
+	requestedBlocks    map[common.Hash]struct{}
+	requestedProposals map[elacom.Uint256]struct{}
+	notHandledProposal map[string]struct{}
+
+	// statusMap collects the consensus statuses peers answer a recovery request
+	// with, bucketed by view offset: recovery picks the highest offset that has
+	// any answer, because that is the furthest the set has moved.
+	statusMapMu sync.Mutex
+	statusMap   map[uint32]map[string]*dmsg.ConsensusStatus
+
+	// recoverStarted guards the one in-flight recovery exchange.
+	recoverMu      sync.Mutex
+	recoverStarted bool
+
+	// ---- chain write seam (see network_listener.go) ----
+	//
+	// consensus.ChainHeaderReader is read-only on purpose (AttachChain explains
+	// why), but the DPoS sync path has to read block bodies and insert a block a
+	// peer sent. core imports consensus, so the engine cannot name
+	// *core.BlockChain without a cycle; these two narrow interfaces are the same
+	// answer as D3.
+	blocks    blockReader
+	inserter  blockInserter
+	peerCount func() int
+
+	// announce asks the DPoS network to re-announce our address.
+	//
+	// It is the engine's copy of dpos.NetworkConfig.AnnounceAddr, installed by
+	// the assembly layer rather than read out of the network object, so that a
+	// transport-less node has a nil here and re-announcing becomes a no-op. See
+	// network_listener.go's announceAddr.
+	announce func()
 }
 
 // New creates the engine.
@@ -161,6 +201,11 @@ func New(legacy *params.LegacyConfig, cfg *Config) *Engine {
 		confirmCh:   make(chan *payload.Confirm, 1),
 		unConfirmCh: make(chan *payload.Confirm, 1),
 		stopCh:      make(chan struct{}),
+
+		requestedBlocks:    make(map[common.Hash]struct{}),
+		requestedProposals: make(map[elacom.Uint256]struct{}),
+		notHandledProposal: make(map[string]struct{}),
+		statusMap:          make(map[uint32]map[string]*dmsg.ConsensusStatus),
 	}
 	if cfg != nil {
 		e.cfg = *cfg
