@@ -407,16 +407,35 @@ func (e *Engine) GetIrreversibleHeight() uint64 {
 }
 
 // OnBlockImported advances the irreversible height when an imported block is one
-// this node has a confirm for, and resets the round state otherwise.
+// this node has a confirm for, and re-anchors the view grid on every imported
+// block.
 //
 // It is driven by the node's chain-head subscription, NOT by Finalize: Finalize
 // runs for every imported block including side branches, so advancing finality
 // there would let a side chain move the watermark (see docs/design
 // pbft-port-design.md D2).
 //
-// The confirm comparison is what makes this idempotent and safe: a block we just
-// sealed has already been recorded by addConfirmToBlock, so FinishedProposal runs
-// once and the second call (from the event) returns early on the height guard.
+// The confirm comparison is what makes the finality half idempotent and safe: a
+// block we just sealed has already been recorded by addConfirmToBlock, so
+// FinishedProposal runs once and the second call (from the event) returns early
+// on the height guard.
+//
+// The two halves are deliberately split, and the split has a shape that is easy
+// to get wrong: upstream bundles them in Finalize
+// (pgp-chain/consensus/pbft/pbft.go:591-598, FinishedProposal(..., header.Time)),
+// and this function unbundles them into "advance the watermark only when we hold
+// the confirm" and "re-anchor the view for every imported block". Unbundling is
+// correct -- that is D2, and D2's whole point is that a block this node has no
+// confirm for must not move GetIrreversibleHeight, which is reported to RPC as
+// the irreversible height. What was wrong was unbundling them and dropping the
+// anchor with them: the port then re-anchored on the local clock instead, which
+// put every node on a different grid and livelocked six producers at the same
+// height with "have different view offset".
+//
+// So the anchor argument below is header.Time and not the local clock, and it is
+// passed on the reset path too, not only on the confirm path. header.Time is the
+// only value both branches share and every node computes identically; see the
+// contract on Dispatcher.ResetConsensus.
 func (e *Engine) OnBlockImported(header *types.Header) {
 	if header == nil || header.Number == nil {
 		return
@@ -431,7 +450,7 @@ func (e *Engine) OnBlockImported(header *types.Header) {
 			return
 		}
 	}
-	e.dispatcher.ResetConsensus(height)
+	e.dispatcher.ResetConsensus(height, header.Time)
 }
 
 // IsProductionEnabled reports whether this node may produce blocks.

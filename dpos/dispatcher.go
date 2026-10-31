@@ -351,8 +351,50 @@ func (d *Dispatcher) FinishedProposal(height uint64, sealHash elacom.Uint256,
 	d.resetViewMu.Unlock()
 }
 
-func (d *Dispatcher) ResetConsensus(height uint64) {
-	Info("[resetConsensus] start", "d.consensusView.IsRunning()", d.consensusView.IsRunning())
+// ResetConsensus re-anchors the view grid and clears the round state.
+//
+// # The anchor contract
+//
+// anchor is not "roughly when this reset happened". It is the value every node
+// MUST compute identically, and the only such value available to a node that has
+// just imported a block is that block's header.Time -- the same integer on every
+// producer, because it is part of the block. ChangeView(now, true, anchor) ends
+// with setChangViewTimeLocked(anchor), which truncates to a whole second and
+// writes viewStartTime = anchor, viewChangeTime = anchor + signTolerance, so the
+// grid a node walks afterwards is a pure function of anchor. Same anchor, same
+// grid; different anchor, different grid, forever.
+//
+// Passing the local clock instead (uint64(now.Unix()), what this function used to
+// do) makes the grid a function of this node's own timing, and the two failure
+// modes that follow are exactly the ones measured on the six-producer rig:
+//
+//   - Two nodes whose handlers fire in different seconds end up on grids one or
+//     more whole views apart, so at one instant they report different
+//     viewOffsets for the same height. ProcessProposal then drops every proposal
+//     whose ViewOffset differs from its local one (dispatcher.go, "have
+//     different view offset"), which is a permanent 3:3 standstill, not a
+//     transient: nothing in that loop ever re-aligns the grid.
+//   - Sub-second phase differences (process start, ticker phase) are NOT the
+//     bug and cannot heal the bug. ChangeView's own realignment
+//     (viewStartTime = now - offsetTime) restores the grid that was already in
+//     force; it cannot move a node onto the other node's grid. Only a force
+//     reset with a shared anchor can.
+//
+// The same chicken-and-egg argument says why the local clock cannot be the
+// anchor even "just once at startup": the phase converges only when a block is
+// produced, and a block is produced only when the phase has already converged.
+//
+// Upstream basis: pgp-chain/consensus/pbft/pbft.go:591-598 -- Finalize calls
+// FinishProposal(..., header.Time), i.e. upstream anchors the grid to the
+// imported block, which is why upstream's normal path never forks the grid.
+// Upstream's own ResetConsensus (pgp-chain/dpos/dispatcher.go:216-231) carries
+// the same local-clock anchor as this one but is reachable only from the
+// ResetView quorum path (pgp-chain/consensus/pbft/network.go:967), not from
+// block import. Note also ResetConsensusForEpochTransition below, which already
+// takes its anchor from the caller for the same reason.
+func (d *Dispatcher) ResetConsensus(height uint64, anchor uint64) {
+	Info("[resetConsensus] start", "d.consensusView.IsRunning()", d.consensusView.IsRunning(),
+		"height", height, "anchor", anchor)
 	defer Info("[resetConsensus] end")
 
 	if d.consensusView.IsRunning() {
@@ -361,7 +403,7 @@ func (d *Dispatcher) ResetConsensus(height uint64) {
 		d.CleanProposals(false)
 		d.consensusView.ResetViewOffset()
 		d.consensusView.UpdateDutyIndex(height)
-		d.consensusView.ChangeView(d.timeSource.AdjustedTime(), true, uint64(d.timeSource.AdjustedTime().Unix()))
+		d.consensusView.ChangeView(d.timeSource.AdjustedTime(), true, anchor)
 	}
 	d.resetViewMu.Lock()
 	d.resetViewRequests = make(map[string]struct{}, 0)

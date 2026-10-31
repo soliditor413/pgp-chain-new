@@ -646,8 +646,21 @@ func (e *Engine) OnResponseResetViewReceived(m *emsg.ResetView) {
 		return
 	}
 	if e.dispatcher.GetResetViewReqCount() >= e.minAcceptVoteCount() {
-		e.dispatcher.ResetConsensus(e.headNumber())
-		log.Info("[OnResponseResetViewReceived] consensus reset")
+		height, anchor, ok := e.headAnchor()
+		if !ok {
+			// Degraded anchor, and the only place in this tree where the local
+			// clock is allowed to be one. See headAnchor: it is tolerable here
+			// because this path runs at startup recovery and the first imported
+			// block re-anchors every producer through
+			// OnBlockImported(header.Time), but it is still a fork risk for the
+			// instant before that block arrives, so it is logged rather than
+			// silently taken.
+			anchor = uint64(e.dispatcher.GetNowTime().Unix())
+			log.Warn("[OnResponseResetViewReceived] no head header, anchoring the view "+
+				"to the local clock until the next block import", "anchor", anchor)
+		}
+		e.dispatcher.ResetConsensus(height, anchor)
+		log.Info("[OnResponseResetViewReceived] consensus reset", "height", height, "anchor", anchor)
 		if e.StartMine != nil {
 			e.StartMine()
 		}
@@ -821,13 +834,36 @@ func (e *Engine) OnProducersMsg(m *dmsg.ProducersMsg) {
 
 // ---- helpers ---------------------------------------------------------------------
 
-func (e *Engine) headNumber() uint64 {
-	if chain := e.chainReader(); chain != nil {
-		if h := chain.CurrentHeader(); h != nil && h.Number != nil {
-			return h.Number.Uint64()
-		}
+// headAnchor returns the height and timestamp of the current head, which is what
+// a recovery-path reset anchors its view grid to.
+//
+// The timestamp rather than the local clock is the anchor because the grid has to
+// be a value every node computes identically (see Dispatcher.ResetConsensus). A
+// header is such a value: every producer holding the same head reads the same
+// Time out of it, regardless of when that producer's own handler happens to run.
+//
+// ok is false without a chain reader, or before the first head header is
+// readable. The caller falls back to the local clock then; headAnchor does not do
+// it, because the fallback needs a comment wherever it is taken and a silent one
+// here would be indistinguishable from the bug this signature exists to fix.
+func (e *Engine) headAnchor() (height uint64, anchor uint64, ok bool) {
+	chain := e.chainReader()
+	if chain == nil {
+		return 0, 0, false
 	}
-	return 0
+	h := chain.CurrentHeader()
+	if h == nil || h.Number == nil {
+		return 0, 0, false
+	}
+	return h.Number.Uint64(), h.Time, true
+}
+
+func (e *Engine) headNumber() uint64 {
+	height, _, ok := e.headAnchor()
+	if !ok {
+		return 0
+	}
+	return height
 }
 
 // SetAnnounceAddr installs the re-announce hook.
