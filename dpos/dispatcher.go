@@ -732,12 +732,39 @@ func (d *Dispatcher) HelpToRecoverAbnormal(id peer.PID, height uint64, currentHe
 // Inherited is not a reason to keep it: the goal is wire-level interop with old
 // nodes, not bug-level fidelity, and the fix is statement order.
 //
-// No caller in this tree yet. Upstream enters through
-// pgp-chain/consensus/pbft/network.go:924, inside Pbft.doRecoverLocked (:901),
-// after HelpToRecoverAbnormal at :597 inside Pbft.OnRequestConsensus (:587). The
-// directory is part of that reference: dpos/network.go is a different and much
-// shorter file, so a reader who looks for :924 there finds nothing and reads that
-// as "the call site does not exist".
+// Live, and hot. The caller is
+// consensus/pbft/network_listener.go:1004 (finishRecoverAndApply), reached from
+// recoverAbnormalState on every recovery exchange; on the six-producer rig that
+// was 37-50 calls per node against a chain stuck at one height. An earlier
+// version of this comment claimed "no caller in this tree yet" and pointed at
+// pgp-chain/consensus/pbft/network.go:924 instead. That was wrong and cost real
+// time: two readers took the path for dead code while it was the thing moving
+// viewOffset.
+//
+// # What medianTime does to the anchor
+//
+// The two lines below look like they re-anchor on the local clock, and that is
+// worth spelling out because it decides whether they are a fork source.
+//
+//	offsetTime = (now - medianTime) % signTolerance
+//	viewStartTime = now - offsetTime
+//
+// Expanding the second line gives medianTime + offset*signTolerance: now cancels
+// out, so the result is medianTime rounded up to its own grid, not this node's
+// clock. Two nodes holding the same medianTime therefore land on the same
+// viewStartTime even if their adjusted clocks differ. So this pair is NOT a
+// source of anchor divergence -- but medianTime itself is per-node (it is the
+// median over whichever statuses that node happened to receive, see
+// pickRecoverStatus), and when the set has no usable view clock at all it falls
+// back to the local now (network_listener.go:1084), which is this node's clock
+// again. Both of those are in pickRecoverStatus, not here.
+//
+// What IS a divergence source here is the ViewOffset line. offset is
+// (now - medianTime)/signTolerance and is therefore the same on every node, but
+// status.ViewOffset is whichever peer's counter pickRecoverStatus happened to
+// return -- it takes the first entry of a Go map, so the choice is arbitrary --
+// and the sum is written back to this node only. Two nodes reading two different
+// peers end two different values apart, with nothing to bring them back together.
 func (d *Dispatcher) RecoverAbnormal(status *dmsg.ConsensusStatus, medianTime int64) {
 	if status == nil {
 		return

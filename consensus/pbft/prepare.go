@@ -130,14 +130,40 @@ func (e *Engine) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 	// tens of millions of offsets and pushes duty onto a producer the rest of the
 	// set disagrees with. Anchoring once, correctly, removes the window instead of
 	// racing it.
+	//
+	// The anchor is parent.Time and nothing else. viewStartTime is a value the
+	// whole set has to agree on -- it is what makes "which view are we in" a
+	// question with one answer -- so the only acceptable inputs are values every
+	// node reads identically, and a block header's timestamp is the only such
+	// value available here. This node's own clock is not a candidate: two nodes
+	// that anchor on their own clocks are on different grids by the difference
+	// between the two instants, and nothing later in the round can repair it.
+	//
+	// That is why the late branch below moves header.Time and leaves the anchor
+	// alone. The two are different problems that used to share a line of code:
+	//
+	//   header.Time   is this block's timestamp. Stamping it with now when the
+	//                 parent is stale keeps the block from being born already
+	//                 expired, and it is this node's own business -- the value
+	//                 travels with the block it produces.
+	//   anchorTime    is the whole set's view clock. It has to be the same
+	//                 integer on every producer, so it can only come from data.
+	//
+	// Moving both was the port's bug, and it does not stay local: with the parent
+	// more than one period old -- which is every round on a chain that has
+	// stopped producing -- the branch fired on every Prepare on every node, so
+	// each node re-anchored on its own clock once per round and the set never had
+	// a shared grid at all. Measured on six producers stuck at height 4:
+	// viewStartTime split into two groups two seconds apart (14:32:27Z x3,
+	// 14:32:29Z x3) while viewOffset -- which does not use the anchor at all --
+	// had already diverged to 39/39/39 vs 55/55/55.
 	header.Time = parent.Time + e.period
 	anchorTime := parent.Time
 	if header.Time < nowTime {
 		// We are late: the parent is older than one period ago. Stamp the block
-		// with the current time so it is not born stale, and anchor the round on it
-		// too so the deadline is measured from now.
+		// with the current time so it is not born stale. The anchor is NOT moved
+		// with it; see above.
 		header.Time = nowTime
-		anchorTime = nowTime
 	}
 	e.startView(anchorTime, headHeight)
 
@@ -164,14 +190,16 @@ func (e *Engine) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 	return nil
 }
 
-// startView opens a round: align the view clock with the round's anchor time
-// (the parent's timestamp, or now when the parent is more than one period old),
+// startView opens a round: align the view clock with the round's anchor time,
 // recompute whose turn it is, and mark consensus running.
 //
-// The anchor is a parameter rather than read from the chain here because it has
-// to be the same instant the header was stamped with. A view clock anchored to a
-// parent the header does not use is a deadline for a round that never started --
-// see the call site.
+// The anchor is the parent block's timestamp -- a value every producer reads
+// identically. It is a parameter rather than read from the chain here because it
+// has to be the same instant the header was stamped with when the block is on
+// time, and because the one caller has already decided that; but "the caller
+// decides" is not licence to pass a local clock. A view clock anchored to
+// anything a single node chose is a deadline the rest of the set does not share,
+// which is the defect the call site's comment describes.
 //
 // The view loop that drives view changes is started once, on the first round, and
 // no-ops until the view is running. That is deliberately different from
