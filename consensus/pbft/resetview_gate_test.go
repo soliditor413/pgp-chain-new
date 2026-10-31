@@ -63,6 +63,32 @@ func TestStuckChainDoesNotTriggerAResetRequestPerTick(t *testing.T) {
 	}
 }
 
+// TestTheOffsetFromTheFieldDoesNotTriggerAReset is the same case as the one above
+// with the number the incident actually reported, so the two cannot drift apart.
+//
+// QA read all six nodes at 22:54:12 with the parent frozen at 22:28:33 and got
+// viewoffset 256 on every one: (22:54:12 - 22:28:33) / 6s = 1539/6 = 256.5, floor
+// 256. That number is not a fault and must not be one: it is how long the set has
+// been unable to produce, identical everywhere, and it is exactly the value the
+// old `vo >= maxViewOffset` test shouted at.
+func TestTheOffsetFromTheFieldDoesNotTriggerAReset(t *testing.T) {
+	const fieldViewOffset = 256 // (22:54:12 - 22:28:33) / 6s, six nodes, identical
+
+	var e Engine
+	if e.shouldRequestResetView(fieldViewOffset) {
+		t.Fatalf("view offset %d, the number all six nodes computed at 22:54:12, "+
+			"triggered a reset request", fieldViewOffset)
+	}
+	for vo := uint32(fieldViewOffset + 1); vo < fieldViewOffset+maxViewOffset; vo++ {
+		if e.shouldRequestResetView(vo) {
+			t.Fatalf("triggered at %d, only %d views after joining", vo, vo-fieldViewOffset)
+		}
+	}
+	if !e.shouldRequestResetView(fieldViewOffset + maxViewOffset) {
+		t.Fatalf("still silent %d views later; the limiter is a mute", maxViewOffset)
+	}
+}
+
 // TestStuckChainAsksOncePerWindowNotOncePerTick is the same fact stated as the
 // count the live chain actually showed, because "not every tick" and "8900 against
 // 8" are different claims and only the second one rules out a storm.

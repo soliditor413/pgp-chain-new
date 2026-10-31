@@ -585,6 +585,18 @@ func (v *ConsensusView) GetAnchor() uint64 {
 	return v.anchor
 }
 
+// GetClock is the instant GetViewOffset derives from, exposed so a status report
+// can show the derivation instead of just its result.
+//
+// It exists because of a real support case: a node reported viewoffset 0 while the
+// last reset in the log carried an anchor nearly half an hour old, which should
+// have been 285. vo on its own cannot distinguish "the derivation is wrong" from
+// "the anchor is not what the log said" from "the clock this node uses is not the
+// one you think". anchor, vo and now together can, in one line.
+func (v *ConsensusView) GetClock() time.Time {
+	return v.clockNow()
+}
+
 func (v *ConsensusView) GetConsensusStatus() uint32 {
 	v.mu.RLock()
 	defer v.mu.RUnlock()

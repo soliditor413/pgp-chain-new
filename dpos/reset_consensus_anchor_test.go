@@ -421,6 +421,34 @@ func TestDerivedOffsetSurvivesUnequalResetRates(t *testing.T) {
 	t.Logf("after %ds at unequal reset rates: %s is %v, %s is %v", seconds, producer.name, a, watcher.name, b)
 }
 
+// TestTheFrozenHeadDerivesTheOffsetTheFieldReported pins the arithmetic of the
+// second live run so it can be reproduced from a single reading.
+//
+// QA read six nodes at 22:54:12 against a parent frozen at 22:28:33 and got
+// viewoffset 256 on all six. A node also reported viewoffset 0 next to a log line
+// carrying that same anchor, which the derivation says cannot be true at the same
+// instant, so the pair is worth being able to check without a chain: a frozen
+// anchor and a clock are enough.
+func TestTheFrozenHeadDerivesTheOffsetTheFieldReported(t *testing.T) {
+	frozen := time.Unix(1_700_000_000, 0) // 22:28:33 in the field, same distance
+	node := newAnchorTestNode("A", phaseA)
+
+	// 1539s after the frozen parent: the interval QA measured.
+	node.clock.set(frozen.Add(1539 * time.Second))
+	node.resumeAndReset(5, uint64(frozen.Unix()))
+
+	if got, want := node.snapshot().offset, uint32(1539/6); got != want {
+		t.Fatalf("a frozen anchor 1539s old must derive view %d, got %d", want, got)
+	}
+	// And the reading that did not add up: an anchor of *now* derives 0, so vo=0
+	// next to an old anchor in a log can only mean the anchor was not written.
+	node.clock.set(frozen.Add(1539 * time.Second))
+	node.resumeAndReset(5, uint64(node.clock.now.Unix()))
+	if got := node.snapshot().offset; got != 0 {
+		t.Fatalf("an anchor of now must derive view 0, got %d", got)
+	}
+}
+
 // TestFrozenAnchorSurvivesAMixedResetRate is the shape of the second live
 // incident, and it is the test that decides whether deriving the offset was enough.
 //
