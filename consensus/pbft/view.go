@@ -18,6 +18,7 @@ package pbft
 
 import (
 	"bytes"
+	"sync"
 	"time"
 
 	emsg "github.com/elastos/Elastos.ELA/dpos/p2p/msg"
@@ -31,15 +32,83 @@ const (
 	// before it is already late, which is why pgp-chain has always used 1s.
 	viewTick = time.Second
 
-	// maxViewOffset is the offset at which view rotation alone is declared
-	// stuck and the node asks the set for a forced reset instead.
+	// maxViewOffset is how far the view must advance, in whole views, before
+	// rotation alone is declared stuck and the node asks the set for a forced
+	// reset instead.
 	//
-	// With twelve producers and a six second window, 100 failed views is ten
-	// minutes of a one-in-twelve proposer failing to produce. Below that the
-	// rotation is still the cheaper remedy: it needs no message the others have
-	// to agree on.
+	// Read that as a RATE, not as a threshold on the offset, and the difference is
+	// the whole point: see shouldRequestResetView. With twelve producers and a six
+	// second window, 100 failed views is ten minutes of a one-in-twelve proposer
+	// failing to produce. Below that the rotation is still the cheaper remedy: it
+	// needs no message the others have to agree on.
 	maxViewOffset = 100
 )
+
+// resetViewGate is the state of the rate limiter described on
+// shouldRequestResetView: the offset this node last asked at, and whether it has
+// started counting yet.
+//
+// A dedicated mutex, and never held while taking another: both callers read the
+// offset first and then ask, so this is a leaf.
+type resetViewGate struct {
+	mu   sync.Mutex
+	last uint32
+	on   bool
+}
+
+// shouldRequestResetView decides whether this tick asks the set for a forced view
+// reset, and limits how often it may.
+//
+// # Why the old test could not survive the anchor repair
+//
+// It used to be `vo >= maxViewOffset`, with vo a counter that a reset zeroed. Two
+// things changed. vo is now derived from the clock -- (now - anchor)/tolerance --
+// and a reset does not zero it, because there is nothing to zero; that was the
+// point of the derivation. So on a chain that has stopped producing, the anchor
+// freezes at the last block's timestamp and vo grows without bound: measured on
+// the six-producer chain, 249 within fourteen minutes. `vo >= 100` was therefore
+// true on EVERY tick, on every node, forever, and each true answer broadcast a
+// reset request plus recorded its own vote. The measured result was 8900 to 9500
+// resetConsensus calls per node in fifteen minutes, about 10Hz, and a chain that
+// could not finish a single round.
+//
+// The mistake was treating a large offset as a fault signal. vo is not a symptom
+// of anything local any more: it is "how many view slots have passed since the
+// last block", a number all six nodes compute identically, and a large value says
+// only that the chain has been stuck for a while. A quantity every node derives
+// from the clock cannot be the thing that makes them all shout.
+//
+// So the trigger is a RATE, which is what the constant was always describing: ask
+// once this node has personally watched the offset advance maxViewOffset whole
+// views without a block landing. Consequences, all intended:
+//
+//   - A node that joins an already-stuck chain with vo=250 does not ask at all
+//     until it has seen 100 more views go by. It did not watch those 250 fail.
+//   - A block landing re-anchors the grid, vo drops, and the gate re-bases on its
+//     own: the counting is per generation of the anchor.
+//   - At most one request per maxViewOffset views, which for six producers is the
+//     ten minutes the constant's comment always claimed.
+func (e *Engine) shouldRequestResetView(vo uint32) bool {
+	e.resetGate.mu.Lock()
+	defer e.resetGate.mu.Unlock()
+
+	// First look at this grid, or the offset went backwards because a block
+	// landed: start counting from here instead of asking. The "went backwards"
+	// case is not a corner -- it is the normal end of a stall, and it is also why
+	// this cannot be a plain subtraction on uint32 without it.
+	if !e.resetGate.on || vo < e.resetGate.last {
+		e.resetGate.on = true
+		e.resetGate.last = vo
+		return false
+	}
+	// Not enough views have gone by since the last request -- including the very
+	// first one, which is why a node that starts at vo=300 says nothing.
+	if vo-e.resetGate.last < maxViewOffset {
+		return false
+	}
+	e.resetGate.last = vo
+	return true
+}
 
 // ensureViewLoop starts the single view-change goroutine.
 //
@@ -107,10 +176,11 @@ func (e *Engine) onChangeView() {
 	}
 	e.dispatcher.OnChangeView()
 
-	// Rotation has failed maxViewOffset times in a row. Waiting for the offset to
-	// wrap far enough to give this node's producer another turn is pointless when
-	// the reason for the failure is shared, so ask the set for a forced reset.
-	if e.dispatcher.GetConsensusView().GetViewOffset() >= maxViewOffset {
+	// Ask for a forced reset only after watching rotation fail for
+	// maxViewOffset whole views. Not "if the offset is large": that condition is
+	// true on every tick of a stuck chain, and asking ten times a second is what
+	// kept it stuck. See shouldRequestResetView.
+	if e.shouldRequestResetView(e.dispatcher.GetConsensusView().GetViewOffset()) {
 		e.broadcastResetView()
 	}
 }

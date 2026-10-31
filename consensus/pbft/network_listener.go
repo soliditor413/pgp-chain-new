@@ -499,28 +499,23 @@ func (e *Engine) OnVoteRejected(id dpeer.PID, vote *payload.DPOSProposalVote) {
 	e.OnVoteAccepted(id, vote)
 }
 
-// OnChangeView advances the view and, past maxViewOffset, asks the set to reset.
+// OnChangeView advances the view and, once rotation has failed long enough, asks
+// the set to reset.
+//
+// The "long enough" test is shouldRequestResetView, shared with the tick loop, and
+// it is a rate and not an offset threshold. This site used to repeat the
+// `vo >= maxViewOffset` comparison inline with its own copy of the broadcast -- so
+// a stuck chain had two independent 10Hz sources, this one reached through the
+// view-change callback rather than through the ticker, and neither could see what
+// the other had already asked for.
 func (e *Engine) OnChangeView() {
 	if e.dispatcher == nil || e.account == nil {
 		return
 	}
 	e.dispatcher.OnChangeView()
 
-	if e.dispatcher.GetConsensusView().GetViewOffset() >= maxViewOffset {
-		m := &emsg.ResetView{Sponsor: e.account.PublicKeyBytes()}
-		buf := new(bytes.Buffer)
-		if err := m.SerializeUnsigned(buf); err != nil {
-			log.Error("OnChangeView: serialize reset view failed", "err", err)
-			return
-		}
-		m.Sign = e.account.Sign(buf.Bytes())
-		if t := e.getTransport(); t != nil {
-			t.BroadcastResetView(m)
-		}
-		// Record ourselves first: the broadcast above does not loop back.
-		if !e.dispatcher.ResetViewRequestIsContain(m.Sponsor) {
-			e.OnResponseResetViewReceived(m)
-		}
+	if e.shouldRequestResetView(e.dispatcher.GetConsensusView().GetViewOffset()) {
+		e.broadcastResetView()
 	}
 }
 

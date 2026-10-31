@@ -149,6 +149,11 @@ type Engine struct {
 	// transport must be released by the assembly layer via MarkRecovered.
 	recovered int32
 
+	// resetGate rate-limits the "rotation alone is not fixing this" reset-view
+	// request. See shouldRequestResetView for why an absolute offset threshold
+	// cannot be the trigger any more.
+	resetGate resetViewGate
+
 	// StartMine is injected by the node wiring. It asks the miner to build a new
 	// work item, which is how a view change hands the turn to the next producer.
 	StartMine func()

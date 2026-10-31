@@ -421,6 +421,73 @@ func TestDerivedOffsetSurvivesUnequalResetRates(t *testing.T) {
 	t.Logf("after %ds at unequal reset rates: %s is %v, %s is %v", seconds, producer.name, a, watcher.name, b)
 }
 
+// TestFrozenAnchorSurvivesAMixedResetRate is the shape of the second live
+// incident, and it is the test that decides whether deriving the offset was enough.
+//
+// The chain stopped at height 5 and never produced another block. Every node kept
+// re-anchoring -- on block import, on the recovered status exchange, on the reset
+// storm -- and every one of those re-anchorings handed back the SAME timestamp,
+// the frozen one in the parent block. So the grid never moved and the anchor was
+// never the problem; the offset was. As a counter, a reset zeroed it and the next
+// tick added back the whole elapsed distance, so one node reported 0 while its
+// neighbour reported 249, two milliseconds apart, forever. Peers reject a proposal
+// carrying another offset, so every round died on "have different view offset".
+//
+// Here the two nodes are reset at two rates an order of magnitude apart -- 10Hz and
+// 1Hz, both with the frozen parent -- which is what the storm on the live chain was
+// doing. If the offset is a position on the grid and not a private counter, the
+// rate cannot be observed in the answer.
+func TestFrozenAnchorSurvivesAMixedResetRate(t *testing.T) {
+	// The parent block's timestamp: frozen, thirty minutes old, shared by both.
+	frozen := time.Unix(1_700_000_000, 0)
+	anchor := uint64(frozen.Unix())
+	base := frozen.Add(30 * time.Minute)
+
+	slammed := newAnchorTestNode("A (reset at 10Hz)", phaseA)
+	occasional := newAnchorTestNode("B (reset at 1Hz)", phaseB)
+
+	// Sixty seconds of wall clock in 100ms steps. Both nodes tick their view clock
+	// once a second, as a real node does; the difference is how often they are
+	// re-anchored -- one by a reset storm at 10Hz, one at 1Hz. Putting the tick in
+	// is what makes the divergence visible while it happens rather than only at the
+	// end: on the counter, the 10Hz node was zeroed ten times a second and the 1Hz
+	// node kept its number, which is the 0-against-249 alternation QA measured two
+	// milliseconds apart on the same box.
+	for i := 0; i < 600; i++ {
+		now := base.Add(time.Duration(i) * 100 * time.Millisecond)
+
+		slammed.clock.set(now)
+		slammed.resumeAndReset(6, anchor)
+
+		occasional.clock.set(now)
+		if i%10 == 0 {
+			occasional.resumeAndReset(6, anchor)
+			slammed.tickAt(now)
+			occasional.tickAt(now)
+		}
+
+		a, b := slammed.snapshot(), occasional.snapshot()
+		if a.offset != b.offset {
+			t.Fatalf("step %d: the reset rate became observable in the view, got %v and %v",
+				i, a, b)
+		}
+	}
+
+	a, b := slammed.snapshot(), occasional.snapshot()
+	// 30 minutes plus the sixty seconds the loop ran, on a 6s tolerance. Stated
+	// absolutely so that two zeroes cannot pass for agreement -- 0 vs 0 is exactly
+	// what the old code produced half the time.
+	last := base.Add(599 * 100 * time.Millisecond)
+	if want := uint32(last.Sub(frozen) / anchorTolerance); a.offset != want {
+		t.Fatalf("the frozen anchor implies view %d at %v, got %v", want, last, a)
+	}
+	if !a.start.Equal(b.start) {
+		t.Fatalf("both nodes must sit in the same window, got %v and %v", a, b)
+	}
+	t.Logf("after 60s at 10Hz and 1Hz resets on a frozen anchor: %s is %v, %s is %v",
+		slammed.name, a, occasional.name, b)
+}
+
 // TestRecoverFromStatusIgnoresThePeerCounter is the same defect on the recovery
 // path, and it is the one that would keep re-seeding the divergence after every
 // other fix.
