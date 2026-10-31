@@ -157,6 +157,11 @@ func (e *Engine) changeViewLoop() {
 			if !e.viewLoopEnabled() {
 				return
 			}
+			// Before the view work, and outside its Running guard: a chain stuck
+			// on a confirm whose block never arrived is often Ready, and this is
+			// the only timer in the engine that keeps ticking either way. See
+			// reclaimOrphanedConfirm.
+			e.reclaimOrphanedConfirm(time.Now())
 			e.onChangeView()
 		}
 	}

@@ -154,6 +154,12 @@ type Engine struct {
 	// cannot be the trigger any more.
 	resetGate resetViewGate
 
+	// orphanMu guards the confirm-without-block watchdog: which height it is
+	// watching, and since when. See reclaimOrphanedConfirm.
+	orphanMu     sync.Mutex
+	orphanHeight uint64
+	orphanSince  time.Time
+
 	// StartMine is injected by the node wiring. It asks the miner to build a new
 	// work item, which is how a view change hands the turn to the next producer.
 	StartMine func()
@@ -452,10 +458,119 @@ func (e *Engine) OnBlockImported(header *types.Header) {
 	if confirm, ok := e.blockPool.GetConfirmByHeight(height); ok {
 		if sealHash := pgp.SealHash(header); common.Hash(confirm.Proposal.BlockHash) == sealHash {
 			e.dispatcher.FinishedProposal(height, elacom.Uint256(sealHash), header.Time)
+			e.blockPool.CleanFinalConfirmedBlock(height)
 			return
 		}
 	}
 	e.dispatcher.ResetConsensus(height, header.Time)
+	// Upstream does this in Finalize, for every imported block, one line after
+	// FinishedProposal (pgp-chain/consensus/pbft/pbft.go:599). Unbundling the two
+	// halves of Finalize moved FinishedProposal here and left this behind, which
+	// matters because the pool's confirm maps are only ever pruned through this
+	// call.
+	//
+	// It is a WINDOW prune, not a per-height one -- it drops entries older than
+	// height-cachedCount -- so on its own it does not clear the height that stalled
+	// the chain: a confirm for a height the chain never reached is not older than
+	// anything, it is ahead. That case needs reclaimOrphanedConfirm below, and the
+	// two are not substitutes. This one keeps the pool from growing without bound
+	// on a chain that is moving; that one unsticks a chain that has stopped.
+	e.blockPool.CleanFinalConfirmedBlock(height)
+}
+
+// confirmOrphanGrace is how long a confirm may be held for a height this node does
+// not have the block of, before it is treated as unreachable and dropped.
+//
+// Two view windows. The normal case is not close to this: the proposer holds the
+// block in its own pool before proposing, and every other node receives it on the
+// DPoS block channel just before the proposal, so a node that has the confirm and
+// not the block is already the exception. Two windows gives a slow block delivery
+// room to arrive without leaving the chain stuck for anything like long enough to
+// matter -- and "stuck" here is permanent, not slow, because nothing else in the
+// tree ever drops that entry.
+const confirmOrphanGrace = 2 * signTolerance
+
+// reclaimOrphanedConfirm breaks the confirm-without-block deadlock.
+//
+// # The stall
+//
+// A height this node holds a confirm for but has no block of is unreachable. Two
+// independent gates treat the confirm as the decision:
+//
+//	seal.go: "height already has a confirm, refusing to propose"      -> nobody proposes
+//	network_listener.go: "already finalised with another block"       -> nobody accepts
+//
+// and the only thing that ever removes a height confirm is
+// BlockPool.CleanFinalConfirmedBlock, which prunes a window six blocks behind the
+// height being imported. A confirm for a height the chain never reached is ahead of
+// that window, not behind it, so it is kept forever. Measured at 23:04 on the
+// six-producer chain: every node held a confirm for h22, none had the block, the
+// head was pinned at 21, and all six refused both to propose and to accept. Four
+// minutes later it had not moved and it never would have.
+//
+// # When dropping is safe
+//
+// The condition is the stall itself, and it has to be: a confirm for head+1 while
+// the head does not move for confirmOrphanGrace.
+//
+// The first version of this also required that the pool not hold the block, on the
+// reasoning that a node which has the block is merely late to import it. That is
+// wrong for the case that actually happened, and wrong for the proposer in
+// particular: Seal puts the block in the pool before proposing, so the proposer
+// always "has" it, and its import is exactly what stopped. Requiring the pool to be
+// missing the block made the watchdog silent in the one state it exists for --
+// measured: the test below held the confirm for 20s and nothing happened.
+//
+// What makes dropping safe is not the pool, it is that finality is not held here.
+// Finality is FinishedProposal, driven by importing a block; a block that is not in
+// the chain is not final on this node no matter what the votes said. Re-proposing
+// the same block afterwards is the normal shape -- it is the pool's copy, and a
+// competitor cannot outrun it while this node is on duty.
+func (e *Engine) reclaimOrphanedConfirm(now time.Time) bool {
+	if e.dispatcher == nil || e.blockPool == nil {
+		return false
+	}
+	head, _, ok := e.headAnchor()
+	if !ok {
+		// No chain reader yet: nothing to conclude about what we are missing.
+		e.forgetOrphanConfirm()
+		return false
+	}
+	height := head + 1
+
+	if _, has := e.blockPool.GetConfirmByHeight(height); !has {
+		e.forgetOrphanConfirm()
+		return false
+	}
+
+	e.orphanMu.Lock()
+	if e.orphanHeight != height {
+		e.orphanHeight, e.orphanSince = height, now
+		e.orphanMu.Unlock()
+		return false
+	}
+	held := now.Sub(e.orphanSince)
+	e.orphanMu.Unlock()
+	if held < confirmOrphanGrace {
+		return false
+	}
+
+	e.blockPool.DropHeightConfirm(height)
+	e.forgetOrphanConfirm()
+	log.Warn("PBFT: dropping a confirm whose block never arrived",
+		"height", height, "held", held.String(),
+		"reason", "a height cannot stay undecided; the confirm would block every proposal forever")
+	if e.StartMine != nil {
+		e.StartMine()
+	}
+	return true
+}
+
+// forgetOrphanConfirm clears the watchdog so the next height starts its own clock.
+func (e *Engine) forgetOrphanConfirm() {
+	e.orphanMu.Lock()
+	e.orphanHeight = 0
+	e.orphanMu.Unlock()
 }
 
 // IsProductionEnabled reports whether this node may produce blocks.

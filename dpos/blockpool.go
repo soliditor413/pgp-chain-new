@@ -317,6 +317,35 @@ func (bm *BlockPool) GetConfirmByHeight(height uint64) (*payload.Confirm, bool) 
 	return confirm, ok
 }
 
+// DropHeightConfirm forgets the final confirm held for height.
+//
+// CleanFinalConfirmedBlock above cannot do this, and the difference is the whole
+// reason this function exists. That one prunes a WINDOW -- `cheight < height -
+// cachedCount` -- so it only removes heights the chain has already moved six past.
+// A confirm for a height the chain never reached is therefore kept forever, and
+// because two separate gates treat "we hold a confirm for this height" as "this
+// height is decided" (Seal refuses to propose, hasConfirmedCompetitor refuses to
+// vote for anyone else's block), holding one whose block never arrived is a
+// permanent stall with no timer anywhere:
+//
+//	height already has a confirm, refusing to propose      height=22
+//	OnProposalReceived: rejecting, height already finalised with another block
+//
+// Measured on the six-producer chain at 23:04: all six nodes held a confirm for
+// h22, none of them had the block, the head was pinned at 21, and every node
+// refused both to propose and to accept. It never recovered.
+//
+// Dropping the confirm does not give up any finality that exists locally: the
+// block was never imported, so this node's chain has no block at that height to be
+// final about. See Engine.reclaimOrphanedConfirm for the conditions, which are
+// deliberately narrow.
+func (bm *BlockPool) DropHeightConfirm(height uint64) {
+	bm.Lock()
+	defer bm.Unlock()
+
+	delete(bm.heightConfirms, height)
+}
+
 func (bm *BlockPool) GetConfirm(hash elacom.Uint256) (*payload.Confirm, bool) {
 	bm.Lock()
 	defer bm.Unlock()
