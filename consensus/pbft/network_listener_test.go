@@ -319,14 +319,17 @@ func TestRecoverAbnormalStateNeedsEnoughPeers(t *testing.T) {
 	}
 }
 
-// TestPickRecoverStatusPrefersHighestOffset covers the arithmetic that decides
-// where a recovering node lands. Picking the wrong bucket silently rewinds the
-// set, and the wrong median parks it on a view start time that no peer agrees
-// with.
+// TestPickRecoverStatusPrefersHighestOffset covers the bucket choice, which is
+// all that is left of this function now: it decides whose WorkingHeight gets
+// adopted. Picking the wrong bucket silently rewinds the set.
+//
+// The median it used to return is covered by
+// TestRecoveryAnchorsOnTheHeadNotOnThePeerClocks below, because the anchor is no
+// longer this function's business.
 func TestPickRecoverStatusPrefersHighestOffset(t *testing.T) {
 	base := time.Unix(1_700_000_000, 0)
 	status := func(offset uint32, start time.Time) *dmsg.ConsensusStatus {
-		return &dmsg.ConsensusStatus{ViewOffset: offset, ViewStartTime: start}
+		return &dmsg.ConsensusStatus{ViewOffset: offset, ViewStartTime: start, WorkingHeight: uint64(offset) + 100}
 	}
 
 	m := map[uint32]map[string]*dmsg.ConsensusStatus{
@@ -344,76 +347,182 @@ func TestPickRecoverStatusPrefersHighestOffset(t *testing.T) {
 		t.Fatalf("countStatuses = %d, want 5", got)
 	}
 
-	// Ten seconds past base: every start time in the map is behind the anchor and
-	// inside the slack, i.e. all of them are usable view clocks.
-	anchor := base.Add(10 * time.Second).UnixNano()
-
-	picked, median := pickRecoverStatus(m, anchor)
+	picked := pickRecoverStatus(m)
 	if picked == nil || picked.ViewOffset != 3 {
 		t.Fatalf("picked offset %v, want 3", picked)
 	}
-	// Median of {1s, 2s, 3s} is 2s.
-	if want := base.Add(2 * time.Second).UnixNano(); median != want {
-		t.Fatalf("median start = %d, want %d", median, want)
+	if picked.WorkingHeight != 103 {
+		t.Fatalf("picked working height %d, want one from the offset-3 bucket (103)", picked.WorkingHeight)
 	}
 
-	if s, mt := pickRecoverStatus(nil, anchor); s != nil || mt != 0 {
-		t.Fatalf("empty status map produced %v / %d", s, mt)
+	if s := pickRecoverStatus(nil); s != nil {
+		t.Fatalf("empty status map produced %v", s)
 	}
 }
 
-// TestPickRecoverStatusIgnoresAViewThatNeverStarted covers the cold start of a
-// freshly generated set.
+// TestRecoveryAnchorsOnTheHeadNotOnThePeerClocks is the regression test for the
+// last known anchor divergence entry point.
 //
-// A producer that has never opened a view still answers a recovery request, with
-// an unset view start time. That decodes as the unix epoch, and feeding it to the
-// offset arithmetic gives (now - 1970) / signTolerance -- hundreds of millions of
-// offsets, computed against each node's own `now`, so the set ends up disagreeing
-// about whose turn it is. The devnet showed exactly that: three producers landed
-// on 149446496/149446497 while the fourth stayed at 0.
+// Five nodes run the same recovery exchange over the same head, and each of them
+// receives a different set of peer statuses -- which is the normal case, because
+// the status map holds whatever answered this node. The head header is identical
+// on all five, so the anchors have to be identical too. Under the implementation
+// this replaces, the anchor was the median of the received bucket's
+// ViewStartTime, and the cases below land in three different places:
 //
-// The contract asserted here: a start time that is not a clock is excluded from
-// the median, and when nothing usable is left the anchor comes back instead, which
-// Dispatcher.RecoverAbnormal turns into offset 0 with the view anchored at now.
-func TestPickRecoverStatusIgnoresAViewThatNeverStarted(t *testing.T) {
+//   - a peer window a whole number of tolerances behind ours ("36s behind")
+//     rounds to the same point as ours, so the gap that looks alarming is the
+//     harmless one. 36 is a multiple of 6: this is the case that proves the
+//     obvious construction cannot split the grid at all.
+//   - a peer window half a tolerance off ours ("3s behind", i.e. exactly one
+//     blockPeriod) rounds to a different grid point, and the two nodes then
+//     disagree about whose turn it is. This is not an exotic input: a peer
+//     anchors its window on the last block it imported, blocks are 3 seconds
+//     apart, so peers sit 3 seconds apart as often as they sit 6.
+//   - two peer windows are averaged (medianInt64 returns the mean of the middle
+//     pair for an even sample), so the anchor lands between them, on a
+//     coordinate no node occupies at all.
+//
+// The last case pins what the old usableViewStart filter used to guard: a peer
+// that has never opened a view reports the zero time, which serialises as the
+// unix epoch and used to decode as a real coordinate, i.e. an offset in the
+// hundreds of millions. It is now structurally harmless -- nothing on this path
+// reads a peer's start time -- and the case is here so that a future change that
+// starts reading it again has to face the epoch.
+func TestRecoveryAnchorsOnTheHeadNotOnThePeerClocks(t *testing.T) {
+	accounts, producerKeys := newProducerSet(t, 6)
+
+	// A head 93 seconds old: the chain this path exists for is the one that has
+	// stopped producing, so the head is not fresh. 93 rather than 90 on purpose --
+	// 90 is a multiple of signTolerance, so the derived offset would sit exactly on
+	// a boundary and which side the run falls on would be measuring the wall clock.
+	const headAge = 93 * time.Second
 	now := time.Now()
-	anchor := now.UnixNano()
+	headTime := uint64(now.Add(-headAge).Unix())
+	chain := &sealTestChain{genesis: &types.Header{
+		Number:     big.NewInt(21),
+		Time:       headTime,
+		Difficulty: new(big.Int).Set(diffInTurn),
+		UncleHash:  types.CalcUncleHash(nil),
+	}}
 
-	m := map[uint32]map[string]*dmsg.ConsensusStatus{
-		0: {
-			"virgin":  {ViewOffset: 0, ViewStartTime: time.Time{}},     // never set
-			"epoch":   {ViewOffset: 0, ViewStartTime: time.Unix(0, 0)}, // set to zero
-			"running": {ViewOffset: 0, ViewStartTime: now.Add(-3 * time.Second)},
+	// recover runs one exchange to completion and returns the anchor the node
+	// landed on. peers is the bucket this node received.
+	recover := func(t *testing.T, offset uint32, peers map[string]time.Time) uint64 {
+		t.Helper()
+		engine := New(&params.LegacyConfig{VerifySeal: true, Producers: producerKeys}, &Config{Enable: true})
+		engine.attachAccount(accounts[0])
+		engine.AttachChain(chain)
+		t.Cleanup(func() { _ = engine.Close() })
+
+		bucket := make(map[string]*dmsg.ConsensusStatus, len(peers))
+		for name, start := range peers {
+			bucket[name] = &dmsg.ConsensusStatus{
+				ViewOffset:    offset,
+				ViewStartTime: start,
+				WorkingHeight: 21,
+			}
+		}
+		engine.statusMapMu.Lock()
+		engine.statusMap = map[uint32]map[string]*dmsg.ConsensusStatus{offset: bucket}
+		engine.statusMapMu.Unlock()
+
+		if !engine.beginRecover() {
+			t.Fatal("beginRecover was refused")
+		}
+		engine.finishRecoverAndApply()
+		return engine.dispatcher.GetConsensusView().GetAnchor()
+	}
+
+	cases := []struct {
+		name   string
+		offset uint32
+		peers  map[string]time.Time
+	}{
+		{
+			name:   "one peer, window 72s behind this node",
+			offset: 5,
+			peers:  map[string]time.Time{"a": now.Add(-72 * time.Second)},
+		},
+		{
+			name:   "one peer, window 36s behind the first (a whole number of views)",
+			offset: 11,
+			peers:  map[string]time.Time{"b": now.Add(-108 * time.Second)},
+		},
+		{
+			name:   "one peer, window one blockPeriod behind the first",
+			offset: 5,
+			peers:  map[string]time.Time{"c": now.Add(-75 * time.Second)},
+		},
+		{
+			name:   "two peers 3s apart, so the median is averaged",
+			offset: 5,
+			peers: map[string]time.Time{
+				"a": now.Add(-72 * time.Second),
+				"c": now.Add(-75 * time.Second),
+			},
+		},
+		{
+			name:   "a peer that never opened a view",
+			offset: 0,
+			peers:  map[string]time.Time{"virgin": {}},
 		},
 	}
-	if _, median := pickRecoverStatus(m, anchor); median != now.Add(-3*time.Second).UnixNano() {
-		t.Fatalf("median = %d, want the one real view clock %d",
-			median, now.Add(-3*time.Second).UnixNano())
+
+	var want uint64
+	for i, tc := range cases {
+		got := recover(t, tc.offset, tc.peers)
+		if i == 0 {
+			want = got
+			continue
+		}
+		if got != want {
+			t.Fatalf("%s: anchored at %d, want %d (%d seconds apart) -- a peer's view "+
+				"start time reached the anchor", tc.name, got, want, int64(got)-int64(want))
+		}
 	}
 
-	// Nothing usable at all: the anchor has to come back, not a median of epochs.
-	allUnusable := map[uint32]map[string]*dmsg.ConsensusStatus{
-		7: {
-			"virgin": {ViewOffset: 7, ViewStartTime: time.Time{}},
-			"epoch":  {ViewOffset: 7, ViewStartTime: time.Unix(0, 0)},
-		},
+	// And the shared anchor has to be the grid the head defines, not merely equal
+	// across nodes: headTime plus a whole number of tolerances, inside the window
+	// the head is old by.
+	if want < headTime {
+		t.Fatalf("anchor %d is behind the head timestamp %d", want, headTime)
 	}
-	status, median := pickRecoverStatus(allUnusable, anchor)
-	if status == nil || status.ViewOffset != 7 {
-		t.Fatalf("status = %v, want the bucket's status at offset 7", status)
+	if off := (want - headTime) % uint64(signTolerance.Seconds()); off != 0 {
+		t.Fatalf("anchor %d is %ds off the grid the head timestamp %d defines "+
+			"(signTolerance %v); the grid must be derived from the block, not from a peer",
+			want, off, headTime, signTolerance)
 	}
-	if median != anchor {
-		t.Fatalf("median = %d, want the anchor %d", median, anchor)
+	if behind := now.Sub(time.Unix(int64(want), 0)); behind < 0 || behind > signTolerance {
+		t.Fatalf("anchor %d is %v behind the node's clock; a head-backed anchor is inside one tolerance",
+			want, behind)
 	}
+	t.Logf("head at %d, all five nodes anchored at %d (+%ds, %v behind their clocks)",
+		headTime, want, want-headTime, now.Sub(time.Unix(int64(want), 0)))
+}
 
-	// A clock from the future is a broken clock, not a clock: a node cannot know a
-	// view started after now.
-	future := map[uint32]map[string]*dmsg.ConsensusStatus{
-		0: {"ahead": {ViewOffset: 0, ViewStartTime: now.Add(time.Hour)}},
+// TestRecoveryAnchorWithoutAHeadIsTheClockNotNull covers the one degraded case in
+// recoveryAnchor.
+//
+// A node that has not read a head header yet has no shared coordinate, so it
+// anchors on its own clock and logs it. What it must NOT do is return 0:
+// ConsensusView.reanchorLocked treats 0 as "never anchored", so a zero here would
+// leave the node deriving offset 0 forever instead of the 15 views its head is
+// old, i.e. pinned on the wrong duty slot with no log line to explain it. The
+// engine below has no chain attached, which is exactly that window.
+func TestRecoveryAnchorWithoutAHeadIsTheClockNotNull(t *testing.T) {
+	engine, _ := newListenerEngine(t)
+
+	anchor := engine.recoveryAnchor()
+	if anchor <= 0 {
+		t.Fatalf("recoveryAnchor returned %d with no head header; 0 is the never-anchored sentinel", anchor)
 	}
-	if _, median := pickRecoverStatus(future, anchor); median != anchor {
-		t.Fatalf("median = %d, want the anchor %d", median, anchor)
+	got := time.Unix(anchor/int64(time.Second), 0)
+	if drift := time.Since(got); drift < -time.Minute || drift > time.Minute {
+		t.Fatalf("the fallback anchor is %v, which is %v away from now; it must be this node's clock",
+			got, drift)
 	}
+	t.Logf("no head header: anchored on the local clock at %v instead of leaving the sentinel", got.UTC())
 }
 
 // TestAnnounceHookIsOptional documents that re-announcing is a hook the assembly

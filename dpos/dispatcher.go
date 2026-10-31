@@ -744,37 +744,42 @@ func (d *Dispatcher) HelpToRecoverAbnormal(id peer.PID, height uint64, currentHe
 // time: two readers took the path for dead code while it was the thing moving
 // viewOffset.
 //
-// # What medianTime does to the anchor
+// # What anchorNanos does to the grid
 //
 // The two lines below look like they re-anchor on the local clock, and that is
 // worth spelling out because it decides whether they are a fork source.
 //
-//	offsetTime = (now - medianTime) % signTolerance
+//	offsetTime = (now - anchorNanos) % signTolerance
 //	viewStartTime = now - offsetTime
 //
-// Expanding the second line gives medianTime + offset*signTolerance: now cancels
-// out, so the result is medianTime rounded up to its own grid, not this node's
-// clock. Two nodes holding the same medianTime therefore land on the same
-// viewStartTime even if their adjusted clocks differ. So this pair is NOT a
-// source of anchor divergence -- but medianTime itself is per-node (it is the
-// median over whichever statuses that node happened to receive, see
-// pickRecoverStatus), and when the set has no usable view clock at all it falls
-// back to the local now (network_listener.go:1084), which is this node's clock
-// again. Both of those are in pickRecoverStatus, not here.
+// Expanding the second line gives anchorNanos + offset*signTolerance: now cancels
+// out, so the result is anchorNanos rounded up to its own grid, not this node's
+// clock. Two nodes holding the same anchorNanos therefore land on the same
+// viewStartTime even if their adjusted clocks differ.
 //
-// What IS a divergence source here is the ViewOffset line. offset is
-// (now - medianTime)/signTolerance and is therefore the same on every node, but
-// status.ViewOffset is whichever peer's counter pickRecoverStatus happened to
-// return -- it takes the first entry of a Go map, so the choice is arbitrary --
-// and the sum is written back to this node only. Two nodes reading two different
-// peers end two different values apart, with nothing to bring them back together.
-func (d *Dispatcher) RecoverAbnormal(status *dmsg.ConsensusStatus, medianTime int64) {
+// The parameter used to be the median of the peers' reported view start times,
+// which made it a per-node value: each receiver medians whichever statuses it
+// happened to get, and an even sample is averaged, so the result could be a
+// coordinate no peer occupied. The anchor is now the head header's timestamp
+// (network_listener.go, recoveryAnchor), which every producer that holds that
+// block reads identically -- so the grid itself is no longer a divergence source.
+// The one remaining per-node input is the no-head fallback there, and it is
+// logged for exactly that reason.
+//
+// The ViewOffset line below is no longer a divergence source either, and that is
+// worth recording because it used to be one. status.ViewOffset is whichever
+// peer's counter pickRecoverStatus returned, and adding offset to it wrote a
+// value that two nodes reading two different peers ended two apart. The sum is
+// still computed -- it is the number the wire shape carries -- but
+// ConsensusView.RecoverFromStatus ignores the parameter now that the offset is
+// derived from the anchor at read time, so nothing downstream can adopt it.
+func (d *Dispatcher) RecoverAbnormal(status *dmsg.ConsensusStatus, anchorNanos int64) {
 	if status == nil {
 		return
 	}
 	Info("RecoverAbnormal", "status", status.ConsensusStatus, "viewOffset", status.ViewOffset, "viewStartTime", status.ViewStartTime)
-	status.ViewStartTime = dtime.Int64ToTime(medianTime)
-	if medianTime != 0 {
+	status.ViewStartTime = dtime.Int64ToTime(anchorNanos)
+	if anchorNanos != 0 {
 		offset, offsetTime := d.consensusView.calculateOffsetTime(status.ViewStartTime, d.timeSource.AdjustedTime())
 		status.ViewOffset += offset
 		status.ViewStartTime = d.timeSource.AdjustedTime().Add(-offsetTime)

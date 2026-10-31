@@ -42,7 +42,6 @@ package pbft
 // common.Hash and aliasing that one would make the file read backwards.
 import (
 	"bytes"
-	"sort"
 	"sync/atomic"
 	"time"
 
@@ -980,8 +979,16 @@ func (e *Engine) sendRequestConsensus() {
 	go t.BroadcastRaw(req)
 }
 
-// finishRecoverAndApply adopts the highest view offset any peer reported, using
-// the median view start time so the set lands on a common clock.
+// finishRecoverAndApply adopts the status from the highest view offset any peer
+// reported, and anchors the view grid on the head header rather than on any
+// number the peers sent.
+//
+// The two decisions are deliberately separate values now. They used to be one:
+// pickRecoverStatus returned the chosen status together with the median of that
+// bucket's ViewStartTime, and the median was the anchor. That median is not a
+// shared coordinate -- it averages an even number of samples, and each node
+// medians whichever statuses it happened to receive -- so two recovering nodes
+// could derive two different anchors from the same set. See recoveryAnchor.
 func (e *Engine) finishRecoverAndApply() {
 	if !e.finishRecover() {
 		return
@@ -989,14 +996,13 @@ func (e *Engine) finishRecoverAndApply() {
 	e.statusMapMu.Lock()
 	count := countStatuses(e.statusMap)
 	var status *dmsg.ConsensusStatus
-	var medianTime int64
 	if count > 0 {
-		status, medianTime = pickRecoverStatus(e.statusMap, e.dispatcher.GetNowTime().UnixNano())
+		status = pickRecoverStatus(e.statusMap)
 	}
 	e.statusMap = make(map[uint32]map[string]*dmsg.ConsensusStatus)
 	e.statusMapMu.Unlock()
 	if count > 0 && status != nil {
-		e.dispatcher.RecoverAbnormal(status, medianTime)
+		e.dispatcher.RecoverAbnormal(status, e.recoveryAnchor())
 	}
 	e.reqMu.Lock()
 	e.notHandledProposal = make(map[string]struct{})
@@ -1015,43 +1021,62 @@ func countStatuses(m map[uint32]map[string]*dmsg.ConsensusStatus) int {
 	return n
 }
 
-// recoverClockSlack is how far ahead of our own clock a peer's view start time
-// may be and still be read as a clock rather than as a placeholder.
-const recoverClockSlack = time.Minute
-
-// usableViewStart reports whether t is a real view clock.
+// recoveryAnchor returns the anchor the recovery path rebases the view grid on,
+// in unix nanoseconds.
 //
-// A producer that has never opened a view answers a recovery request anyway, and
-// what it answers with is the zero view state: an unset view start time, which
-// serialises to the zero time.Time and decodes on our side as the unix epoch (or
-// as whatever a sub-second median of the two lands on). That value is not a
-// clock coordinate, and treating it as one is not a rounding error: recovery
-// derives viewOffset from (now - start) / signTolerance, so "1970" against 2026
-// is an offset in the hundreds of millions, and each node computes it against its
-// own `now`. Two nodes then differ by one offset and disagree about whose turn it
-// is, which is a set that cannot form a quorum.
+// It is the head header's timestamp, i.e. the same value the reset-view path
+// takes (OnResponseResetViewReceived, above), and for the same reason: the grid
+// has to be a number that every node computes identically, and a header is the
+// only such number two producers share. The local clock is not one and neither
+// is anything a peer reports about its own view.
 //
-// So the rule is: a start time at or before the epoch, or in the future, is not a
-// view clock and is excluded from the median. Upstream has no such check and does
-// not need one on a chain that has been producing: its members always carry a
-// real view start time. A freshly generated devnet is the case it never sees.
-func usableViewStart(t time.Time, anchor int64) bool {
-	if t.Unix() <= 0 {
-		return false
+// What stood here before was the median of the peers' ViewStartTime. That is the
+// wrong kind of value three times over:
+//
+//  1. medianInt64 averages the middle pair for an even sample, so the result can
+//     be a coordinate no peer occupies -- on the six-producer rig that is how a
+//     node ends up one grid point away from every other node.
+//  2. the sample is per-node. Each receiver medians the statuses that reached it,
+//     so a lost message moves the anchor.
+//  3. a start time is a peer's own view bookkeeping, which is exactly the field
+//     the rest of this tree stopped trusting when the offset became a derived
+//     value (see ConsensusView.RecoverFromStatus).
+//
+// The head timestamp has none of those properties: every producer that has the
+// block reads the same Time out of the same header, and the offset each node then
+// derives is (now - that) / signTolerance, which is the definition of the grid
+// the rest of the engine already uses.
+//
+// ok == false is the no-head case, and it falls back to the local clock with a
+// log rather than silently -- see headAnchor on why the fallback needs to be
+// visible. The window it covers is the instant before this node has a readable
+// head; the first imported block re-anchors every producer through
+// OnBlockImported(header.Time).
+func (e *Engine) recoveryAnchor() int64 {
+	if _, anchor, ok := e.headAnchor(); ok {
+		return int64(anchor) * int64(time.Second)
 	}
-	return t.UnixNano() <= anchor+recoverClockSlack.Nanoseconds()
+	now := e.dispatcher.GetNowTime()
+	log.Warn("[finishRecoverAndApply] no head header, anchoring the view to the local "+
+		"clock until the next block import", "anchor", now.Unix())
+	return now.UnixNano()
 }
 
-// pickRecoverStatus returns the status from the highest view offset present and
-// the median start time across that bucket, in unix nanoseconds.
+// pickRecoverStatus returns the status from the highest view offset present.
 //
-// When no peer in that bucket reports a usable view clock, the anchor is returned
-// instead of a median. That is the right answer rather than a fallback: if nobody
-// in the set has an open view, there is no view clock to align to, so the set has
-// to start one, and starting it now with a zero offset is what makes every member
-// compute the same duty. Dispatcher.RecoverAbnormal turns an anchor-based
-// medianTime into exactly that -- offset 0, view start anchored at now.
-func pickRecoverStatus(m map[uint32]map[string]*dmsg.ConsensusStatus, anchor int64) (*dmsg.ConsensusStatus, int64) {
+// The bucket choice decides whose WorkingHeight is adopted; highest rather than
+// lowest is upstream's rule and is unchanged here, because it is a different
+// question from the anchor and this change does not touch it.
+//
+// It no longer returns a view start time at all. Nothing reads the peer's
+// ViewStartTime on this path any more: the anchor comes from recoveryAnchor. The
+// field still travels on the wire (dmsg.ConsensusStatus) and is still honoured
+// where it is a report rather than an instruction, but it is not an input to the
+// grid any more -- which is why the "is this a real clock" filter that used to
+// live here is gone too. Filtering a value that is no longer read is a guard
+// against a bug that can no longer happen, and leaving it in place would suggest
+// the value still decides something.
+func pickRecoverStatus(m map[uint32]map[string]*dmsg.ConsensusStatus) *dmsg.ConsensusStatus {
 	var maxOffset uint32
 	var seen bool
 	for offset := range m {
@@ -1060,37 +1085,12 @@ func pickRecoverStatus(m map[uint32]map[string]*dmsg.ConsensusStatus, anchor int
 		}
 	}
 	if !seen {
-		return nil, 0
+		return nil
 	}
-	var status *dmsg.ConsensusStatus
-	startTimes := make([]int64, 0, len(m[maxOffset]))
 	for _, v := range m[maxOffset] {
-		if status == nil {
-			status = v
-		}
-		if !usableViewStart(v.ViewStartTime, anchor) {
-			continue
-		}
-		startTimes = append(startTimes, v.ViewStartTime.UnixNano())
+		return v
 	}
-	if len(startTimes) == 0 {
-		// The bucket has answers but none of them is a view clock, so there is
-		// nothing to align to. Anchor at now: see this function's comment.
-		return status, anchor
-	}
-	sort.Slice(startTimes, func(i, j int) bool { return startTimes[i] < startTimes[j] })
-	return status, medianInt64(startTimes)
-}
-
-func medianInt64(nums []int64) int64 {
-	l := len(nums)
-	if l == 0 {
-		return 0
-	}
-	if l%2 == 0 {
-		return (nums[l/2] + nums[l/2-1]) / 2
-	}
-	return nums[l/2]
+	return nil
 }
 
 // The engine is the DPoS listener. Checked at compile time because a drift in

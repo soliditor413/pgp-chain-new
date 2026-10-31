@@ -21,42 +21,42 @@ import (
 // defect. The function's first statement read status.ConsensusStatus, with the
 // nil check below it, so a nil status panicked there.
 //
-// Both medianTime values are covered. For the nil case the second row does not
+// Both anchor values are covered. For the nil case the second row does not
 // change the verdict -- every statement between the log line and the return
 // dereferences status, so a check moved to any of those positions fails both rows
 // (measured: the mutant that put the check back below the log line failed
-// medianTime=0 and medianTime=1600000000 alike). The second row earns its place
-// on the non-nil path in the next case, where medianTime != 0 is the branch that
-// calls calculateOffsetTime; a table with only medianTime=0 would let that branch
+// anchorNanos=0 and anchorNanos=1600000000 alike). The second row earns its place
+// on the non-nil path in the next case, where anchorNanos != 0 is the branch that
+// calls calculateOffsetTime; a table with only anchorNanos=0 would let that branch
 // go uncovered while looking covered.
 func TestRecoverAbnormalWithNilStatusDoesNotPanic(t *testing.T) {
 	d := newRecoveryNilFixture(t)
 
-	for _, medianTime := range []int64{0, 1600000000} {
-		medianTime := medianTime
-		t.Run(fmt.Sprintf("medianTime=%d", medianTime), func(t *testing.T) {
+	for _, anchorNanos := range []int64{0, 1600000000} {
+		anchorNanos := anchorNanos
+		t.Run(fmt.Sprintf("anchorNanos=%d", anchorNanos), func(t *testing.T) {
 			mustNotPanic(t, "RecoverAbnormal(nil)", func() {
-				d.RecoverAbnormal(nil, medianTime)
+				d.RecoverAbnormal(nil, anchorNanos)
 			})
 		})
 	}
 }
 
 // TestRecoverAbnormalAppliesStatusWithMedianTime drives the branch the nil cases
-// above cannot reach: a real status with medianTime != 0, which recomputes the
+// above cannot reach: a real status with anchorNanos != 0, which recomputes the
 // offset against the local clock and rewrites the start time before handing the
 // status to RecoverFromConsensusStatus.
 //
 // The assertion is that the status actually arrived. "Did not panic" is not
 // enough here: the function could return early and still not panic.
-func TestRecoverAbnormalAppliesStatusWithMedianTime(t *testing.T) {
+func TestRecoverAbnormalAppliesStatusWithAnAnchor(t *testing.T) {
 	d := newRecoveryNilFixture(t)
 
 	status := &dmsg.ConsensusStatus{
 		ConsensusStatus: ConsensusRunning,
 		ViewOffset:      3,
 	}
-	mustNotPanic(t, "RecoverAbnormal(status, medianTime!=0)", func() {
+	mustNotPanic(t, "RecoverAbnormal(status, anchorNanos!=0)", func() {
 		d.RecoverAbnormal(status, 1600000000)
 	})
 
@@ -64,7 +64,7 @@ func TestRecoverAbnormalAppliesStatusWithMedianTime(t *testing.T) {
 		t.Fatalf("recovered status is %d, want %d; the status never reached the view", got, ConsensusRunning)
 	}
 	if status.ViewStartTime.IsZero() {
-		t.Fatalf("ViewStartTime is still zero; the medianTime branch did not run")
+		t.Fatalf("ViewStartTime is still zero; the anchorNanos branch did not run")
 	}
 }
 
