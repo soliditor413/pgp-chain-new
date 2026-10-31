@@ -8,6 +8,7 @@ package dpos
 
 import (
 	"bytes"
+	"math"
 	"sort"
 	"sync"
 	"time"
@@ -67,20 +68,32 @@ type ConsensusView struct {
 	// mu guards exactly the five fields below. publicKey and signTolerance are
 	// set at construction and never written again (which is why they are not
 	// "missing a lock"); producers owns its own mutex and must be reached
-	// through its accessors, not protected from here; listener is set once by
-	// the constructor.
+	// through its accessors, not protected from here; listener and now are set
+	// once by the constructor.
 	mu sync.RWMutex
 
 	consensusStatus uint32
-	viewOffset      uint32
-	publicKey       []byte
-	signTolerance   time.Duration
-	viewStartTime   time.Time
-	viewChangeTime  time.Time
-	isDposOnDuty    bool
-	producers       *Producers
+	// anchor is the whole-second instant the view grid is measured from, and it
+	// is the ONLY stored input of viewOffset -- which is not a field any more,
+	// see currentOffsetLocked. Two nodes agree on the view they are in exactly
+	// when they agree on anchor, which is why every writer of this field takes
+	// an argument the whole set can compute identically (a block header's
+	// timestamp, or a peer's window start). It is uint64 seconds and not a
+	// time.Time on purpose: a value with sub-second precision cannot be shared,
+	// and the type is the cheapest place to say so.
+	anchor         uint64
+	publicKey      []byte
+	signTolerance  time.Duration
+	viewStartTime  time.Time
+	viewChangeTime time.Time
+	isDposOnDuty   bool
+	producers      *Producers
 
 	listener ViewListener
+	// now is the clock currentOffsetLocked measures against. Injected rather
+	// than taken from the time package so a test can drive the derived offset
+	// without sleeping; nil means time.Now.
+	now func() time.Time
 }
 
 // The Locked functions below assume mu is already held by the caller. They are
@@ -103,14 +116,90 @@ func (v *ConsensusView) isReadyLocked() bool {
 	return v.consensusStatus == ConsensusReady
 }
 
-func (v *ConsensusView) resetViewOffsetLocked() {
-	v.viewOffset = 0
+// clockNow is the time currentOffsetLocked measures against. It reads an
+// immutable field, so it is safe on either side of mu.
+func (v *ConsensusView) clockNow() time.Time {
+	if v.now != nil {
+		return v.now()
+	}
+	return time.Now()
 }
 
-func (v *ConsensusView) setChangViewTimeLocked(parentTime uint64) {
-	headerTime := time.Unix(int64(parentTime), 0)
-	v.viewChangeTime = headerTime.Add(v.signTolerance)
-	v.viewStartTime = headerTime
+// currentOffsetLocked derives the view offset from the anchor and the clock.
+//
+// This is the whole of the field's definition: viewOffset = (now - anchor) /
+// signTolerance. It is a function, not a counter, and the difference is the
+// defect this replaces. As a counter it advanced only while the view was
+// Running (view.go's loop returns early otherwise, and SetRunning is called
+// from startView alone), so two nodes holding the same anchor still reported
+// different offsets -- measured on six producers, 96 against 288, with the
+// anchor identical. Nothing later could repair it: a counter has memory, and
+// that memory was this node's own history.
+//
+// Two nodes now agree whenever they agree on anchor, and anchor is only ever
+// written from a value the set computes identically. Nothing to reset, and
+// nothing for a peer to overwrite: reanchorLocked moves the origin instead.
+//
+// Zero is used for anchor==0 (constructed, never anchored) and for a clock that
+// reads earlier than the anchor. Neither can be a real view number, and both
+// would otherwise be a large or wrapped offset that would drive
+// maxViewOffset's reset broadcast before the first round.
+func (v *ConsensusView) currentOffsetLocked(now time.Time) uint32 {
+	if v.anchor == 0 || now.Unix() <= int64(v.anchor) {
+		return 0
+	}
+	offset := (now.Unix() - int64(v.anchor)) / int64(v.signTolerance/time.Second)
+	if offset > math.MaxUint32 {
+		return math.MaxUint32
+	}
+	return uint32(offset)
+}
+
+// reanchorLocked is the only writer of anchor, and therefore the only thing
+// that can move the view grid.
+//
+// The argument must be a whole second that the whole set computes identically:
+// a block header's timestamp, or a peer's window start in recovery. Anything
+// this node chose on its own -- time.Now(), the adjusted clock, a ticker phase --
+// puts this node on a grid of its own, and the failure is structural rather than
+// transient, because every later offset is measured from it.
+//
+// now is the caller's clock, used only to place the window: the anchor is the
+// origin of the grid, and the window this node is sitting in is the one now falls
+// in. Writing viewStartTime = anchor directly, as this did while the offset was a
+// counter, would leave a reset on an old block reporting viewOffset 5 against a
+// viewChangeTime six seconds after that old block -- a deadline already in the
+// past, which Seal reads as an expired round.
+func (v *ConsensusView) reanchorLocked(anchor uint64, now time.Time) {
+	v.anchor = anchor
+	start := time.Unix(int64(anchor), 0)
+	offset := v.currentOffsetLocked(now)
+	if offset > 0 {
+		start = start.Add(time.Duration(offset) * v.signTolerance)
+	}
+	v.viewStartTime = start
+	v.viewChangeTime = start.Add(v.signTolerance)
+
+	// Re-anchoring can move the rotation slot, so isDposOnDuty is recomputed here
+	// rather than left for the caller.
+	//
+	// This is not tidying. prepare.go's startView has two arms: a Ready view goes
+	// through UpdateDutyIndex and gets the flag recomputed, but a view that is
+	// still Running goes through ResetView alone -- and ResetView is this function.
+	// Before the offset was derived, the stale flag happened to agree, because a
+	// reset put the counter at 0 and the next ChangeView would have computed the
+	// same 0. Derive the offset from the anchor and the two can differ: the view
+	// loop's last advance before the reset left the flag true for the slot it had
+	// moved to, while the new anchor puts this node back on its own slot. Prepare's
+	// gate reads the flag after startView, so the stale value is what it acts on,
+	// and the failure is one node refusing its turn and every later Prepare
+	// answering ErrConsensusIsRunning. Measured: seal_test's
+	// TestFailedRoundDoesNotStallTheNode.
+	//
+	// Nesting viewMu -> producers.mtx, the declared order.
+	if producer := v.producers.GetNextOnDutyProducer(offset); producer != nil {
+		v.isDposOnDuty = bytes.Equal(producer, v.publicKey)
+	}
 }
 
 // dumpInfoLocked builds the duty listing. It takes onDuty as an argument instead
@@ -132,14 +221,20 @@ func (v *ConsensusView) dumpInfoLocked(onDuty []byte) string {
 // producerIsOnDutyLocked mirrors ProducerIsOnDuty for callers that already hold
 // the lock. It nests viewMu -> producers.mtx, which is the allowed direction.
 func (v *ConsensusView) producerIsOnDutyLocked(account []byte) bool {
-	producer := v.producers.GetNextOnDutyProducer(v.viewOffset)
+	producer := v.producers.GetNextOnDutyProducer(v.currentOffsetLocked(v.clockNow()))
 	return bytes.Equal(producer, account)
 }
 
+// updateDutyIndexLocked recomputes both the rotation index and the on-duty flag.
+//
+// The offset it passes is derived from the clock, so this function's answer is a
+// function of (height, anchor, now) and nothing local: two nodes that agree on
+// the anchor and the head height agree on who is on duty, whatever their
+// histories.
 func (v *ConsensusView) updateDutyIndexLocked(height uint64) {
 	v.producers.UpdateDutyIndex(height)
 
-	currentProducer := v.producers.GetNextOnDutyProducer(v.viewOffset)
+	currentProducer := v.producers.GetNextOnDutyProducer(v.currentOffsetLocked(v.clockNow()))
 	v.isDposOnDuty = bytes.Equal(currentProducer, v.publicKey)
 }
 
@@ -364,12 +459,19 @@ func (v *ConsensusView) UpdateDutyIndex(height uint64) {
 }
 
 // ChangeView moves the view forward, and it is the deepest composite in this
-// file: ResetView forwards to SetChangViewTime, resetViewOffset writes the
-// offset, and DumpInfo walks Producers. All of it happens under one write lock
-// because halfway through, the view is internally inconsistent (new start time,
-// old offset), and a reader that saw that pair would compute a deadline against
-// the wrong start. The logging and the listener call are moved outside the lock:
-// logging can block on I/O, and the listener runs into the miner.
+// file: a forced reset re-anchors the grid, a timeout advance moves the window,
+// and DumpInfo walks Producers. All of it happens under one write lock because
+// halfway through, the view is internally inconsistent, and a reader that saw
+// that pair would compute a deadline against the wrong start. The logging and
+// the listener call are moved outside the lock: logging can block on I/O, and
+// the listener runs into the miner.
+//
+// The reported offset is derived after the move, never accumulated. That is the
+// one behavioural difference from the ported version and it is the point of the
+// change: an accumulator only advances while the view is Running, so a node that
+// was Ready for a while reported a smaller offset than one that was Running, with
+// the same anchor and the same clock. Nothing could reconcile the two, because
+// each node's number embedded its own history.
 func (v *ConsensusView) ChangeView(now time.Time, force bool, parentTime uint64) {
 	var (
 		offset, effective     uint32
@@ -382,28 +484,32 @@ func (v *ConsensusView) ChangeView(now time.Time, force bool, parentTime uint64)
 	)
 
 	v.mu.Lock()
-	offset, offsetTime = v.calculateOffsetTime(v.viewStartTime, now)
-	if offset > 0 {
-		v.viewStartTime = now.Add(-offsetTime)
-		// Forwarder, not leaf: SetChangViewTime writes the two times.
-		v.setChangViewTimeLocked(uint64(v.viewStartTime.Unix()))
-	}
-	v.viewOffset += offset
 	if force {
-		offset = 1
-		v.resetViewOffsetLocked()
-		// Same forwarder, second call site.
-		v.setChangViewTimeLocked(parentTime)
+		// The only operation that can put two nodes on different grids back on
+		// one: move the origin. parentTime is the caller's shared value, and it
+		// is the reason this branch takes an argument at all.
+		v.reanchorLocked(parentTime, now)
+		effective = 1
+		changed = true
+	} else {
+		offset, offsetTime = v.calculateOffsetTime(v.viewStartTime, now)
+		if offset > 0 {
+			// now is past the window the view is sitting on: move the window to
+			// the grid point now falls in. The grid itself does not move, so the
+			// derived offset below lands exactly on viewStartTime's window.
+			v.viewStartTime = now.Add(-offsetTime)
+			v.viewChangeTime = v.viewStartTime.Add(v.signTolerance)
+			effective = offset
+			changed = true
+		}
 	}
 
-	if offset > 0 {
-		changed = true
-		effective = offset
+	if changed {
+		viewOffset = v.currentOffsetLocked(now)
 		startTime = v.viewStartTime
 		changeTime = v.viewChangeTime
-		viewOffset = v.viewOffset
 		dutyIndex = v.producers.GetDutyIndex()
-		onDutyProducer := v.producers.GetNextOnDutyProducer(v.viewOffset)
+		onDutyProducer := v.producers.GetNextOnDutyProducer(viewOffset)
 		v.isDposOnDuty = bytes.Equal(onDutyProducer, v.publicKey)
 		onDuty = v.isDposOnDuty
 		dump = v.dumpInfoLocked(onDutyProducer)
@@ -433,7 +539,7 @@ func (v *ConsensusView) ChangeView(now time.Time, force bool, parentTime uint64)
 // would hold viewMu across a write to the log sink.
 func (v *ConsensusView) DumpInfo() {
 	v.mu.RLock()
-	str := v.dumpInfoLocked(v.producers.GetNextOnDutyProducer(v.viewOffset))
+	str := v.dumpInfoLocked(v.producers.GetNextOnDutyProducer(v.currentOffsetLocked(v.clockNow())))
 	v.mu.RUnlock()
 	Info(str)
 }
@@ -454,10 +560,29 @@ func (v *ConsensusView) GetChangeViewTime() time.Time {
 	return v.viewChangeTime
 }
 
+// GetViewOffset returns the view this node is in, derived from the anchor and the
+// clock at the moment of the call.
+//
+// Derived rather than read from a field, which is what makes two nodes agree:
+// there is no per-node history left to disagree about. The cost is that the
+// answer moves without anyone calling a setter, so a caller that reads it twice
+// can see two values -- which is correct, and is why the value is never used as
+// an identity. See currentOffsetLocked.
 func (v *ConsensusView) GetViewOffset() uint32 {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return v.viewOffset
+	return v.currentOffsetLocked(v.clockNow())
+}
+
+// GetAnchor returns the whole-second instant the view grid is measured from.
+//
+// This is the value operators should compare across nodes: two nodes reporting
+// the same anchor are in the same view regardless of what their counters used to
+// say, and two reporting different anchors cannot agree on anything.
+func (v *ConsensusView) GetAnchor() uint64 {
+	v.mu.RLock()
+	defer v.mu.RUnlock()
+	return v.anchor
 }
 
 func (v *ConsensusView) GetConsensusStatus() uint32 {
@@ -470,44 +595,32 @@ func (v *ConsensusView) GetConsensusStatus() uint32 {
 // Asking three getters would return a status, an offset and a start time that
 // never belonged to the same view.
 //
-// What it does not return is viewChangeTime; the receiver recomputes it from
-// viewStartTime. That round trip holds only because viewStartTime is always
-// stored at second granularity: ChangeView writes it with sub-second precision
-// first, then calls setChangViewTimeLocked, which overwrites both times from the
-// truncated Unix second. So this function's symmetry rests on one write order
-// inside ChangeView, one line apart. Whoever writes viewStartTime directly and
-// skips that call -- the half-way shape ChangeView itself uses immediately
-// before it -- breaks the round trip for every recovering peer, and nothing will
-// report it: the peer just resumes at a start time that is not the one this node
-// used, with a viewChangeTime that never matched it.
+// The receiver now treats viewStartTime as an anchor and ignores the offset, so
+// what this function has to guarantee is narrower than it used to be: the start
+// time must be a whole second, because it is what the peer will measure from.
+// That holds by construction -- reanchorLocked writes time.Unix(anchor, 0) and
+// ChangeView's advance moves viewStartTime to another whole second -- so there is
+// no longer a write ORDER to preserve here, only a write INVARIANT.
 func (v *ConsensusView) GetViewState() (status uint32, viewOffset uint32, viewStartTime time.Time) {
 	v.mu.RLock()
 	defer v.mu.RUnlock()
-	return v.consensusStatus, v.viewOffset, v.viewStartTime
-}
-
-// ResetViewOffset is the exported form of the reset the Dispatcher uses when it
-// restarts a round outside of a ChangeView.
-func (v *ConsensusView) ResetViewOffset() {
-	v.mu.Lock()
-	defer v.mu.Unlock()
-	v.resetViewOffsetLocked()
+	return v.consensusStatus, v.currentOffsetLocked(v.clockNow()), v.viewStartTime
 }
 
 // ResetView is a forwarder, not a leaf: its body is one call to
-// SetChangViewTime. It takes the lock on its own only because it is exported;
+// reanchorLocked. It takes the lock on its own only because it is exported;
 // ChangeView calls the Locked twin directly, because taking this lock from
 // inside ChangeView's write lock would deadlock on the same goroutine.
 func (v *ConsensusView) ResetView(parentTime uint64) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.setChangViewTimeLocked(parentTime)
+	v.reanchorLocked(parentTime, v.clockNow())
 }
 
 func (v *ConsensusView) SetChangViewTime(parentTime uint64) {
 	v.mu.Lock()
 	defer v.mu.Unlock()
-	v.setChangViewTimeLocked(parentTime)
+	v.reanchorLocked(parentTime, v.clockNow())
 }
 
 // RecoverFromStatus applies a recovered view state under one acquisition of the
@@ -575,8 +688,24 @@ func (v *ConsensusView) RecoverFromStatus(status uint32, viewOffset uint32, view
 	defer v.mu.Unlock()
 
 	v.consensusStatus = status
-	v.viewOffset = viewOffset
-	v.setChangViewTimeLocked(uint64(viewStartTime.Unix()))
+	// The peer's viewStartTime becomes this node's anchor; the peer's viewOffset
+	// is deliberately ignored.
+	//
+	// That asymmetry is the point of the derivation. A peer's counter is that
+	// peer's history -- how long ITS view happened to be Running -- so importing
+	// it transfers a number that already embeds a local accident. Its window
+	// start is different: it is the same kind of value this node would have
+	// computed for itself, and RecoverAbnormal has already rounded it to a grid
+	// point that every node computing the same median gets. So the start time is
+	// a shared candidate and the counter is not, and taking the start time while
+	// dropping the counter is what makes recovery converge instead of copying the
+	// divergence.
+	//
+	// _ = viewOffset keeps the parameter in the signature: it is the wire shape
+	// (dmsg.ConsensusStatus) and callers should not have to care that this side
+	// no longer reads it.
+	_ = viewOffset
+	v.reanchorLocked(uint64(viewStartTime.Unix()), v.clockNow())
 	// UpdateWorkingHeight, not the locked twin: workingHeight belongs to
 	// Producers, and viewMu orders nothing about it. This nests viewMu ->
 	// producers.mtx, which is the allowed direction.
@@ -619,10 +748,34 @@ func (v *ConsensusView) IsOnduty() bool {
 
 func (v *ConsensusView) ProducerIsOnDuty(account []byte) bool {
 	v.mu.RLock()
-	offset := v.viewOffset
+	offset := v.currentOffsetLocked(v.clockNow())
 	v.mu.RUnlock()
 	producer := v.producers.GetNextOnDutyProducer(offset)
 	return bytes.Equal(producer, account)
+}
+
+// CurrentOnDutyProducer names the producer the rotation puts on duty for the
+// view this node is in: slot (dutyIndex + viewOffset) % producers, answered by
+// Producers itself rather than recomputed here.
+//
+// It exists for the status RPC, and it is a method rather than two getters at the
+// call site because the answer spans both structs. Reading dutyIndex and
+// viewOffset separately and doing the modulo outside gives a slot that may belong
+// to no single instant -- the offset moves on its own now, once per
+// signTolerance -- and a wrong answer here is read as "the wrong node is on duty".
+// The two reads below are one acquisition each, view lock then producer lock,
+// which is the declared order.
+//
+// What it is for: on the six-producer rig two producers reported different
+// viewOffsets and BOTH landed on a key holder. That is why the chain had two nodes
+// claiming the round at once instead of none, and it is invisible from the offsets
+// alone -- the modulo is what turns two different counts into two live claimants.
+// One line per node now answers it.
+func (v *ConsensusView) CurrentOnDutyProducer() []byte {
+	v.mu.RLock()
+	offset := v.currentOffsetLocked(v.clockNow())
+	v.mu.RUnlock()
+	return v.producers.GetNextOnDutyProducer(offset)
 }
 
 func (v *ConsensusView) IsMajorityAgree(count int) bool {
@@ -658,12 +811,15 @@ func NewConsensusView(tolerance time.Duration, account []byte,
 	c := &ConsensusView{
 		consensusStatus: ConsensusReady,
 		viewStartTime:   time.Unix(0, 0),
-		viewOffset:      0,
-		publicKey:       account,
-		signTolerance:   tolerance,
-		producers:       producers,
-		listener:        viewListener,
-		isDposOnDuty:    false,
+		// anchor 0 means "never anchored": currentOffsetLocked answers 0 until a
+		// shared value arrives, which is what a node that has not taken part in a
+		// round yet should report. The first startView or reset anchors it.
+		anchor:        0,
+		publicKey:     account,
+		signTolerance: tolerance,
+		producers:     producers,
+		listener:      viewListener,
+		isDposOnDuty:  false,
 	}
 	return c
 }

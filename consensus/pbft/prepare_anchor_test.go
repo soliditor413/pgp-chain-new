@@ -81,12 +81,25 @@ func TestPrepareAnchorsTheViewOnParentTimeNotTheLocalClock(t *testing.T) {
 	// The duty gate sits after startView, so a node whose turn it is not still
 	// gets its anchor set. The error is therefore irrelevant here and is dropped
 	// on purpose; what this test reads is the view, not the verdict.
-	prepare := func(t *testing.T, e *Engine) time.Time {
+	//
+	// It reads the ANCHOR and the derived offset rather than viewStartTime, which
+	// is what this test read before the offset became a derived value. viewStartTime
+	// is now the start of the window this node currently sits in -- anchor +
+	// offset*signTolerance -- so with a 100s-old parent it is legitimately about
+	// now rather than the parent, and comparing it across nodes would be comparing
+	// two numbers that both encode "I am 16 views in". The shared value is the
+	// anchor, so that is what has to be equal.
+	type viewState struct {
+		anchor uint64
+		offset uint32
+	}
+	prepare := func(t *testing.T, e *Engine) viewState {
 		t.Helper()
 		header := newPrepareTestHeader()
 		header.ParentHash = chain.genesis.Hash()
 		_ = e.Prepare(chain, header)
-		return e.dispatcher.GetConsensusView().GetViewStartTime()
+		v := e.dispatcher.GetConsensusView()
+		return viewState{anchor: v.GetAnchor(), offset: v.GetViewOffset()}
 	}
 
 	first := prepare(t, newEngine(t))
@@ -94,20 +107,31 @@ func TestPrepareAnchorsTheViewOnParentTimeNotTheLocalClock(t *testing.T) {
 	time.Sleep(2 * time.Second)
 	second := prepare(t, newEngine(t))
 
-	want := time.Unix(int64(parentTime), 0)
-	if !first.Equal(want) {
-		t.Fatalf("the first node anchored the view at %v, want the parent timestamp %v; "+
-			"a late round must move header.Time without moving the anchor", first, want)
+	want := parentTime
+	if first.anchor != want {
+		t.Fatalf("the first node anchored the view at %d, want the parent timestamp %d; "+
+			"a late round must move header.Time without moving the anchor", first.anchor, want)
 	}
-	if !second.Equal(want) {
-		t.Fatalf("the second node anchored the view at %v, want %v", second, want)
+	if second.anchor != want {
+		t.Fatalf("the second node anchored the view at %d, want %d", second.anchor, want)
 	}
-	if !first.Equal(second) {
-		t.Fatalf("two nodes sharing one parent anchored their views %v apart (%v vs %v); "+
-			"the local clock reached the anchor", second.Sub(first), first, second)
+	if first.anchor != second.anchor {
+		t.Fatalf("two nodes sharing one parent anchored their views at %d and %d; "+
+			"the local clock reached the anchor", first.anchor, second.anchor)
 	}
-	t.Logf("both nodes anchored at %v; their local clocks were %v apart",
-		first, 2*time.Second)
+	// And the anchors being equal is only worth anything if the derived view agrees
+	// too. It can differ by at most one: the two Prepares are two real seconds
+	// apart, and a derived offset is a function of the clock, so a sample that
+	// straddles a tolerance boundary legitimately reports one view more. That
+	// bounded window is the transient QA measured at 786ms between two tick phases;
+	// what must never happen is a whole-view gap that persists, which is what the
+	// counter produced and what the anchors above rule out.
+	if diff := int(second.offset) - int(first.offset); diff < 0 || diff > 1 {
+		t.Fatalf("one anchor gave views %d apart (%d and %d); at most the one-window skew is allowed",
+			diff, first.offset, second.offset)
+	}
+	t.Logf("both nodes anchored at %d and both derived viewOffset %d; their local clocks were %v apart",
+		first.anchor, first.offset, 2*time.Second)
 }
 
 // TestPrepareStillAdvancesTheBlockTimeWhenLate is the other half, and the reason
@@ -142,8 +166,8 @@ func TestPrepareStillAdvancesTheBlockTimeWhenLate(t *testing.T) {
 		t.Fatalf("Prepare left header.Time at %d with the parent at %d: the block is born "+
 			"already expired", header.Time, parentTime)
 	}
-	if got := engine.dispatcher.GetConsensusView().GetViewStartTime(); !got.Equal(time.Unix(int64(parentTime), 0)) {
-		t.Fatalf("the anchor followed header.Time to %v; it must stay on the parent %d",
+	if got := engine.dispatcher.GetConsensusView().GetAnchor(); got != parentTime {
+		t.Fatalf("the anchor followed header.Time to %d; it must stay on the parent %d",
 			got, parentTime)
 	}
 	t.Logf("header.Time advanced to %d while the anchor stayed on parent %d", header.Time, parentTime)

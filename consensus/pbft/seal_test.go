@@ -355,12 +355,16 @@ func TestFailedRoundDoesNotStallTheNode(t *testing.T) {
 	if err := engine.Prepare(chain, header); err != nil {
 		t.Fatalf("Prepare refused to open the first round: %v", err)
 	}
-	// Move the view deadline into the past instead of waiting out
-	// signTolerance: Prepare anchors it at parent.Time+signTolerance, and the
-	// behaviour under test is what happens after the failure, not how long the
-	// failure took. The waits below are guarded anyway, so a future change that
-	// re-anchors the deadline degrades this test to "slower", never to "hangs".
-	engine.dispatcher.GetConsensusView().SetChangViewTime(uint64(time.Now().Add(-time.Minute).Unix()))
+	// Let the view deadline expire instead of moving it into the past, which is
+	// what this did before (SetChangViewTime(now-1min)). That setter re-anchors the
+	// grid now, and the view offset is derived from the anchor, so moving the
+	// deadline by a minute also rotates the rotation slot by ten views -- the
+	// signer stops being on duty, and Seal answers ErrSignerNotOnduty before it
+	// ever reaches the timeout path this test is about. There is no setter that
+	// moves the deadline without moving the anchor, so the round is now allowed to
+	// time out for real: at most one signTolerance, which the guard below covers.
+	// The behaviour under test is what happens AFTER the failure, not how long the
+	// failure took.
 
 	results := make(chan *types.Block, 1)
 	stop := make(chan struct{})
@@ -392,6 +396,7 @@ func TestFailedRoundDoesNotStallTheNode(t *testing.T) {
 	if !engine.dispatcher.GetConsensusView().IsReady() {
 		t.Fatal("the rotation did not release the view: every later Prepare will answer ErrConsensusIsRunning")
 	}
+	reAnchorToNow(chain)
 	retryHeader := newHeader()
 	if err := engine.Prepare(chain, retryHeader); err != nil {
 		t.Fatalf("Prepare after a failed round: %v (ErrConsensusIsRunning here means the node is stalled for good)", err)
@@ -514,7 +519,9 @@ func TestLateConfirmAfterFinishRoundDoesNotPanic(t *testing.T) {
 	if err := engine.Prepare(chain, header); err != nil {
 		t.Fatalf("Prepare refused to open the first round: %v", err)
 	}
-	engine.dispatcher.GetConsensusView().SetChangViewTime(uint64(time.Now().Add(-time.Minute).Unix()))
+	// Same as the first test: the deadline expires on its own now that the offset
+	// is derived from the anchor and SetChangViewTime can no longer move the
+	// deadline without rotating the slot. See the note there.
 
 	sealed := make(chan error, 1)
 	go func() {
@@ -559,6 +566,7 @@ func TestLateConfirmAfterFinishRoundDoesNotPanic(t *testing.T) {
 	// --- and the node still produces a block ---------------------------------
 
 	releaseAfterFailedRound(engine)
+	reAnchorToNow(chain)
 	retryHeader := newHeader()
 	if err := engine.Prepare(chain, retryHeader); err != nil {
 		t.Fatalf("Prepare after late votes: %v", err)
@@ -914,4 +922,23 @@ func TestSingleProducerSealsInOneRound(t *testing.T) {
 func releaseAfterFailedRound(engine *Engine) {
 	engine.SetIsCurrent(func() bool { return true })
 	engine.OnViewChanged(true, false)
+}
+
+// reAnchorToNow moves the mock chain head to a current timestamp.
+//
+// Both tests below fail a round and then expect THIS account to produce the next
+// one, and that expectation is no longer free. The view offset is derived from the
+// anchor (dpos.ConsensusView.currentOffsetLocked), Prepare anchors on parent.Time,
+// and a head that is nine seconds old is therefore -- by the grid's own arithmetic
+// -- one whole view late, so the rotation has legitimately moved to the next
+// producer. Put another way, the offset now advances with wall-clock time instead
+// of with each ChangeView, which is the whole repair: it is why two nodes that were
+// Running for different lengths of time finally agree on the view number.
+//
+// On the live chain this account gets the slot back in one of three ways: the
+// rotation wraps around after producers*signTolerance, the view is re-anchored by a
+// block import, or the head advances. These tests take the block-import shape and
+// make the parent current, which is what a landed block does to the grid.
+func reAnchorToNow(chain *sealTestChain) {
+	chain.genesis.Time = uint64(time.Now().Unix())
 }

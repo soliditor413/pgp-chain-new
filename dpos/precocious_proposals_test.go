@@ -38,12 +38,26 @@ func stashLen(d *Dispatcher) int {
 	return len(d.precociousProposals)
 }
 
-// setView drives the view to a known (status, offset) pair. RecoverFromStatus is
-// the only exported setter that writes both, and the pair is the whole input of
-// UpdatePrecociousProposals, so the fixture cannot borrow a getter to set them.
+// setView drives the view to a known (status, offset) pair.
+//
+// The offset is no longer a value anyone can hand to a setter: it is derived from
+// the anchor and the clock (ConsensusView.currentOffsetLocked), and
+// RecoverFromStatus deliberately ignores the offset argument it still takes for
+// wire compatibility. So the fixture places the view the way the production code
+// does -- by choosing the anchor -- and then asserts the placement took, because a
+// fixture that silently lands on the wrong view would make every case below pass
+// for the wrong reason.
 func setView(t *testing.T, d *Dispatcher, status uint32, offset uint32) {
 	t.Helper()
-	d.GetConsensusView().RecoverFromStatus(status, offset, time.Unix(1_700_000_000, 0), 1, 0)
+
+	v := d.GetConsensusView()
+	tolerance := int64(v.GetViewInterval() / time.Second)
+	anchor := v.clockNow().Unix() - int64(offset)*tolerance
+	v.RecoverFromStatus(status, offset, time.Unix(anchor, 0), 1, 0)
+
+	if got := v.GetViewOffset(); got != offset {
+		t.Fatalf("fixture could not place the view at offset %d, it is at %d", offset, got)
+	}
 }
 
 // TestUpdatePrecociousProposalsReleasesOnlyTheCurrentView is the contract that

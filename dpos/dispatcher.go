@@ -359,9 +359,9 @@ func (d *Dispatcher) FinishedProposal(height uint64, sealHash elacom.Uint256,
 // MUST compute identically, and the only such value available to a node that has
 // just imported a block is that block's header.Time -- the same integer on every
 // producer, because it is part of the block. ChangeView(now, true, anchor) ends
-// with setChangViewTimeLocked(anchor), which truncates to a whole second and
-// writes viewStartTime = anchor, viewChangeTime = anchor + signTolerance, so the
-// grid a node walks afterwards is a pure function of anchor. Same anchor, same
+// with reanchorLocked(anchor), which stores it as a whole second and derives the
+// view offset from it: offset = (now - anchor) / signTolerance. The grid a node
+// walks afterwards is therefore a pure function of anchor. Same anchor, same
 // grid; different anchor, different grid, forever.
 //
 // Passing the local clock instead (uint64(now.Unix()), what this function used to
@@ -401,7 +401,11 @@ func (d *Dispatcher) ResetConsensus(height uint64, anchor uint64) {
 		Info("[resetConsensus] reset view")
 		d.consensusView.SetReady()
 		d.CleanProposals(false)
-		d.consensusView.ResetViewOffset()
+		// No ResetViewOffset here any more: the offset is derived from the anchor
+		// (ConsensusView.currentOffsetLocked), so there is nothing to zero. The
+		// forced ChangeView below moves the anchor, which IS the reset -- and
+		// zeroing a counter first, as this used to, was what let two nodes with
+		// the same anchor report different views.
 		d.consensusView.UpdateDutyIndex(height)
 		d.consensusView.ChangeView(d.timeSource.AdjustedTime(), true, anchor)
 	}
@@ -436,7 +440,6 @@ func (d *Dispatcher) ResetConsensusForEpochTransition(height uint64, parentTime 
 
 	d.consensusView.SetReady()
 	d.CleanProposals(false)
-	d.consensusView.ResetViewOffset()
 	d.consensusView.UpdateDutyIndex(height)
 	d.consensusView.ChangeView(d.timeSource.AdjustedTime(), true, parentTime)
 
@@ -860,12 +863,21 @@ func (d *Dispatcher) GetNowTime() time.Time {
 func NewDispatcher(producers [][]byte, onConfirm func(confirm *payload.Confirm) error,
 	unConfirm func(confirm *payload.Confirm) error, tolerance time.Duration, publicKey []byte,
 	medianTime dtime.MedianTimeSource, viewListener ViewListener, dposStartHeight uint64) *Dispatcher {
+	view := NewConsensusView(tolerance, publicKey, NewProducers(producers, dposStartHeight), viewListener)
+	// The view derives its offset from a clock, and it has to be this one: the
+	// offset is what selects the producer, so measuring it with time.Now while
+	// every other deadline in the engine uses the adjusted clock would give two
+	// answers to "which view is it" inside one node. Left nil the view falls back
+	// to time.Now, which is only what a test wants.
+	if medianTime != nil {
+		view.now = medianTime.AdjustedTime
+	}
 	return &Dispatcher{
 		acceptVotes:         make(map[elacom.Uint256]*payload.DPOSProposalVote),
 		rejectedVotes:       make(map[elacom.Uint256]*payload.DPOSProposalVote),
 		pendingVotes:        make(map[elacom.Uint256]*payload.DPOSProposalVote),
 		precociousProposals: make(map[elacom.Uint256]*payload.DPOSProposal),
-		consensusView:       NewConsensusView(tolerance, publicKey, NewProducers(producers, dposStartHeight), viewListener),
+		consensusView:       view,
 		onConfirm:           onConfirm,
 		unConfirm:           unConfirm,
 		timeSource:          medianTime,

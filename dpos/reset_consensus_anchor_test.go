@@ -17,12 +17,11 @@
 package dpos
 
 // The view grid is a pure function of one number: the anchor a force reset hands
-// to ChangeView. setChangViewTimeLocked truncates that anchor to a whole second
-// and writes viewStartTime = anchor, viewChangeTime = anchor + signTolerance, and
-// viewOffset is then a counter of how many advances this node has made since its
-// own reset. Two nodes agree on "which view are we in at height h" only if they
-// were reset with the same anchor. Hand them different anchors and every proposal
-// is stamped with a view number the others do not recognise, which dispatcher
+// to ChangeView. reanchorLocked stores it as a whole second and every later
+// viewOffset is DERIVED from it -- offset = (now - anchor) / signTolerance -- so
+// two nodes agree on "which view are we in at height h" exactly when they were
+// anchored with the same value. Hand them different anchors and every proposal is
+// stamped with a view number the others do not recognise, which dispatcher
 // ProcessProposal drops on the "have different view offset" branch.
 //
 // These tests pin that mechanism rather than the particular call sites, because
@@ -30,6 +29,15 @@ package dpos
 // every imported block but anchored it to uint64(now.Unix()) of the local clock,
 // so six producers sat one and two whole views apart, three against three, and
 // livelocked at height 6 with no path back. See Dispatcher.ResetConsensus.
+//
+// The second half of the same repair is that the offset is derived and not
+// accumulated. As a counter it advanced only while the view was Running, so two
+// nodes holding an identical anchor still reported different offsets, and the
+// number each reported carried its own history: measured on the live rig, 96 on
+// five producers against 288 on the one that had been on duty. A counter can only
+// be repaired by resetting it, which is why ResetViewOffset existed and why every
+// node that skipped a reset drifted. TestDerivedOffsetSurvivesUnequalResetRates
+// and TestRecoverFromStatusIgnoresThePeerCounter below cover that half.
 
 import (
 	"fmt"
@@ -249,12 +257,20 @@ func TestResetConsensusAnchorDecidesTheViewGrid(t *testing.T) {
 	nodeB.resumeAndReset(7, uint64(headerTime.Unix()))
 
 	fixedA, fixedB := nodeA.snapshot(), nodeB.snapshot()
-	if fixedA.offset != 0 || fixedB.offset != 0 {
-		t.Fatalf("a force reset must zero the counter, got %v and %v", fixedA, fixedB)
+	// Not "zero": a derived offset has no counter to zero, and the two nodes are
+	// not at offset 0 here -- they were reset onto a 31s-old anchor and are
+	// therefore five whole views in. What the force reset buys is that the number
+	// they report is a function of the shared anchor instead of their own history,
+	// so the assertion is agreement, not zero.
+	if fixedA.offset != fixedB.offset {
+		t.Fatalf("one anchor must mean one view, got %v and %v", fixedA, fixedB)
 	}
-	if !fixedA.start.Equal(fixedB.start) || !fixedA.start.Equal(headerTime) {
-		t.Fatalf("both nodes must anchor to the shared header.Time %v, got %v and %v",
-			headerTime, fixedA.start, fixedB.start)
+	// The window both nodes are sitting in, expressed from the shared anchor: this
+	// is what makes the grid shared rather than merely the answer equal today.
+	wantStart := headerTime.Add(time.Duration(fixedA.offset) * anchorTolerance)
+	if !fixedA.start.Equal(wantStart) || !fixedB.start.Equal(wantStart) {
+		t.Fatalf("both nodes must sit on %v (%v + %d tolerances), got %v and %v",
+			wantStart, headerTime, fixedA.offset, fixedA.start, fixedB.start)
 	}
 	if !fixedA.change.Equal(fixedB.change) {
 		t.Fatalf("the deadlines must be identical too, got %v and %v", fixedA.change, fixedB.change)
@@ -336,4 +352,110 @@ func TestSharedAnchorIsStableUnderPhaseSkew(t *testing.T) {
 		t.Fatalf("the grid drifted off the whole second: %v", a.start)
 	}
 	t.Logf("after five windows at .890 and .104: %s is %v, %s is %v", nodeA.name, a, nodeB.name, b)
+}
+
+// TestDerivedOffsetSurvivesUnequalResetRates is the half the anchor fix could not
+// reach, and the one the live rig reproduced after that fix was deployed.
+//
+// Both nodes are anchored to the same block header, so by the grid argument above
+// they should never disagree. But the view offset used to be a counter that only
+// advanced while the view was Running, and SetRunning is called from prepare.go's
+// startView -- once per round -- while a reset zeroed the counter. A node that
+// produced the block got a reset and started counting again from zero; a node that
+// only watched stayed Ready, kept its number, or jumped. Measured on six
+// producers with one shared anchor: 96 on five and 288 on the one that had been
+// on duty. Nothing in either node could reconcile the two, because each number was
+// that node's own history.
+//
+// This is the same test written against both implementations: one node runs for
+// ten minutes without ever being reset, the other is reset every thirty seconds
+// onto the identical anchor. Ten minutes is a hundred view windows.
+func TestDerivedOffsetSurvivesUnequalResetRates(t *testing.T) {
+	headerTime := time.Unix(1_700_000_000, 0)
+	anchor := uint64(headerTime.Unix())
+
+	// A produces and is re-anchored by every imported block; B has no block to
+	// import for the next ten minutes and is only ever re-anchored when the driver
+	// pokes it. Both start from the same anchor, which is the whole premise.
+	producer := newAnchorTestNode("A (reset every 30s)", phaseA)
+	watcher := newAnchorTestNode("B (never reset)", phaseB)
+
+	for _, n := range []*anchorTestNode{producer, watcher} {
+		n.clock.set(headerTime.Add(500 * time.Millisecond))
+		n.resumeAndReset(6, anchor)
+	}
+
+	// Ten minutes of one-second ticks. The two tick at their own phases, which is
+	// the skew the test above shows is harmless on a shared anchor.
+	const seconds = 600
+	for i := 1; i <= seconds; i++ {
+		tick := headerTime.Add(time.Duration(i) * time.Second)
+
+		watcher.tickAt(tick.Add(phaseB))
+
+		if i%30 == 0 {
+			// A block landed on A: ResetConsensus with the block's own header.Time,
+			// which here is the anchor both nodes already share.
+			producer.clock.set(tick.Add(phaseA))
+			producer.resumeAndReset(uint64(6+i/30), anchor)
+		} else {
+			producer.tickAt(tick.Add(phaseA))
+		}
+
+		gotA, gotB := producer.snapshot(), watcher.snapshot()
+		if gotA.offset != gotB.offset {
+			t.Fatalf("second %d: one anchor must mean one view whatever the reset rate, got %v and %v",
+				i, gotA, gotB)
+		}
+		if !gotA.start.Equal(gotB.start) {
+			t.Fatalf("second %d: the two nodes must sit in the same window, got %v and %v", i, gotA, gotB)
+		}
+	}
+
+	a, b := producer.snapshot(), watcher.snapshot()
+	// 600s on a 6s tolerance. Stated as an absolute so the test fails loudly if a
+	// future change rescales the grid instead of silently comparing two zeroes.
+	if want := uint32(seconds / 6); a.offset != want {
+		t.Fatalf("after %ds the shared view should be %d, got %v", seconds, want, a)
+	}
+	t.Logf("after %ds at unequal reset rates: %s is %v, %s is %v", seconds, producer.name, a, watcher.name, b)
+}
+
+// TestRecoverFromStatusIgnoresThePeerCounter is the same defect on the recovery
+// path, and it is the one that would keep re-seeding the divergence after every
+// other fix.
+//
+// RecoverAbnormal asks every peer for its view state and takes the median window
+// start; pickRecoverStatus then picks one peer's status to apply. Under the
+// counter, applying it meant `viewOffset += offset`, so the number this node
+// carried afterwards was the peer's accident plus its own -- and the peer is
+// chosen by map iteration order, so two nodes recovering from the same evidence
+// landed on different views.
+//
+// The offset argument is still on the wire and still passed in. What this pins is
+// that the local view is a function of the anchor and the clock only: any value in
+// that argument, including a nonsense one, must leave the answer alone.
+func TestRecoverFromStatusIgnoresThePeerCounter(t *testing.T) {
+	headerTime := time.Unix(1_700_000_000, 0)
+	node := newAnchorTestNode("A", phaseA)
+
+	// Thirteen seconds past the shared anchor is two whole tolerances in.
+	node.clock.set(headerTime.Add(13 * time.Second))
+
+	// The peer's window start is a shared candidate; its counter is not. 999 is
+	// what an accumulator on a long-running peer reports, and 0 is what a freshly
+	// restarted one reports. Neither may move this node off the grid.
+	for _, peerOffset := range []uint32{999, 0, 1, 2, 7} {
+		node.d.GetConsensusView().RecoverFromStatus(ConsensusRunning, peerOffset, headerTime, 1, 0)
+
+		view := node.d.GetConsensusView()
+		if got := view.GetViewOffset(); got != 2 {
+			t.Fatalf("peer reported viewOffset %d and the local view became %d, want the 2 the anchor implies",
+				peerOffset, got)
+		}
+		if start := view.GetViewStartTime(); !start.Equal(headerTime.Add(12 * time.Second)) {
+			t.Fatalf("peer reported viewOffset %d and the local window moved to %v, want %v",
+				peerOffset, start, headerTime.Add(12*time.Second))
+		}
+	}
 }
