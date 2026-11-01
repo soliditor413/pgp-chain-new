@@ -107,10 +107,15 @@ func newHandler(backend Backend, network uint64, hooks DPOSHooks) *handler {
 	}
 }
 
-// MakeProtocols returns the eth/64 protocol entry.
+// MakeProtocols returns the eth/64 protocol entry and the elamsg entry that
+// carries the DPoS address channel.
 //
-// The handler (peer set + syncer) is created once and shared by every peer, so
-// BestPeer sees all of them.
+// Two entries, one handler. They cannot share a capability name: p2p keys
+// matched protocols by name, so "eth"/64 is overwritten by eth/68 or eth/70 on
+// any connection that speaks them (see ElaMsgProtocolName in protocol.go).
+// Sharing the handler is what keeps the second entry useful -- a peer registered
+// by either Run is visible to BroadcastElaMsg, PeerByID, PeerCount and the
+// syncer, because they all read the same peer set.
 func MakeProtocols(backend Backend, network uint64, hooks DPOSHooks) []p2p.Protocol {
 	h := newHandler(backend, network, hooks)
 	h.start()
@@ -119,25 +124,36 @@ func MakeProtocols(backend Backend, network uint64, hooks DPOSHooks) []p2p.Proto
 	// this pointer is the one-way channel that avoids an import cycle.
 	currentHandler.Store(h)
 
+	// One closure for both entries: which capability served the connection is an
+	// implementation detail of the transport, not something to report per entry.
+	peerInfo := func(id enode.ID) interface{} {
+		if peer := h.peers.Peer(id.String()); peer != nil {
+			head, td := peer.Head()
+			return struct {
+				Version uint
+				Head    string
+				TD      string
+			}{peer.Version(), head.Hex(), td.String()}
+		}
+		return nil
+	}
+
 	return []p2p.Protocol{{
 		Name:    ProtocolName,
 		Version: ETH64,
 		// Length must stay 17, see protocolLengths.
-		Length: protocolLengths[ETH64],
-		Run: func(peer *p2p.Peer, rw p2p.MsgReadWriter) error {
-			return h.run(peer, rw)
-		},
-		PeerInfo: func(id enode.ID) interface{} {
-			if peer := h.peers.Peer(id.String()); peer != nil {
-				head, td := peer.Head()
-				return struct {
-					Version uint
-					Head    string
-					TD      string
-				}{peer.Version(), head.Hex(), td.String()}
-			}
-			return nil
-		},
+		Length:   protocolLengths[ETH64],
+		Run:      func(peer *p2p.Peer, rw p2p.MsgReadWriter) error { return h.run(peer, rw) },
+		PeerInfo: peerInfo,
+	}, {
+		Name:    ElaMsgProtocolName,
+		Version: ElaMsgProtocolVersion,
+		// Same window size as eth/64: the message code table is the pgp-chain
+		// one, and matchProtocols accumulates Length onto the next protocol's
+		// offset, so any other value would shift snap/bsc codes.
+		Length:   protocolLengths[ETH64],
+		Run:      func(peer *p2p.Peer, rw p2p.MsgReadWriter) error { return h.runElaMsgOnly(peer, rw) },
+		PeerInfo: peerInfo,
 	}}
 }
 
@@ -271,6 +287,100 @@ func (h *handler) dispatch(peer *Peer) error {
 			// connection.
 			discardedMeter.Mark(1)
 			peer.Log().Trace("Discarding unsupported eth64 message", "code", msg.Code, "size", msg.Size)
+			if err := msg.Discard(); err != nil {
+				return err
+			}
+		}
+	}
+}
+
+// runElaMsgOnly serves a connection on the elamsg capability: no handshake, no
+// block traffic, just the DPoS address channel.
+//
+// It differs from run in four deliberate ways:
+//
+//   - no handshake. This capability has no Status exchange to perform; both ends
+//     are this client by construction, so the peer is registered immediately.
+//   - no h.syncer.trigger(). eth/70 owns syncing on the connections that speak
+//     it; triggering from here would put two downloaders on one head.
+//   - only ELAMSG is dispatched. Everything else is discarded, never returned as
+//     an error, so a stray frame cannot kill the address channel.
+//   - it registers into the same peer set as run, which is what makes the peer
+//     visible to BroadcastElaMsg and PeerByID.
+//
+// Register can only fail with "already registered" if eth/64 also accepted this
+// connection. That cannot happen while this client offers eth/68 and eth/70 --
+// matchProtocols keeps one version per name, so on a connection that negotiates
+// eth/70 the eth/64 entry never runs. If it ever does (a peer that speaks eth/64
+// but not eth/70), eth/64's own dispatch already handles 0x08, so losing this
+// entry costs nothing; returning the error just stops the duplicate reader.
+func (h *handler) runElaMsgOnly(p2pPeer *p2p.Peer, rw p2p.MsgReadWriter) error {
+	// Version is the elamsg capability's, not ETH64: it is what PeerInfo reports
+	// for this entry, and reporting 64 there would claim an eth/64 session that
+	// this connection does not have.
+	peer := NewPeer(ElaMsgProtocolVersion, p2pPeer.ID().String(), rw)
+	registered := false
+	defer func() {
+		peer.Close()
+		if registered {
+			// Same ordering as run: PeerDown before Unregister, outside the
+			// peer-set lock, so the DPoS subscriber sees the drop while the
+			// session is still in the set it resolves peers in.
+			if h.hooks != nil {
+				h.hooks.PeerDown(peer)
+			}
+			if err := h.peers.Unregister(peer.ID()); err != nil {
+				peer.Log().Debug("Failed to unregister DPoS peer", "err", err)
+			}
+		}
+	}()
+
+	if err := h.peers.Register(peer); err != nil {
+		peer.Log().Debug("Failed to register DPoS peer", "err", err)
+		return err
+	}
+	registered = true
+	if h.hooks != nil {
+		h.hooks.PeerUp(peer)
+	}
+
+	return h.dispatchElaMsgOnly(peer)
+}
+
+// dispatchElaMsgOnly is the single reader of an elamsg connection.
+func (h *handler) dispatchElaMsgOnly(peer *Peer) error {
+	for {
+		msg, err := peer.rw.ReadMsg()
+		if err != nil {
+			return err
+		}
+		if msg.Size > protocolMaxMsgSize {
+			msg.Discard()
+			return fmt.Errorf("%w: %d > %d", errMsgTooLarge, msg.Size, protocolMaxMsgSize)
+		}
+		switch msg.Code {
+		case ELAMSG:
+			// Same policy as dispatch: an undecodable payload is dropped, not
+			// returned as an error. The routing layer only loses that one
+			// address, while tearing the connection down would lose the channel.
+			hooks := h.hooks
+			if hooks == nil {
+				msg.Discard()
+				continue
+			}
+			elaMsg := new(elamsg.ElaMsg)
+			if err := msg.Decode(&elaMsg); err != nil {
+				peer.Log().Debug("Discarding undecodable ELAMSG", "err", err)
+				continue
+			}
+			hooks.ElaMsg(peer, elaMsg)
+
+		default:
+			// Never return an error for an unknown code: this capability exists
+			// to stay alive next to block-sync traffic, and a version skew must
+			// not turn into a peer-churn loop.
+			discardedMeter.Mark(1)
+			peer.Log().Trace("Discarding unsupported elamsg message", "code", msg.Code, "size", msg.Size)
 			if err := msg.Discard(); err != nil {
 				return err
 			}

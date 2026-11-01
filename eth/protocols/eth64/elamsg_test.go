@@ -12,6 +12,7 @@ import (
 
 	"github.com/ethereum/go-ethereum/dpos/elamsg"
 	"github.com/ethereum/go-ethereum/p2p"
+	"github.com/ethereum/go-ethereum/p2p/enode"
 )
 
 // recordingHooks captures the three DPoS callbacks.
@@ -189,4 +190,103 @@ func TestELAMSGIsNotDecodedWithoutHooks(t *testing.T) {
 
 	remote.Close()
 	<-done
+}
+
+// waitFor polls cond until it holds or the deadline passes.
+func waitFor(t *testing.T, what string, cond func() bool) {
+	t.Helper()
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if cond() {
+			return
+		}
+		time.Sleep(time.Millisecond)
+	}
+	t.Fatalf("timed out waiting for %s", what)
+}
+
+// TestRunElaMsgOnlyCarriesTheChannel drives the elamsg capability's own Run over
+// a real pipe.
+//
+// This is the capability that actually carries the address channel: the eth/64
+// entry is shadowed by eth/70 on every connection this client makes, so this Run
+// is the only thing keeping ELAMSG alive. Two properties are pinned here --
+// there is no handshake to wait for (the peer is announced immediately, which is
+// what BroadcastElaMsg iterates), and an unknown message code is discarded
+// without killing the reader, because a version skew must not turn into a
+// peer-churn loop on the channel that carries DAddr.
+func TestRunElaMsgOnlyCarriesTheChannel(t *testing.T) {
+	remote, local := p2p.MsgPipe()
+	defer remote.Close()
+	defer local.Close()
+
+	var nodeID enode.ID
+	nodeID[0] = 0x42
+	p2pPeer := p2p.NewPeer(nodeID, "elamsg-test", nil)
+
+	hooks := &recordingHooks{}
+	h := newHandler(nil, 860621, hooks)
+	defer h.Close()
+
+	done := make(chan error, 1)
+	go func() { done <- h.runElaMsgOnly(p2pPeer, local) }()
+
+	waitFor(t, "the peer to be registered and announced", func() bool {
+		up, _, _, _ := hooks.snapshot()
+		return up == 1 && h.peers.Peer(nodeID.String()) != nil
+	})
+
+	first := &elamsg.ElaMsg{Type: elamsg.DAddr, Msg: []byte{7, 8, 9}}
+	if err := p2p.Send(remote, ELAMSG, first); err != nil {
+		t.Fatalf("cannot send ELAMSG: %v", err)
+	}
+	waitFor(t, "the first ELAMSG", func() bool {
+		_, _, msgs, _ := hooks.snapshot()
+		return len(msgs) == 1
+	})
+	_, _, msgs, peers := hooks.snapshot()
+	if msgs[0].Type != first.Type || string(msgs[0].Msg) != string(first.Msg) {
+		t.Fatalf("decoded ELAMSG = %+v, want %+v", msgs[0], first)
+	}
+	if peers[0].ID() != nodeID.String() {
+		t.Fatalf("envelope arrived with peer id %q, want %q", peers[0].ID(), nodeID.String())
+	}
+
+	// An unknown code must not reach the hooks and must not end the loop.
+	if err := p2p.Send(remote, 0x03, []interface{}{"x"}); err != nil {
+		t.Fatalf("cannot send unknown code: %v", err)
+	}
+	time.Sleep(100 * time.Millisecond)
+	if _, _, msgs, _ := hooks.snapshot(); len(msgs) != 1 {
+		t.Fatalf("an unknown code reached the hooks (%d ELAMSG delivered)", len(msgs))
+	}
+	select {
+	case err := <-done:
+		t.Fatalf("the reader returned on an unknown message code: %v", err)
+	default:
+	}
+
+	// Still alive: the channel must keep delivering.
+	second := &elamsg.ElaMsg{Type: elamsg.Inv, Msg: []byte{1}}
+	if err := p2p.Send(remote, ELAMSG, second); err != nil {
+		t.Fatalf("cannot send ELAMSG after the unknown code: %v", err)
+	}
+	waitFor(t, "the second ELAMSG", func() bool {
+		_, _, msgs, _ := hooks.snapshot()
+		return len(msgs) == 2
+	})
+
+	remote.Close()
+	select {
+	case <-done:
+	case <-time.After(5 * time.Second):
+		t.Fatal("runElaMsgOnly did not return after the pipe was closed")
+	}
+
+	if _, down, _, _ := hooks.snapshot(); down != 1 {
+		t.Fatalf("PeerDown fired %d times, want 1", down)
+	}
+	if h.peers.Peer(nodeID.String()) != nil {
+		t.Fatal("the peer stayed in the set after the channel closed, so BroadcastElaMsg would keep writing to it")
+	}
 }

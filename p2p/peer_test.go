@@ -360,3 +360,53 @@ func TestMatchProtocols(t *testing.T) {
 		}
 	}
 }
+
+// TestMatchProtocolsKeepsTheElaMsgCapability pins the rule the DPoS address
+// channel's separate capability name exists for.
+//
+// matchProtocols keys its result by NAME, so two versions of "eth" collapse into
+// one entry (the highest mutual version) and only one of them gets a Run
+// goroutine. A different name is matched independently, which is the only way
+// the address channel can run next to eth/70 on the same connection. If p2p ever
+// keys negotiation by name AND version, the extra name becomes unnecessary --
+// until then, removing it silently disables the channel.
+func TestMatchProtocolsKeepsTheElaMsgCapability(t *testing.T) {
+	local := []Protocol{
+		{Name: "eth", Version: 64, Length: 17},
+		{Name: "eth", Version: 70, Length: 17},
+		{Name: "elamsg", Version: 1, Length: 17},
+	}
+	remote := []Cap{
+		{Name: "eth", Version: 64},
+		{Name: "eth", Version: 70},
+		{Name: "elamsg", Version: 1},
+	}
+
+	result := matchProtocols(local, remote, nil)
+	if len(result) != 2 {
+		t.Fatalf("matched %d capabilities, want 2 (eth and elamsg): %v", len(result), result)
+	}
+
+	eth, ok := result["eth"]
+	if !ok {
+		t.Fatalf("eth did not match: %v", result)
+	}
+	if eth.Version != 70 {
+		t.Fatalf("eth matched version %d, want 70: the lower version must lose within a name", eth.Version)
+	}
+
+	ela, ok := result["elamsg"]
+	if !ok {
+		t.Fatalf("the elamsg capability did not match, so the DPoS address channel would never run: %v", result)
+	}
+	if ela.Version != 1 {
+		t.Fatalf("elamsg matched version %d, want 1", ela.Version)
+	}
+
+	// The two windows must not overlap, or each reader would receive the other's
+	// frames: matchProtocols assigns offsets by accumulating Length.
+	if ela.offset < eth.offset+eth.Length && eth.offset < ela.offset+ela.Length {
+		t.Fatalf("elamsg window [%d,%d) overlaps eth's [%d,%d)",
+			ela.offset, ela.offset+ela.Length, eth.offset, eth.offset+eth.Length)
+	}
+}

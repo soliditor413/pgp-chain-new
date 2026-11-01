@@ -631,3 +631,60 @@ func TestSyncerLatchWithoutRetryTimeStaysParked(t *testing.T) {
 		t.Fatal("a latch with no retry time expired after a day")
 	}
 }
+
+// TestMakeProtocolsRegistersTheElaMsgCapability pins the shape of the fix for the
+// eth/64 shadowing: two entries, one handler.
+//
+// Why it matters: p2p/peer.go's matchProtocols keys by capability name, so an
+// entry registered as "eth"/64 never runs on a connection that also offers
+// eth/68 or eth/70. If the elamsg entry disappears, or goes back to being named
+// "eth", the DPoS address channel stops existing at runtime with no error
+// anywhere -- peers still connect, BroadcastElaMsg just iterates an empty set.
+func TestMakeProtocolsRegistersTheElaMsgCapability(t *testing.T) {
+	previous := currentHandler.Swap(nil)
+	t.Cleanup(func() { currentHandler.Store(previous) })
+
+	protos := MakeProtocols(nil, 860621, nil)
+	if h := currentHandler.Load(); h != nil {
+		t.Cleanup(h.Close)
+	}
+
+	if len(protos) != 2 {
+		t.Fatalf("MakeProtocols returned %d entries, want 2 (eth/64 and elamsg)", len(protos))
+	}
+	byName := make(map[string]p2p.Protocol, 2)
+	for _, p := range protos {
+		if _, dup := byName[p.Name]; dup {
+			t.Fatalf("duplicate capability name %q: matchProtocols keeps only the last one", p.Name)
+		}
+		byName[p.Name] = p
+	}
+	eth, ok := byName[ProtocolName]
+	if !ok {
+		t.Fatalf("no %q entry, got %v", ProtocolName, byName)
+	}
+	ela, ok := byName[ElaMsgProtocolName]
+	if !ok {
+		t.Fatalf("no %q entry, got %v", ElaMsgProtocolName, byName)
+	}
+
+	for name, p := range byName {
+		if p.Length != protocolLengths[ETH64] {
+			t.Fatalf("%s Length = %d, want %d (matchProtocols accumulates it onto the next offset)",
+				name, p.Length, protocolLengths[ETH64])
+		}
+		if p.Run == nil {
+			t.Fatalf("%s has no Run function", name)
+		}
+	}
+	if eth.Version != ETH64 {
+		t.Fatalf("eth entry version = %d, want %d", eth.Version, ETH64)
+	}
+	if ela.Version != ElaMsgProtocolVersion {
+		t.Fatalf("elamsg version = %d, want %d", ela.Version, ElaMsgProtocolVersion)
+	}
+	if ela.Name == ProtocolName {
+		t.Fatalf("the DPoS capability is registered as %q; matchProtocols would shadow it with eth/68 or eth/70",
+			ela.Name)
+	}
+}

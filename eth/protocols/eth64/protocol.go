@@ -49,6 +49,34 @@ const ETH64 = 64
 // ProtocolName is the devp2p capability name.
 const ProtocolName = "eth"
 
+// ElaMsgProtocolName is the devp2p capability that carries the DPoS address
+// channel.
+//
+// It is a name of its own because of how p2p negotiates, not because of anything
+// about the wire format. p2p/peer.go:505-522 (matchProtocols) keys its result by
+// capability NAME alone: matching a second version of a name it has already seen
+// does `offset -= old.Length` and overwrites result[cap.Name], so only one
+// version of a name ever gets a Run goroutine. A protocol registered as
+// "eth"/64 therefore loses to eth/68 and eth/70 on every connection that offers
+// them -- which is every connection this client makes -- and its Run never
+// starts. That is not a version negotiation failure the node can report: the
+// capability is advertised, so the peer looks healthy, while the protocol's peer
+// set stays empty.
+//
+// A distinct name is the only way both can run: the version arbitration above is
+// then confined to the single "eth" entry, and this one is matched independently
+// of it.
+//
+// This name must never become "eth". Doing so silently restores the shadowing,
+// with no error anywhere: currentHandler.peers stays empty and
+// eth64.BroadcastElaMsg iterates nothing, so every DAddr announcement goes
+// nowhere.
+const ElaMsgProtocolName = "elamsg"
+
+// ElaMsgProtocolVersion is the only version of the elamsg capability. Both ends
+// are this client, so there is nothing to negotiate.
+const ElaMsgProtocolVersion = 1
+
 // protocolLengths is the number of message codes the protocol occupies.
 //
 // IMPORTANT: this must stay exactly 17. p2p/peer.go's matchProtocols assigns
