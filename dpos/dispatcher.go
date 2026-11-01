@@ -746,16 +746,34 @@ func (d *Dispatcher) HelpToRecoverAbnormal(id peer.PID, height uint64, currentHe
 //
 // # What anchorNanos does to the grid
 //
-// The two lines below look like they re-anchor on the local clock, and that is
-// worth spelling out because it decides whether they are a fork source.
+// The anchor is the view grid's origin, and it is only an origin if the whole set
+// reads the same value. The head header's timestamp is such a value: every
+// producer holding that block reads the same Time out of it.
 //
-//	offsetTime = (now - anchorNanos) % signTolerance
-//	viewStartTime = now - offsetTime
+// The two lines below used to be described as "re-anchoring on the local clock,
+// but harmless", on this argument:
 //
-// Expanding the second line gives anchorNanos + offset*signTolerance: now cancels
-// out, so the result is anchorNanos rounded up to its own grid, not this node's
-// clock. Two nodes holding the same anchorNanos therefore land on the same
-// viewStartTime even if their adjusted clocks differ.
+//	offsetTime    = (now - anchorNanos) % signTolerance
+//	viewStartTime = now - offsetTime                     // <- removed
+//	expand: anchorNanos + signTolerance*floor((now-anchorNanos)/signTolerance)
+//
+// so "now cancels out". It does, within a window. It does not cancel the window
+// index q = floor((now-anchorNanos)/signTolerance), and q is a per-node quantity
+// because `now` is this node's adjusted clock. Two nodes recovering the same head
+// one second apart, with that second straddling a multiple of signTolerance,
+// therefore stored origins one grid point apart. That is what the rig showed: a
+// 4/2 split with anchors 6 seconds apart -- one grid point, not a block period,
+// so not a head difference.
+//
+// The distinction that settles it is window start versus origin. An origin is
+// written once and every later offset is measured from it, so a translated
+// origin never heals. A translated window does, on the next block, when startView
+// re-anchors on parent.Time. Placing the window is reanchorLocked's job
+// (consensusview.go), and it derives the window from the anchor it is handed plus
+// the caller's clock -- which is the one place `now` is allowed in.
+//
+// dpos/recover_anchor_contract_test.go pins it: the value passed in as the anchor
+// is the value stored, in every window.
 //
 // The parameter used to be the median of the peers' reported view start times,
 // which made it a per-node value: each receiver medians whichever statuses it
@@ -780,9 +798,29 @@ func (d *Dispatcher) RecoverAbnormal(status *dmsg.ConsensusStatus, anchorNanos i
 	Info("RecoverAbnormal", "status", status.ConsensusStatus, "viewOffset", status.ViewOffset, "viewStartTime", status.ViewStartTime)
 	status.ViewStartTime = dtime.Int64ToTime(anchorNanos)
 	if anchorNanos != 0 {
-		offset, offsetTime := d.consensusView.calculateOffsetTime(status.ViewStartTime, d.timeSource.AdjustedTime())
+		offset, _ := d.consensusView.calculateOffsetTime(status.ViewStartTime, d.timeSource.AdjustedTime())
 		status.ViewOffset += offset
-		status.ViewStartTime = d.timeSource.AdjustedTime().Add(-offsetTime)
+		// ViewStartTime is deliberately NOT rewritten here any more.
+		//
+		// It used to be `AdjustedTime().Add(-offsetTime)`, i.e. anchor +
+		// signTolerance*floor((now-anchor)/signTolerance) -- a WINDOW START -- and
+		// RecoverFromStatus then stored that as the anchor
+		// (consensusview.go:720). The anchor is the grid ORIGIN, a value the whole
+		// set reads out of the same block header; replacing it with a window start
+		// computed from this node's own clock puts every recovering node on its own
+		// grid. Measured on the six-producer rig: two nodes stored 16:24:26Z and
+		// four stored 16:24:32Z -- one grid point -- and the lagging pair then
+		// reported a viewOffset one lower for good, so ProcessProposal dropped their
+		// votes (dispatcher.go:124) and only the remaining four made quorum.
+		//
+		// Placing the window is reanchorLocked's job and it already does it from the
+		// anchor it is given (consensusview.go:167-181). Doing it here first meant
+		// the origin was moved and the window then computed from the moved origin, so
+		// the shift was not merely redundant, it was permanent.
+		//
+		// dpos/recover_anchor_contract_test.go pins this: what is passed in as the
+		// anchor must be what is stored, and two nodes recovering the same head from
+		// different grid windows must end up with the same origin.
 	}
 	// The error is logged here rather than dropped. Go discards a returned error
 	// silently, and this is the only call site in the tree: dropping it would

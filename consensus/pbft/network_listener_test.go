@@ -407,8 +407,8 @@ func TestRecoveryAnchorsOnTheHeadNotOnThePeerClocks(t *testing.T) {
 	}}
 
 	// recover runs one exchange to completion and returns the anchor the node
-	// landed on. peers is the bucket this node received.
-	recover := func(t *testing.T, offset uint32, peers map[string]time.Time) uint64 {
+	// landed on, and the window start it derived from it.
+	recover := func(t *testing.T, offset uint32, peers map[string]time.Time) (uint64, time.Time) {
 		t.Helper()
 		engine := New(&params.LegacyConfig{VerifySeal: true, Producers: producerKeys}, &Config{Enable: true})
 		engine.attachAccount(accounts[0])
@@ -431,7 +431,8 @@ func TestRecoveryAnchorsOnTheHeadNotOnThePeerClocks(t *testing.T) {
 			t.Fatal("beginRecover was refused")
 		}
 		engine.finishRecoverAndApply()
-		return engine.dispatcher.GetConsensusView().GetAnchor()
+		view := engine.dispatcher.GetConsensusView()
+		return view.GetAnchor(), view.GetViewStartTime()
 	}
 
 	cases := []struct {
@@ -469,9 +470,13 @@ func TestRecoveryAnchorsOnTheHeadNotOnThePeerClocks(t *testing.T) {
 		},
 	}
 
-	var want uint64
+	var (
+		want   uint64
+		starts []time.Time
+	)
 	for i, tc := range cases {
-		got := recover(t, tc.offset, tc.peers)
+		got, start := recover(t, tc.offset, tc.peers)
+		starts = append(starts, start)
 		if i == 0 {
 			want = got
 			continue
@@ -482,23 +487,42 @@ func TestRecoveryAnchorsOnTheHeadNotOnThePeerClocks(t *testing.T) {
 		}
 	}
 
-	// And the shared anchor has to be the grid the head defines, not merely equal
-	// across nodes: headTime plus a whole number of tolerances, inside the window
-	// the head is old by.
-	if want < headTime {
-		t.Fatalf("anchor %d is behind the head timestamp %d", want, headTime)
+	// And the shared anchor has to be the head's timestamp itself: not merely a value
+	// equal across nodes, and not merely a value sitting on the head's grid.
+	//
+	// This used to assert "headTime plus a whole number of tolerances, inside one
+	// tolerance of now", which is the shape the anchor had while RecoverAbnormal
+	// rebuilt it as anchor + signTolerance*floor((now-anchor)/signTolerance)
+	// (dpos/dispatcher.go:804 before it was removed). Two nodes produce that shape
+	// identically only if they land in the same grid window; the rig showed what
+	// happens when they do not -- six producers split 4/2 with anchors 16:24:26Z and
+	// 16:24:32Z, the lagging pair then reporting a viewOffset one lower for good and
+	// losing the vote. Snapping to the current window is the part that makes the
+	// anchor per-node, so the assertion is exact equality: any whole-window
+	// translation of the head's timestamp is a different origin, hence a different
+	// grid.
+	if want != headTime {
+		t.Fatalf("anchor %d, want the head's timestamp %d (%d seconds, %d whole "+
+			"tolerances apart): the anchor is the grid origin, every producer reads the "+
+			"same Time out of the same header, and a translated origin is a per-node grid",
+			want, headTime, int64(want)-int64(headTime),
+			(int64(want)-int64(headTime))/int64(signTolerance.Seconds()))
 	}
-	if off := (want - headTime) % uint64(signTolerance.Seconds()); off != 0 {
-		t.Fatalf("anchor %d is %ds off the grid the head timestamp %d defines "+
-			"(signTolerance %v); the grid must be derived from the block, not from a peer",
-			want, off, headTime, signTolerance)
+
+	// The value that IS supposed to be near now is the window start: reanchorLocked
+	// places it at the beginning of the window the caller's clock falls in
+	// (dpos/consensusview.go:167-181), and the head is 93s old here, so that window
+	// start is headTime+90s = 3s behind now. This is the assertion the old one was
+	// reaching for, moved to the field it actually describes.
+	for _, start := range starts {
+		if behind := now.Sub(start); behind < 0 || behind > signTolerance {
+			t.Fatalf("viewStartTime %v is %v away from the node's clock; the window the "+
+				"derived offset selects must be the one now falls in (head is %v old, "+
+				"signTolerance %v)", start, behind, headAge, signTolerance)
+		}
 	}
-	if behind := now.Sub(time.Unix(int64(want), 0)); behind < 0 || behind > signTolerance {
-		t.Fatalf("anchor %d is %v behind the node's clock; a head-backed anchor is inside one tolerance",
-			want, behind)
-	}
-	t.Logf("head at %d, all five nodes anchored at %d (+%ds, %v behind their clocks)",
-		headTime, want, want-headTime, now.Sub(time.Unix(int64(want), 0)))
+	t.Logf("head at %d, all five nodes anchored at %d (+0s), window start %v (%v behind their clocks)",
+		headTime, want, starts[0], now.Sub(starts[0]))
 }
 
 // TestRecoveryAnchorWithoutAHeadIsTheClockNotNull covers the one degraded case in

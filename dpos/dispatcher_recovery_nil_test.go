@@ -44,8 +44,12 @@ func TestRecoverAbnormalWithNilStatusDoesNotPanic(t *testing.T) {
 
 // TestRecoverAbnormalAppliesStatusWithMedianTime drives the branch the nil cases
 // above cannot reach: a real status with anchorNanos != 0, which recomputes the
-// offset against the local clock and rewrites the start time before handing the
-// status to RecoverFromConsensusStatus.
+// offset against the local clock before handing the status to
+// RecoverFromConsensusStatus.
+//
+// It used to rewrite the start time too, and this comment said so; that rewrite was
+// the anchor-split defect (see recover_anchor_contract_test.go). What survives here
+// is the offset arithmetic, because status.ViewOffset is part of the wire shape.
 //
 // The assertion is that the status actually arrived. "Did not panic" is not
 // enough here: the function could return early and still not panic.
