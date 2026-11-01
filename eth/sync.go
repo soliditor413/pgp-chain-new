@@ -164,11 +164,21 @@ func (cs *chainSyncer) nextSyncOp() *chainSyncOp {
 	mode, ourTD := cs.modeAndLocalHead()
 	op := peerToSyncOp(mode, peer)
 	if op.td.Cmp(ourTD) <= 0 {
-		if !cs.handler.acceptTxs.Load() {
-			// Occurs only during a quick restart.
-			cs.handler.acceptTxs.Store(true)
-			log.Info("Enable transaction acceptance for already in sync.")
+		// Already in sync by TD -- in practice this is the quick restart case.
+		//
+		// This branch used to set acceptTxs alone, which left h.synced false for
+		// the whole life of the process: the flag's only writers are doSync
+		// (below, reached only when a peer is actually ahead) and
+		// Ethereum.SetSynced, whose single caller is the beacon client
+		// (eth/catalyst/api.go). A non-beacon chain reaches neither, so a restart
+		// next to an equal-TD peer permanently disabled the block fetcher's
+		// inserter (handler.go) and every propagated block was dropped, leaving
+		// the PBFT direct-insert path as the only way to advance.
+		if !cs.handler.synced.Load() {
+			log.Info("Marking the node synced: already in sync by TD.")
 		}
+		cs.handler.enableSyncedFeatures()
+
 		// We seem to be in sync according to the legacy rules. In the merge
 		// world, it can also mean we're stuck on the merge block, waiting for
 		// a beacon client. In the latter case, notify the user.

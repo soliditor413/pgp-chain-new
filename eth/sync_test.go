@@ -105,6 +105,86 @@ func testSnapSyncDisabling(t *testing.T, ethVer uint, snapVer uint) {
 	}
 }
 
+// TestAlreadyInSyncMarksTheNodeSynced verifies that nextSyncOp marks the node as
+// synced when the local chain is already at (or above) the best peer's TD.
+//
+// A node restarting next to a peer with an equal TD takes that branch, which used
+// to set acceptTxs alone and left handler.synced == false for the life of the
+// process. synced is the gate of the block fetcher's inserter (handler.go), so
+// every propagated block was discarded and the node could only advance through
+// the PBFT direct-insert path.
+func TestAlreadyInSyncMarksTheNodeSynced(t *testing.T) {
+	t.Parallel()
+
+	// Local node and peers share the same genesis-only chain, so the highest peer
+	// TD equals our own and nextSyncOp takes the "already in sync" branch instead
+	// of returning a sync operation.
+	local := newTestHandler(ethconfig.FullSync)
+	defer local.close()
+
+	// nextSyncOp returns early unless the peer set is at least defaultMinSyncPeers.
+	const peers = defaultMinSyncPeers
+
+	sinks := make([]*testHandler, peers)
+	for i := 0; i < peers; i++ {
+		sinks[i] = newTestHandler(ethconfig.FullSync)
+		defer sinks[i].close()
+
+		localPipe, sinkPipe := p2p.MsgPipe()
+		defer localPipe.Close()
+		defer sinkPipe.Close()
+
+		localPeer := eth.NewPeer(eth.ETH68, p2p.NewPeer(enode.ID{byte(i + 1)}, "", nil), localPipe, local.txpool, nil)
+		sinkPeer := eth.NewPeer(eth.ETH68, p2p.NewPeer(enode.ID{0}, "", nil), sinkPipe, sinks[i].txpool, nil)
+		defer localPeer.Close()
+		defer sinkPeer.Close()
+
+		go local.handler.runEthPeer(localPeer, func(peer *eth.Peer) error {
+			return eth.Handle((*ethHandler)(local.handler), peer)
+		})
+		go sinks[i].handler.runEthPeer(sinkPeer, func(peer *eth.Peer) error {
+			return eth.Handle((*ethHandler)(sinks[i].handler), peer)
+		})
+	}
+	// Peers only enter the set once their handshake completed.
+	for deadline := time.Now().Add(10 * time.Second); local.handler.peers.len() < peers; time.Sleep(10 * time.Millisecond) {
+		if time.Now().After(deadline) {
+			t.Fatalf("peers not connected: have %d, want %d", local.handler.peers.len(), peers)
+		}
+	}
+	// Same TD on both sides: this is the restart case, not a real sync.
+	peer := local.handler.peers.peerWithHighestTD()
+	if peer == nil {
+		t.Fatal("no peer with a TD in the peer set")
+	}
+	_, ourTD := (&chainSyncer{handler: local.handler}).modeAndLocalHead()
+	_, peerTD := peer.Head()
+	if peerTD.Cmp(ourTD) > 0 {
+		t.Fatalf("peer td %v above local td %v, test setup would sync instead", peerTD, ourTD)
+	}
+	// Let the running sync loop consume the registration events: it will only
+	// wake up again on the force timer (forceSyncCycle) after that.
+	time.Sleep(300 * time.Millisecond)
+
+	// Simulate the state right after a restart: nothing has been synced yet.
+	local.handler.synced.Store(false)
+	local.handler.acceptTxs.Store(false)
+	if local.handler.synced.Load() {
+		t.Fatal("precondition failed: handler already marked synced")
+	}
+
+	cs := &chainSyncer{handler: local.handler}
+	if op := cs.nextSyncOp(); op != nil {
+		t.Fatalf("sync op scheduled for already in sync node: peer td %v", op.td)
+	}
+	if !local.handler.synced.Load() {
+		t.Error("handler not marked synced although already in sync by TD")
+	}
+	if !local.handler.acceptTxs.Load() {
+		t.Error("transaction acceptance not enabled although already in sync by TD")
+	}
+}
+
 func TestFullSyncWithBlobs(t *testing.T) {
 	testChainSyncWithBlobs(t, ethconfig.FullSync, 128, 128)
 }
