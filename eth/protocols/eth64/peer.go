@@ -347,6 +347,15 @@ func (ps *peerSet) Peers() []*Peer {
 }
 
 // BestPeer returns the peer with the highest total difficulty, or nil.
+//
+// Only eth/64 peers are considered. The set also holds elamsg connections --
+// they register here so that BroadcastElaMsg and PeerByID can reach them -- but
+// those carry no block traffic: the capability has no Status exchange, so their
+// head stays zero and their TD stays 0. Handing one to the syncer would make it
+// send GetBlockHeaders into the elamsg code window, where the far end discards
+// it as an unknown code: a request that can never be answered, retried every
+// syncLoopInterval, logged at INFO on the refusal path. Returning nil instead is
+// what makes chainSyncer.loop take its `continue` and leave syncing to eth/70.
 func (ps *peerSet) BestPeer() *Peer {
 	ps.lock.RLock()
 	defer ps.lock.RUnlock()
@@ -354,6 +363,9 @@ func (ps *peerSet) BestPeer() *Peer {
 	var best *Peer
 	var bestTD *big.Int
 	for _, peer := range ps.peers {
+		if peer.Version() != ETH64 {
+			continue
+		}
 		if best == nil {
 			best, bestTD = peer, peer.TD()
 			continue
