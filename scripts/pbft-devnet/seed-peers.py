@@ -15,14 +15,35 @@ A producer finds the other producers' DPoS listen addresses in one of two ways:
      target without any gossip having to happen.
 
 Path 1 is the production one and it is implemented faithfully (dpos/routes.go is
-a close copy of pgp-chain's), but it has no end-to-end evidence on this tree:
-the 4-node acceptance rig has always run with SEED_DPOS=1, i.e. with this file
-pre-seeded. So when a fresh multi-node setup shows pbft_getArbiterPeersInfo full
-of NoneConnection entries with ip="unknown", gossip is the first suspect and
-this script is the way to tell the two apart: if pre-seeding makes the set
-connect, the consensus stack is fine and the gossip is what needs debugging; if
-it still does not connect, the problem is downstream of addressing (port, magic,
-advertised IP, firewall).
+a close copy of pgp-chain's). It now works end-to-end on this tree, which took
+three fixes and is worth writing down because the failure was silent:
+
+  - eth/p2p_dpos_peer.go announces peers from the devp2p layer too, not only from
+    eth/64 (dpos.Routes needs the peer in its cache before it will answer anything).
+  - eth64 is registered a second time as its own capability, "elamsg"/1
+    (eth/protocols/eth64/protocol.go). It used to be "eth"/64 alongside eth/68 and
+    eth/70, and p2p/peer.go's matchProtocols keys by capability name only, so the
+    higher eth version replaced it on every connection: eth64's peer set stayed
+    empty, BroadcastElaMsg iterated nothing, and no Inv ever left any node. Every
+    DPoS producer showed NoneConnection/ip="unknown" with five healthy devp2p
+    peers and not one line of error.
+  - eth64's BestPeer skips peers whose version is not ETH64, so those elamsg
+    connections are visible to BroadcastElaMsg/PeerByID without being handed to
+    the syncer, which would send GetBlockHeaders into a window the far end
+    discards.
+
+Measured on the six-producer rig with every peers.json removed: DPoS network
+started at t+0 with 0 addresses, "PBFT: producers connected, starting recovery
+peers=4 need=4" at t+38s, first imported block at t+91s, activedpospeers=10 on
+all six, six heads and anchors identical. So gossip alone is sufficient.
+
+This script is still the fast path and the deterministic one: pre-seeded, the
+same rig dials at startup instead of waiting ~40s for the address round trip, and
+a node whose gossip is broken by a config mistake (wrong --pbft.net.port, magic,
+advertised IP, firewall) still connects. It is also the discriminator: pre-seed
+and the set connects -> the consensus stack is fine and the gossip is what needs
+debugging; pre-seed and it still does not connect -> the problem is downstream of
+addressing.
 
 WHAT IT WRITES
 

@@ -1035,6 +1035,14 @@ func (s *Ethereum) Start() error {
 	// Only PBFT chains run the routing layer, so nobody else pays for the
 	// goroutine. See p2p_dpos_peer.go, including why this does not replace the
 	// eth/64 notifications.
+	//
+	// This is not a belt-and-braces extra, it is load-bearing on a chain that
+	// also speaks eth/68 or eth/70: the eth/64 capability is shadowed there by
+	// the higher version of the same name (see ElaMsgProtocolName in
+	// eth/protocols/eth64/protocol.go), so those notifications are all but
+	// absent. The address channel itself now rides "elamsg"/1, but a peer is
+	// only in dpos.Routes' cache -- and therefore able to receive a DAddr -- if
+	// this feed put it there.
 	if s.pbftEngine != nil {
 		s.watchP2PPeers()
 	}
