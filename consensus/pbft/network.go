@@ -35,6 +35,7 @@ import (
 	"fmt"
 
 	"github.com/elastos/Elastos.ELA/dpos/dtime"
+	dpp2p "github.com/elastos/Elastos.ELA/dpos/p2p"
 	dpeer "github.com/elastos/Elastos.ELA/dpos/p2p/peer"
 	"github.com/elastos/Elastos.ELA/events"
 
@@ -118,6 +119,109 @@ func (e *Engine) WatchPeerSet() {
 // handshake uses the same source. Two different median clocks on one node would
 // make it reject its own relayed records on a skewed machine.
 func (e *Engine) GetTimeSource() dtime.MedianTimeSource { return e.timeSource }
+
+// DPoSNetworkRunning reports whether a DPoS TCP server is attached at all.
+//
+// This is the difference between "no peers connected" and "no server to connect
+// to", which the peer count alone cannot express: a verifier-only node and a
+// single-producer rig both report zero peers and neither runs a server, while a
+// misconfigured multi-node bench also reports zero peers but does. The RPC
+// status needs the distinction to point an operator at the right knob.
+func (e *Engine) DPoSNetworkRunning() bool {
+	e.transportMu.RLock()
+	defer e.transportMu.RUnlock()
+	return e.network != nil
+}
+
+// DumpDPoSPeersInfo snapshots the DPoS TCP server's connect list, including
+// producers this node has never reached (State == CSNoneConnection, Addr ==
+// "unknown").
+//
+// The connect list is the load-bearing half of the answer to "peers look
+// connected in devp2p but nothing happens": devp2p peers and DPoS peers are two
+// different sets over two different TCP servers, and only this table shows the
+// second one. A producer missing here is a producer whose votes can never
+// arrive, no matter what net_peerCount says.
+//
+// It returns nil, not an empty slice, when no server is attached, so a caller
+// can tell "not running" from "running with nothing connected".
+func (e *Engine) DumpDPoSPeersInfo() []*dpp2p.PeerInfo {
+	e.transportMu.RLock()
+	n := e.network
+	e.transportMu.RUnlock()
+	if n == nil {
+		return nil
+	}
+	dumper, ok := n.(dpos.PeersDumper)
+	if !ok {
+		return nil
+	}
+	return dumper.DumpPeersInfo()
+}
+
+// ActiveDPoSPeers is the number of established DPoS TCP connections.
+//
+// It counts live connections, whereas DumpDPoSPeersInfo counts the connect list,
+// which also holds peers that are unreachable. Recovery gates on this number
+// (network_listener.go's StartRecovery compares it against the majority count),
+// so it is the one an operator should compare against majoritycount.
+//
+// It counts CONNECTIONS, not distinct peers: a producer set whose members have
+// all dialed each other reports twice as many as there are peers, because each
+// pair holds one connection in each direction (measured: 6 for a 4-producer
+// bench, 4 after one node was killed). Only DumpPeersInfo folds the pair into
+// one row and calls it 2WayConnection. Comparing this against majoritycount is
+// therefore conservative, never optimistic, which is the right direction for a
+// gate -- but do not read it as a peer count.
+func (e *Engine) ActiveDPoSPeers() int {
+	e.transportMu.RLock()
+	n := e.network
+	e.transportMu.RUnlock()
+	if n == nil {
+		return 0
+	}
+	return len(n.GetActivePeers())
+}
+
+// ActiveDPoSPeerInfos is ActiveDPoSPeers with the per-connection detail, for the
+// RPC that shows who is actually talking right now.
+//
+// The connect-list dump already reports direction, but it can only report what
+// the server knows about a configured peer. A connection that exists but whose
+// PID is not in the connect list would appear in neither outboundPeers nor
+// connectPeers, and that is exactly the shape of an address-book or magic
+// mismatch. This path walks the live peers instead.
+func (e *Engine) ActiveDPoSPeerInfos() []*dpp2p.PeerInfo {
+	e.transportMu.RLock()
+	n := e.network
+	e.transportMu.RUnlock()
+	if n == nil {
+		return nil
+	}
+	peers := n.GetActivePeers()
+	out := make([]*dpp2p.PeerInfo, 0, len(peers))
+	for _, p := range peers {
+		real := p.ToPeer()
+		if real == nil {
+			continue
+		}
+		// NodeVersion is an exported field on the DPoS peer (it is NOT on its
+		// StatsSnap, unlike the plain p2p peer in the same vendor tree), set
+		// once during the Version handshake and never mutated afterwards.
+		info := &dpp2p.PeerInfo{
+			PID:         p.PID(),
+			Addr:        real.Addr(),
+			NodeVersion: real.NodeVersion,
+		}
+		if real.Inbound() {
+			info.State = dpp2p.CSInboundOnly
+		} else {
+			info.State = dpp2p.CSOutboundOnly
+		}
+		out = append(out, info)
+	}
+	return out
+}
 
 // SetIsCurrent installs the "is the chain caught up" probe.
 //

@@ -20,6 +20,7 @@ package web3ext
 var Modules = map[string]string{
 	"admin":  AdminJs,
 	"parlia": ParliaJs,
+	"pbft":   PbftJs,
 	"debug":  DebugJs,
 	"eth":    EthJs,
 	"miner":  MinerJs,
@@ -28,6 +29,47 @@ var Modules = map[string]string{
 	"txpool": TxpoolJs,
 	"dev":    DevJs,
 }
+
+// PbftJs mirrors pgp-chain's PbftJs (pgp-chain/internal/web3ext/web3ext.go:151-180)
+// for the four methods it shares, plus status, which this port adds.
+//
+// dispatcher and network are not exposed: upstream returns the Go objects
+// themselves, which only works because its console speaks to an in-process RPC
+// with no transport to serialise across. There is nothing an operator can read
+// off them that status does not already flatten.
+const PbftJs = `
+web3._extend({
+	property: 'pbft',
+	methods: [
+		new web3._extend.Method({
+			name: 'announceDAddr',
+			call: 'pbft_announceDAddr',
+			params: 0
+		}),
+		new web3._extend.Method({
+			name: 'getArbiterPeersInfo',
+			call: 'pbft_getArbiterPeersInfo',
+			params: 0
+		}),
+		new web3._extend.Method({
+			name: 'getAllPeersInfo',
+			call: 'pbft_getAllPeersInfo',
+			params: 0
+		}),
+		new web3._extend.Method({
+			name: 'getActivePeers',
+			call: 'pbft_getActivePeers',
+			params: 0
+		}),
+		new web3._extend.Method({
+			name: 'status',
+			call: 'pbft_status',
+			params: 0
+		}),
+	],
+	properties: []
+});
+`
 
 const ParliaJs = `
 web3._extend({

@@ -70,6 +70,28 @@ type DPOSNetwork interface {
 	GetActivePeers() []p2p.Peer
 }
 
+// PeersDumper is the optional half of the DPoS server that reports the connect
+// list with each peer's link direction.
+//
+// It is deliberately NOT part of DPOSNetwork. That interface is what the engine
+// talks to while driving consensus, and every implementer of it must exist in
+// tests: dpos_transport_test.go, peerset_watch_test.go and the recovery tests
+// all stand up stubs. Adding a method there would force four unrelated files to
+// grow a fake just so an RPC could read a table.
+//
+// The concrete *Network always satisfies this (network.go's DumpPeersInfo), so
+// a type assertion is enough. Upstream exposes the same method on the same
+// object (pgp-chain/consensus/pbft/network.go:131) and attaches it to the same
+// RPC.
+//
+// One caveat the caller has to respect, and upstream documents it too
+// (Elastos.ELA/dpos/p2p/interface.go:129-131): this walks the outbound, inbound
+// and connect lists under the server's state lock, so it is not free. It is for
+// an operator asking a question, not for a loop.
+type PeersDumper interface {
+	DumpPeersInfo() []*p2p.PeerInfo
+}
+
 type StatusSyncEventListener interface {
 	OnPing(id peer.PID, height uint32)
 	OnPong(id peer.PID, height uint32)

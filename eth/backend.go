@@ -689,6 +689,12 @@ func (s *Ethereum) APIs() []rpc.API {
 	if p, ok := s.engine.(*parlia.Parlia); ok {
 		apis = append(apis, p.APIs(s.BlockChain())...)
 	}
+	// The legacy PBFT engine keeps the DPoS connect list, which no other
+	// namespace can see: net_peerCount counts devp2p peers on a different TCP
+	// server. See consensus/pbft/api.go.
+	if s.pbftEngine != nil {
+		apis = append(apis, s.pbftEngine.APIs()...)
+	}
 
 	// Append all the local APIs and return
 	return append(apis, []rpc.API{
