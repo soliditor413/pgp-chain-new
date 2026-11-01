@@ -79,12 +79,15 @@ func TestOnViewChangedReleasesTheProducerOnDuty(t *testing.T) {
 	}
 }
 
-// TestOnViewChangedIgnoresForcedResets keeps the release narrow. force is used by
+// TestOnViewChangedPokesTheMinerWithoutClearingTheMark keeps the two halves of a
+// forced reset apart, because they are about different things. force is used by
 // Dispatcher.FinishedProposal and Dispatcher.ResetConsensus, both of which have
-// already called SetReady and re-anchored the view on a real block; releasing a
-// second time there would let the miner prepare another round on top of a height
-// that just became final.
-func TestOnViewChangedIgnoresForcedResets(t *testing.T) {
+// already called SetReady and re-anchored the view on a real block, so the Running
+// mark must survive. The head did move, though, so the miner's work item is stale
+// and has to be rebuilt: without that poke the rebuild waits for
+// minerconfig.defaultRecommit (10s), which is longer than one 6s view, and the
+// rig lands a block every 12s instead of every 6s.
+func TestOnViewChangedPokesTheMinerWithoutClearingTheMark(t *testing.T) {
 	engine, mined := newViewChangedEngine(t, 4)
 	view := engine.dispatcher.GetConsensusView()
 
@@ -93,8 +96,24 @@ func TestOnViewChangedIgnoresForcedResets(t *testing.T) {
 	if !view.IsRunning() {
 		t.Fatal("a forced view change cleared the Running mark; FinishedProposal owns that")
 	}
+	if got := atomic.LoadInt32(mined); got != 1 {
+		t.Fatalf("a forced view change poked the miner %d times, want 1", got)
+	}
+}
+
+// TestOnViewChangedHoldsTheMinerOnAForcedResetWhileBehind covers the gate the poke
+// shares with the normal path: a node that is still catching up must not rebuild,
+// because its head is not the set's head and a block built on it would lose the
+// vote. IsCurrent is false exactly while the downloader has a higher target.
+func TestOnViewChangedHoldsTheMinerOnAForcedResetWhileBehind(t *testing.T) {
+	engine, mined := newViewChangedEngine(t, 4)
+	view := engine.dispatcher.GetConsensusView()
+	engine.SetIsCurrent(func() bool { return false })
+
+	view.SetRunning()
+	engine.OnViewChanged(true, true)
 	if got := atomic.LoadInt32(mined); got != 0 {
-		t.Fatalf("a forced view change poked the miner %d times, want 0", got)
+		t.Fatalf("a node that is still syncing poked the miner %d times, want 0", got)
 	}
 }
 

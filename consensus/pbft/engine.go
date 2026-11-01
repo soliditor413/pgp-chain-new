@@ -652,11 +652,16 @@ func (e *Engine) Producers() []string { return e.legacy.Producers }
 // tree to pass true, the branch dpos.Dispatcher.CleanProposals documents as
 // ported-but-not-wired until the view-change path landed.
 //
-// Forced resets are excluded, and that is not an oversight: force is used by
-// Dispatcher.FinishedProposal and Dispatcher.ResetConsensus, both of which have
-// already called SetReady and rebuilt the view from a real block. Clearing the
-// Running mark a second time there would let the miner prepare a second round on
+// Forced resets do NOT clear the Running mark, and that is not an oversight: force
+// is used by Dispatcher.FinishedProposal and Dispatcher.ResetConsensus, both of
+// which have already called SetReady and rebuilt the view from a real block.
+// Clearing it a second time there would let the miner prepare a second round on
 // top of a height that just became final.
+//
+// They do poke the miner, though, and that difference matters: the mark is about
+// the round, the poke is about the work item. A forced reset fires immediately
+// after a block was imported, which is the one moment this node's pending work is
+// guaranteed to be built on a stale head. See the note at the call site.
 func (e *Engine) OnViewChanged(isOnDuty bool, force bool) {
 	log.Debug("PBFT view changed", "onDuty", isOnDuty, "force", force)
 	if e.dispatcher == nil {
@@ -670,6 +675,23 @@ func (e *Engine) OnViewChanged(isOnDuty bool, force bool) {
 	// same three steps in the same sequence.
 	e.processPrecociousProposal()
 	if force {
+		// A forced change is fired right after a block was imported, so the work
+		// item this node is holding was built on the block before it. Rebuilding it
+		// here is the difference between "the next slot can use this node" and "the
+		// next slot has to wait for a timer".
+		//
+		// Skipping it is what pinned the six-producer rig to 12s a block. The view
+		// grid is signTolerance = 6s and a block may only carry the grid point its
+		// view starts on, so the rebuild has to happen inside the new window. With
+		// no poke at import time the only remaining trigger was
+		// minerconfig.defaultRecommit = 10s, which is longer than one window: the
+		// rebuild always landed on the grid point after next. Measured on this rig,
+		// same binary otherwise: recommit 10s -> 12s intervals, recommit 2s -> 6s.
+		//
+		// The Running mark is deliberately left alone; FinishedProposal owns it.
+		if e.IsCurrent() && e.StartMine != nil {
+			e.StartMine()
+		}
 		return
 	}
 	e.dispatcher.CleanProposals(true)
