@@ -9,22 +9,34 @@
 package dpos
 
 import (
+	"context"
+	"fmt"
+	"log/slog"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/elastos/Elastos.ELA/common"
 	"github.com/elastos/Elastos.ELA/crypto"
 	"github.com/elastos/Elastos.ELA/dpos/dtime"
 	"github.com/elastos/Elastos.ELA/dpos/p2p/peer"
 	"github.com/elastos/Elastos.ELA/p2p/msg"
+
+	glog "github.com/ethereum/go-ethereum/log"
 )
 
-// fakeRoutesPeer is the IPeer slice that Routes actually uses: disconnecting and
-// sending an ELAMSG. Both are no-ops; the announce path only needs the peer to
-// exist as a map key in state.peerCache.
+// fakeRoutesPeer is the IPeer slice that Routes actually uses: an identity,
+// disconnecting and sending an ELAMSG. Both of the latter are no-ops; the
+// announce path only needs the peer to exist in state.peerCache, which is keyed
+// by ID.
+//
+// id is an int so a test can name the same remote node from two different
+// objects -- which is exactly what the p2p layer and eth/64 do.
 type fakeRoutesPeer struct {
 	id int
 }
 
+func (f *fakeRoutesPeer) ID() string             { return fmt.Sprintf("peer-%d", f.id) }
 func (f *fakeRoutesPeer) Disconnect()            {}
 func (f *fakeRoutesPeer) SendELAMessage(*ElaMsg) {}
 
@@ -148,5 +160,109 @@ func TestAnnounceIsSuppressedWhenNotCurrent(t *testing.T) {
 		t.Fatal("relayed an address while IsCurrent() is false; announceAddr must bail out")
 	case <-time.After(500 * time.Millisecond):
 		// expected: nothing announced
+	}
+}
+
+// warnRecorder keeps every record the root logger hands out, so a test can
+// assert on LEVEL, not just on wording. recordingHandler in log_test.go only
+// keeps the message.
+type warnRecorder struct {
+	mu      sync.Mutex
+	records []slog.Record
+}
+
+func (h *warnRecorder) Enabled(context.Context, slog.Level) bool { return true }
+
+func (h *warnRecorder) Handle(_ context.Context, r slog.Record) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	// Record.Clone because the caller may reuse the record once Handle returns.
+	h.records = append(h.records, r.Clone())
+	return nil
+}
+
+func (h *warnRecorder) WithAttrs([]slog.Attr) slog.Handler { return h }
+func (h *warnRecorder) WithGroup(string) slog.Handler      { return h }
+
+func (h *warnRecorder) warnings() []string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	var out []string
+	for _, r := range h.records {
+		if r.Level >= slog.LevelWarn {
+			out = append(out, r.Message)
+		}
+	}
+	return out
+}
+
+// newTestState builds the slice of state the two peer-cache handlers touch.
+func newTestState() *state {
+	return &state{
+		peers:     make(map[peer.PID]struct{}),
+		requested: make(map[common.Uint256]struct{}),
+		peerCache: make(map[string]*cache),
+	}
+}
+
+// TestPeerCacheFoldsBothLayersForOneNode pins the reason peerCache is keyed by
+// ID. The p2p server announces every connection and eth/64 announces the ones
+// that can carry an ELAMSG, so the same remote node arrives twice, from two
+// different objects. Object keying would leave two entries: DonePeer only
+// deletes the one it is handed, and the survivor would never be removed.
+func TestPeerCacheFoldsBothLayersForOneNode(t *testing.T) {
+	const node = 7
+	id := fmt.Sprintf("peer-%d", node)
+
+	r := &Routes{}
+	s := newTestState()
+
+	// p2p first: it sees the connection before any subprotocol is negotiated.
+	r.handleNewPeer(s, &fakeRoutesPeer{id: node})
+	// An in-flight request must survive the second notification.
+	hash := common.Uint256{1}
+	s.peerCache[id].requested[hash] = struct{}{}
+
+	// eth/64 second: a different object for the same node.
+	r.handleNewPeer(s, &fakeRoutesPeer{id: node})
+
+	if len(s.peerCache) != 1 {
+		t.Fatalf("peerCache holds %d entries for one node, want 1: %v", len(s.peerCache), s.peerCache)
+	}
+	if _, ok := s.peerCache[id]; !ok {
+		t.Fatalf("peerCache is not keyed by peer ID: %v", s.peerCache)
+	}
+	if _, ok := s.peerCache[id].requested[hash]; !ok {
+		t.Fatal("the second announcement replaced the cache entry and dropped an in-flight request; " +
+			"its DAddr reply would then look unsolicited and disconnect a healthy peer")
+	}
+}
+
+// TestDonePeerIsIdempotent covers the other half of the double notification:
+// both layers report the drop, so the second DonePeer always finds nothing.
+// That must be silent and harmless -- a warning would fire on every disconnect,
+// twice per reconnect.
+func TestDonePeerIsIdempotent(t *testing.T) {
+	previous := glog.Root()
+	recorder := &warnRecorder{}
+	glog.SetDefault(glog.NewLogger(recorder))
+	defer glog.SetDefault(previous)
+
+	const node = 7
+
+	r := &Routes{}
+	s := newTestState()
+	r.handleNewPeer(s, &fakeRoutesPeer{id: node})
+
+	r.handleDonePeer(s, &fakeRoutesPeer{id: node}) // p2p
+	r.handleDonePeer(s, &fakeRoutesPeer{id: node}) // eth/64, entry already gone
+
+	if len(s.peerCache) != 0 {
+		t.Fatalf("peerCache still holds %d entries after both DonePeer notifications: %v",
+			len(s.peerCache), s.peerCache)
+	}
+	if w := recorder.warnings(); len(w) != 0 {
+		t.Fatalf("the duplicate DonePeer logged %d warning(s): %q", len(w), w)
 	}
 }

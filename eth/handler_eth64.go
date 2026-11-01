@@ -40,9 +40,16 @@ var _ eth64.DPOSHooks = eth64DPOSHooks{}
 
 // PeerUp tells the routing layer that a devp2p peer is now usable.
 //
-// dpos.Routes keys its per-peer request cache by this object, and its whole
-// announce path iterates that cache -- so no PeerUp means no DAddr gossip, which
-// is indistinguishable from a firewalled network.
+// dpos.Routes keys its per-peer request cache by peer id, and its whole announce
+// path iterates that cache -- so no PeerUp means no DAddr gossip, which is
+// indistinguishable from a firewalled network.
+//
+// This is the upper of the two peer notifications, not the only one: the p2p
+// layer already announced the same node when the connection appeared (see
+// p2p_dpos_peer.go). Both are needed. p2p covers every connection, including the
+// ones that never negotiate eth/64, while this one marks the moment the peer can
+// actually carry an ELAMSG. dpos folds the two by peer id, so the second
+// announcement is idempotent.
 func (eth64DPOSHooks) PeerUp(peer *eth64.Peer) {
 	events.Notify(dpos.ETNewPeer, dpos.IPeer(peer))
 }

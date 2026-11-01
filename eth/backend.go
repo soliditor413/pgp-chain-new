@@ -1029,6 +1029,16 @@ func (s *Ethereum) Start() error {
 	// Start the networking layer
 	s.handler.Start(s.p2pServer.MaxPeers, s.p2pServer.MaxPeersPerIP)
 
+	// Feed DPoS the devp2p peer set, not only the eth/64 one: eth/64 is not even
+	// registered on a chain without legacy history, so without this a peer that
+	// connects but negotiates something else would never reach dpos.Routes.
+	// Only PBFT chains run the routing layer, so nobody else pays for the
+	// goroutine. See p2p_dpos_peer.go, including why this does not replace the
+	// eth/64 notifications.
+	if s.pbftEngine != nil {
+		s.watchP2PPeers()
+	}
+
 	go s.reportRecentBlocksLoop()
 
 	// Start the connection manager

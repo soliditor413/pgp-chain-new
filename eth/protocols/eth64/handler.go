@@ -167,9 +167,9 @@ func (h *handler) run(p2pPeer *p2p.Peer, rw p2p.MsgReadWriter) error {
 		peer.Close()
 		if registered {
 			// PeerDown before Unregister, and outside the peer-set lock, so the
-			// subscriber sees a peer that is still in the set: dpos.Routes keys
-			// its per-peer request cache by the peer object and has to be able
-			// to find and drop that entry.
+			// DPoS subscriber sees the drop while the session is still in the
+			// set it resolves peers in. dpos keys its per-peer request cache by
+			// peer id and removes that entry here.
 			if h.hooks != nil {
 				h.hooks.PeerDown(peer)
 			}
@@ -310,11 +310,29 @@ func BroadcastElaMsg(msg *elamsg.ElaMsg) {
 	}
 }
 
+// PeerByID returns the established eth/64 peer with the given id, or nil when
+// there is none -- either this process runs no eth/64 protocol set at all, or
+// the session has not finished its handshake yet.
+//
+// It is the read side of the bridge from the p2p layer to the protocol layer.
+// The p2p server is what knows a connection exists, but only an eth/64 peer can
+// carry an ELAMSG, so the DPoS adapter in the eth package (p2p_dpos_peer.go)
+// turns an enode.ID into the session that can send. The lookup goes through
+// currentHandler because the handler type stays unexported; eth already imports
+// this package, so there is no cycle.
+func PeerByID(id string) *Peer {
+	h := currentHandler.Load()
+	if h == nil {
+		return nil
+	}
+	return h.peers.Peer(id)
+}
+
 // PeerCount is the number of established eth/64 peers.
 //
 // It is exported for the DPoS node's peer counter: dpos.Routes only gossips to
-// peers in its cache, and the cache is filled by PeerUp, so this is also a
-// reasonable "is the devp2p side alive" probe for a status endpoint.
+// peers in its cache, and an ELAMSG can only leave this protocol set, so this is
+// also a reasonable "is the devp2p side alive" probe for a status endpoint.
 func PeerCount() int {
 	h := currentHandler.Load()
 	if h == nil {

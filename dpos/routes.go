@@ -93,7 +93,13 @@ type cache struct {
 type state struct {
 	peers     map[peer.PID]struct{}
 	requested map[common.Uint256]struct{}
-	peerCache map[IPeer]*cache
+	// peerCache is keyed by the peer ID rather than by the IPeer object because
+	// the same remote node is announced twice: by the p2p server when the
+	// connection appears, and by eth/64 when it becomes able to carry an ELAMSG.
+	// Keying by object would store that node twice, once per adapter, and
+	// DonePeer only removes the entry it was handed -- the other one would leak
+	// for the life of the process, one more per reconnect.
+	peerCache map[string]*cache
 }
 
 type newPeerMsg IPeer
@@ -244,7 +250,7 @@ func (r *Routes) addrHandler() {
 	state := &state{
 		peers:     make(map[peer.PID]struct{}),
 		requested: make(map[common.Uint256]struct{}),
-		peerCache: make(map[IPeer]*cache),
+		peerCache: make(map[string]*cache),
 	}
 
 	// lastAnnounce indicates the time when last announce sent.
@@ -445,9 +451,10 @@ func (r *Routes) announceAddr() {
 }
 
 func (r *Routes) handleDAddr(s *state, p IPeer, m *msg.DAddr) {
-	c, exists := s.peerCache[p]
+	id := p.ID()
+	c, exists := s.peerCache[id]
 	if !exists {
-		Warnf("Received getdaddr message for unknown peer %s", p)
+		Warnf("Received getdaddr message for unknown peer %s", id)
 		return
 	}
 
@@ -455,7 +462,7 @@ func (r *Routes) handleDAddr(s *state, p IPeer, m *msg.DAddr) {
 
 	if _, ok := c.requested[hash]; !ok {
 		Warnf("Got unrequested addr %s from %s -- disconnecting",
-			hash, p)
+			hash, id)
 		p.Disconnect()
 		return
 	}
@@ -465,7 +472,7 @@ func (r *Routes) handleDAddr(s *state, p IPeer, m *msg.DAddr) {
 
 	if err := r.verifyDAddr(s, m); err != nil {
 		Warnf("Got invalid addr %s %s from %s -- disconnecting",
-			hash, err, p)
+			hash, err, id)
 		p.Disconnect()
 		return
 	}
@@ -515,19 +522,31 @@ func (r *Routes) appendAddr(m *msg.DAddr) {
 }
 
 func (r *Routes) handleNewPeer(s *state, p IPeer) {
+	id := p.ID()
+	// The same node is announced by both layers, so this has to be idempotent.
+	// An existing entry is kept rather than replaced: its requested set holds
+	// the GetData calls already in flight, and resetting it would make the
+	// replies look unsolicited and disconnect a perfectly healthy peer.
+	if _, ok := s.peerCache[id]; ok {
+		return
+	}
 	// Create state for the new peer.
-	s.peerCache[p] = &cache{requested: make(map[common.Uint256]struct{})}
+	s.peerCache[id] = &cache{requested: make(map[common.Uint256]struct{})}
 }
 
 func (r *Routes) handleDonePeer(s *state, p IPeer) {
-	c, exists := s.peerCache[p]
+	id := p.ID()
+	c, exists := s.peerCache[id]
 	if !exists {
-		Warnf("Received done peer message for unknown peer %s", p)
+		// Both layers send DonePeer for the same disconnect, so the second one
+		// always arrives after the entry is gone. That is the normal path, not
+		// a protocol error: warning here would put two lines in the log for
+		// every single disconnect.
 		return
 	}
 
 	// Remove done peer from peer state.
-	delete(s.peerCache, p)
+	delete(s.peerCache, id)
 
 	// Clear cached information.
 	for pid := range c.requested {
@@ -536,9 +555,10 @@ func (r *Routes) handleDonePeer(s *state, p IPeer) {
 }
 
 func (r *Routes) handleInv(s *state, p IPeer, m *msg.Inv) {
-	c, exists := s.peerCache[p]
+	id := p.ID()
+	c, exists := s.peerCache[id]
 	if !exists {
-		Warnf("Received inv message for unknown peer %s", p)
+		Warnf("Received inv message for unknown peer %s", id)
 		return
 	}
 

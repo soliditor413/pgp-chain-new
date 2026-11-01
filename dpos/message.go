@@ -26,7 +26,17 @@ const (
 
 // IPeer is the slice of a devp2p peer that the address routing needs. The eth
 // protocol layer adapts its own peer to it; dpos never sees an eth peer.
+//
+// ID is part of the interface because two layers report the same remote node:
+// the p2p server as soon as a connection exists (regardless of which subprotocol
+// it negotiated) and eth/64 once that connection can actually carry an ELAMSG.
+// Routes has to fold those two notifications into ONE cache entry, and object
+// identity cannot do it -- the p2p adapter and the eth/64 peer are different
+// objects wrapping the same node. Both implementations therefore return
+// enode.ID.String(), and they must agree byte for byte: that string is the only
+// thing tying the p2p-announced node to the socket an ELAMSG can go out on.
 type IPeer interface {
+	ID() string
 	Disconnect()
 	SendELAMessage(msg *ElaMsg)
 }
