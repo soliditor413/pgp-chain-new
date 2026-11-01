@@ -91,3 +91,5 @@ cmd/keeper/keeper
 # makes vcs.modified=true for every binary built afterwards, which is the exact thing
 # gate.sh's G8 is trying to read.
 /.tmp-gate-run/
+/tmp-keyscan/
+__pycache__/
