@@ -224,12 +224,29 @@ var (
 		Usage:    "Path to the Elastos arbiter keystore holding the producer key",
 		Category: flags.EthCategory,
 	}
-	// The password is a plain string because a cleartext password is the only
-	// form pgp-chain ever supported for this keystore. GetDposAccount takes it as
-	// bytes and the ELA keystore has no other unlock path.
+	// The value is a PATH TO A FILE, not the password itself, even though the
+	// flag name reads like a value. That is pgp-chain's semantics too: its
+	// MakeDposPasswordList (pgp-chain/cmd/utils/flags.go:1217-1229) reads the
+	// file named by this flag and passes the contents on. The name is kept
+	// identical so an existing arbiter configuration moves across unchanged --
+	// that is precisely why the mismatch went unnoticed: the same flag name
+	// accepts a literal in argv and silently produces a node that cannot unlock
+	// its keystore, which degrades to a verifier without a single error line
+	// (miner/worker.go logs the resulting Prepare failure at Debug).
+	//
+	// Forcing a file is also the stronger form of the original intent ("prefer a
+	// file over the command line"): a path in argv is harmless, and the password
+	// never reaches `ps` or the shell history. readPbftPasswordFile below is
+	// deliberately strict about multi-line files, because a stray extra line
+	// otherwise surfaces as "password wrong", which is undiagnosable.
+	//
+	// No EnvVars, on purpose. There is no GETH_PBFT_KEYSTORE_PASSWORD: this flag
+	// never had one, the variable appears nowhere in `geth --help`, and with the
+	// password confined to a file there is nothing left for an environment
+	// channel to protect.
 	PbftKeyStorePasswordFlag = &cli.StringFlag{
 		Name:     "pbft.keystore.password",
-		Usage:    "Password of the arbiter keystore (prefer a file over the command line)",
+		Usage:    "Path to a file holding the arbiter keystore password (a single line; trailing newline trimmed)",
 		Category: flags.EthCategory,
 	}
 	// header.Coinbase is part of the PBFT seal hash, so this is not cosmetic: the
@@ -1921,6 +1938,101 @@ func MakePasswordListFromPath(path string) []string {
 	return lines
 }
 
+// readPbftPasswordFile reads the single-line password file named by
+// --pbft.keystore.password.
+//
+// The trailing-newline handling is one TrimRight over the cutset "\r\n" rather
+// than pgp-chain's two sequential TrimRights
+// (pgp-chain/cmd/utils/flags.go:1217-1229). Upstream's version strips "\r"
+// first and "\n" second, so a CRLF file -- "pw\r\n" -- loses the "\n" on the
+// first pass leaving "pw\r" for the second, which then finds no "\n" to strip:
+// the password handed to the keystore ends with a carriage return and the
+// unlock fails with "password wrong". One trim over both characters gives the
+// same result for LF, CRLF and no-newline files. That is a deliberate
+// divergence, not an oversight.
+//
+// A file that still contains a newline after trimming is an error rather than a
+// best guess: the only way to get one is a file with more than one line, which
+// is a mistake in how the file was written, and guessing which line the
+// operator meant would turn it into "password wrong" instead.
+//
+// Two more refusals come from the same principle, and both were measured on this
+// tree before being added, because each one otherwise produces a plausible
+// looking password that the keystore rejects with "password wrong":
+//
+//   - a UTF-8 BOM (what Notepad and several Windows editors prepend) made the
+//     password "\ufeffpw". It is stripped, not rejected: the file is well formed
+//     UTF-8 text and the BOM carries no meaning of its own.
+//   - NUL bytes mean the file is UTF-16 or binary. PowerShell's `>` writes
+//     UTF-16LE by default, so `echo pw > pw.txt` on Windows produces a file
+//     whose every ASCII character is followed by a NUL byte. Decoding that
+//     correctly needs the byte order, and a wrong guess yields another
+//     plausible wrong password, so it is refused with an instruction instead.
+//     (A 1MB all-NUL file used to be returned verbatim; it is now an error.)
+//
+// An empty file is an error too. It used to return "", on the theory that the
+// keystore would reject it like any wrong password, but nothing in this tree can
+// legitimately hold an empty password -- keygen refuses to create one
+// ("empty password is refused") -- so "" is always a mistake, and saying so
+// here is the difference between "your file is empty" and "password wrong".
+func readPbftPasswordFile(path string) (string, error) {
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", err
+	}
+	text := strings.TrimPrefix(string(raw), "\ufeff")
+	if strings.IndexByte(text, 0) >= 0 {
+		return "", fmt.Errorf("password file %s contains NUL bytes; the file is probably UTF-16 or binary, save it as UTF-8", path)
+	}
+	password := strings.TrimRight(text, "\r\n")
+	if strings.ContainsAny(password, "\r\n") {
+		return "", fmt.Errorf("password file %s contains more than one line", path)
+	}
+	if password == "" {
+		return "", fmt.Errorf("password file %s is empty", path)
+	}
+	return password, nil
+}
+
+// MakePbftPassword resolves --pbft.keystore.password into the cleartext password
+// the ELA keystore takes.
+//
+// It is called from setPbft, i.e. at flag-parsing time, so an unreadable or
+// malformed password file aborts the process here, instead of surfacing much
+// later as a silently absent producer key. The Fatalf style matches
+// MakePasswordListFromPath directly above.
+//
+// The read-failure branch deliberately does NOT echo the flag value. Putting the
+// password itself on this flag is the single most likely mistake an operator can
+// make -- the flag name reads like a value -- and Fatalf's output goes to stderr,
+// which run.sh tees into the node's logfile. Echoing it would take the one input
+// this change exists to keep out of logs and write it to a log. Only the
+// underlying system error is printed, plus a warning to rotate.
+//
+// The content errors below (multi-line, NUL, empty) DO name the file, and that is
+// safe by construction: they can only be produced after the read succeeded, so
+// the value really was a path and not a password.
+func MakePbftPassword(path string) string {
+	if path == "" {
+		return ""
+	}
+	password, err := readPbftPasswordFile(path)
+	if err != nil {
+		var pathErr *os.PathError
+		if errors.As(err, &pathErr) {
+			// %v on the PathError itself would print "open <value>: ...", and <value>
+			// may well be the password. Only the syscall error is safe to print.
+			Fatalf("Failed to open the file named by --pbft.keystore.password: %v.\n"+
+				"The path itself is not echoed here on purpose: this flag is the likeliest place to "+
+				"paste the password by mistake, and this message goes to the node's log.\n"+
+				"That flag takes a PATH, not the password. If you passed the password there, it has "+
+				"just been written to this log: rotate it, put it in a file, and pass that file.", pathErr.Err)
+		}
+		Fatalf("Failed to read PBFT keystore password file %s: %v", path, err)
+	}
+	return password
+}
+
 func SetP2PConfig(ctx *cli.Context, cfg *p2p.Config) {
 	setNodeKey(ctx, cfg)
 	setNAT(ctx, cfg)
@@ -2266,8 +2378,12 @@ func setPbft(ctx *cli.Context, cfg *ethconfig.Config) {
 	if ctx.IsSet(PbftKeyStoreFlag.Name) {
 		cfg.Pbft.KeyStore = ctx.String(PbftKeyStoreFlag.Name)
 	}
+	// The flag holds a path; the config holds the password. Resolving here (not
+	// in eth/backend.go) keeps the file read at flag-parsing time, next to every
+	// other flag-to-config translation, and means a bad path fails the process
+	// start rather than a keystore open that only logs.
 	if ctx.IsSet(PbftKeyStorePasswordFlag.Name) {
-		cfg.Pbft.KeyStorePassword = ctx.String(PbftKeyStorePasswordFlag.Name)
+		cfg.Pbft.KeyStorePassword = MakePbftPassword(ctx.String(PbftKeyStorePasswordFlag.Name))
 	}
 	if ctx.IsSet(PbftMinerAddressFlag.Name) {
 		cfg.Pbft.MinerAddress = ctx.String(PbftMinerAddressFlag.Name)

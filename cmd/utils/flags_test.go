@@ -19,7 +19,10 @@ package utils
 
 import (
 	"flag"
+	"os"
+	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/urfave/cli/v2"
@@ -171,4 +174,149 @@ func TestSetPbftKeepsExplicitValues(t *testing.T) {
 	if seen.Pbft.MaxNodePerHost != 8 {
 		t.Errorf("MaxNodePerHost = %d, want 8", seen.Pbft.MaxNodePerHost)
 	}
+}
+
+// TestReadPbftPasswordFile pins the trailing-newline rules of the password file.
+//
+// The CRLF row is the one that matters and it is not hypothetical: pgp-chain's
+// MakeDposPasswordList (flags.go:1217-1229) trims "\r" then "\n" as two separate
+// passes, which leaves "pw\r" for a CRLF file -- the "\r" was stripped first,
+// so the second pass finds no "\n" at the end and the carriage return survives
+// into the password. The keystore then answers "password wrong", which reads as
+// a wrong password rather than a wrong file. This port trims both characters in
+// one pass, and this row is what keeps that from regressing.
+//
+// The multi-line row guards the other half: a file with two lines is a mistake
+// in how it was written, and guessing which line was meant would turn it into
+// the same undiagnosable "password wrong".
+//
+// The BOM and NUL rows are the same class of bug reached from Windows: an editor
+// that prepends a BOM, or a shell that writes UTF-16LE. Both used to be returned
+// verbatim -- "\ufeffpw", or "p\x00w\x00" -- so the operator saw "password
+// wrong" for a password that looks correct in any editor. The BOM is stripped;
+// UTF-16 is refused because decoding it needs the byte order and a wrong guess is
+// just another wrong password.
+//
+// The three empty rows (0 bytes, one "\n", one "\r\n") are errors. They used to
+// return "", on the theory that the keystore rejects an empty password anyway,
+// but nothing in this tree can hold one -- keygen refuses to create it -- so an
+// empty file is always a mistake and naming it beats "password wrong".
+func TestReadPbftPasswordFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	write := func(t *testing.T, name, content string) string {
+		t.Helper()
+		path := filepath.Join(dir, name)
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatalf("write %s: %v", name, err)
+		}
+		return path
+	}
+	longPath := write(t, "multi", "pw\nextra\n")
+	// What `echo pw > pw.txt` under Windows PowerShell actually writes: UTF-16LE
+	// with a BOM, i.e. a NUL after every ASCII byte.
+	utf16Path := write(t, "utf16", "\xff\xfep\x00w\x00\r\x00\n\x00")
+
+	tests := []struct {
+		name    string
+		content string
+		path    string
+		want    string
+		wantErr bool
+	}{
+		{name: "trailing LF", content: "pw\n", want: "pw"},
+		{name: "trailing CRLF", content: "pw\r\n", want: "pw"},
+		{name: "no newline", content: "pw", want: "pw"},
+		{name: "inner spaces kept", content: " p w \n", want: " p w "},
+		{name: "utf8 BOM stripped", content: "\ufeffpw\n", want: "pw"},
+		{name: "empty file", content: "", wantErr: true},
+		{name: "only LF", content: "\n", wantErr: true},
+		{name: "only CRLF", content: "\r\n", wantErr: true},
+		{name: "only BOM", content: "\ufeff", wantErr: true},
+		{name: "NUL bytes", content: "p\x00w\x00", wantErr: true},
+		{name: "utf16 with BOM", path: utf16Path, wantErr: true},
+		{name: "two lines", path: longPath, wantErr: true},
+		{name: "missing file", path: filepath.Join(dir, "does-not-exist"), wantErr: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			path := tt.path
+			if path == "" {
+				path = write(t, strings.ReplaceAll(tt.name, " ", "-"), tt.content)
+			}
+			got, err := readPbftPasswordFile(path)
+			if tt.wantErr {
+				if err == nil {
+					t.Fatalf("readPbftPasswordFile(%q) = %q, want error", path, got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("readPbftPasswordFile(%q): %v", path, err)
+			}
+			if got != tt.want {
+				t.Errorf("readPbftPasswordFile(%q) = %q, want %q", path, got, tt.want)
+			}
+		})
+	}
+}
+
+// TestSetPbftResolvesPasswordFile is the end-to-end shape of the flag: what the
+// operator passes is a path, what lands in the config is the password.
+//
+// This is the assertion that would have caught the bug this change fixes. The
+// flag name matches pgp-chain's and pgp-chain reads a file, but this tree used
+// to assign the raw flag value straight into cfg.Pbft.KeyStorePassword. A node
+// configured the pgp-chain way therefore tried to unlock its keystore with a
+// filesystem path: GetDposAccount failed, the engine stayed a verifier, and
+// nothing above Debug level said so.
+//
+// The second half asserts the empty case: no flag means no password, so the
+// node does not silently pick up whatever happens to be in a file.
+func TestSetPbftResolvesPasswordFile(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "pbft-password")
+	const password = "correct horse battery staple"
+	if err := os.WriteFile(path, []byte(password+"\n"), 0o600); err != nil {
+		t.Fatalf("write password file: %v", err)
+	}
+
+	run := func(t *testing.T, args []string) *ethconfig.Config {
+		t.Helper()
+		var seen *ethconfig.Config
+		app := &cli.App{
+			Flags: []cli.Flag{PbftKeyStorePasswordFlag},
+			Action: func(ctx *cli.Context) error {
+				cfg := &ethconfig.Config{}
+				setPbft(ctx, cfg)
+				seen = cfg
+				return nil
+			},
+		}
+		if err := app.Run(append([]string{"geth"}, args...)); err != nil {
+			t.Fatalf("run %v: %v", args, err)
+		}
+		if seen == nil {
+			t.Fatal("setPbft never ran")
+		}
+		return seen
+	}
+
+	t.Run("path is read", func(t *testing.T) {
+		cfg := run(t, []string{"--" + PbftKeyStorePasswordFlag.Name, path})
+		if cfg.Pbft.KeyStorePassword != password {
+			t.Errorf("KeyStorePassword = %q, want %q (the file's contents, not its path)",
+				cfg.Pbft.KeyStorePassword, password)
+		}
+	})
+
+	t.Run("no flag means no password", func(t *testing.T) {
+		cfg := run(t, nil)
+		if cfg.Pbft.KeyStorePassword != "" {
+			t.Errorf("KeyStorePassword = %q, want empty", cfg.Pbft.KeyStorePassword)
+		}
+	})
 }

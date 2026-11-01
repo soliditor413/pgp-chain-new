@@ -91,16 +91,21 @@ type Config struct {
 	// key: the password comes from KeyStorePassword.
 	KeyStore string
 
-	// KeyStorePassword is the keystore password in clear text, because that is
-	// the only form pgp-chain has ever supported (--pbft.keystore.password).
-	// Prefer a file the operator can chmod over a command line argument that
-	// lands in the shell history.
+	// KeyStorePassword is the resolved cleartext password for KeyStore, read from
+	// the file named by --pbft.keystore.password. It is empty when that flag is
+	// not given, which leaves the keystore locked and the node a verifier.
+	//
+	// The flag holds a path; this field holds the password. The two are separated
+	// at flag-parsing time (cmd/utils/flags.go's MakePbftPassword), so nothing
+	// downstream has to know that a file was involved. The field name is load
+	// bearing and must not be renamed: eth/ethconfig/secrets_test.go pins it by
+	// reflection, together with the toml:"-" tag.
 	//
 	// It is excluded from the TOML form (toml:"-") and therefore from both
 	// `geth dumpconfig` output and any config file the node rewrites: a password
 	// that can be read back out of a file on disk is not a secret. It can only be
-	// supplied through the flag (or its GETH_PBFT_KEYSTORE_PASSWORD environment
-	// variable), which also keeps it out of --config entirely.
+	// supplied through the flag, which also keeps it out of --config entirely.
+	// There is no environment variable for it -- see PbftKeyStorePasswordFlag.
 	KeyStorePassword string `toml:"-"`
 
 	// DataDir is where the DPoS peer address database is kept, relative to the
