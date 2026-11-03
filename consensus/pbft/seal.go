@@ -73,7 +73,7 @@ import (
 // runs:
 //
 //   - a peer running this binary takes up to 15s of lead outright, no queue and
-//     no wait (consensus/pgp/pgp.go:227, against allowedFutureBlockTime at :56);
+//     no wait (consensus/pgp/pgp.go:229, against allowedFutureBlockTime at :58);
 //     past 15s it is queued and retried every 5s (core/blockchain.go:2404 ->
 //     addFutureBlock:2224, updateFutureBlocks:3356-3357), and refused without
 //     queueing once the gap passes maxTimeFutureBlocks, 30s

@@ -360,13 +360,18 @@ func (e *Engine) CalcDifficulty(chain consensus.ChainHeaderReader, time uint64, 
 	return new(big.Int).Set(diffInTurn)
 }
 
-// Finalize implements consensus.Engine.
+// Finalize implements consensus.Engine by forwarding to the embedded pgp engine.
+//
+// The forwarding is not cosmetic. *pgp.Engine implements FinalizeAndAssemble and
+// *pbft.Engine inherits it by embedding, so a block this node assembles reaches
+// pgp.Finalize through that method, while an imported block reaches this one
+// through core/state_processor.go:257, which calls Engine().Finalize for EVERY
+// imported block, not only for blocks this node assembles. If this method kept a
+// body of its own, the two paths would compute one consensus rule in two
+// different functions, and only one of them would get changed. Do not give it a
+// body again.
 //
 // It is a pure function of the state: recompute the root, clear the uncle hash.
-// Both pbft and pgp do the same thing, and both must, because
-//
-//	core/state_processor.go:237 calls Engine().Finalize for EVERY imported
-//	block, not only for blocks this node assembles.
 //
 // pgp-chain advances its irreversible height inside Finalize
 // (dispatcher.FinishedProposal). That must NOT be reproduced here: a side branch
@@ -376,9 +381,7 @@ func (e *Engine) CalcDifficulty(chain consensus.ChainHeaderReader, time uint64, 
 func (e *Engine) Finalize(chain consensus.ChainHeaderReader, header *types.Header, state vm.StateDB,
 	txs *[]*types.Transaction, uncles []*types.Header, withdrawals []*types.Withdrawal,
 	receipts *[]*types.Receipt, systemTxs *[]*types.Transaction, usedGas *uint64, tracer *tracing.Hooks) error {
-	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
-	header.UncleHash = types.CalcUncleHash(nil)
-	return nil
+	return e.Engine.Finalize(chain, header, state, txs, uncles, withdrawals, receipts, systemTxs, usedGas, tracer)
 }
 
 // Delay implements consensus.Engine.

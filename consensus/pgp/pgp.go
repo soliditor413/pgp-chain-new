@@ -37,12 +37,14 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/common/gopool"
 	"github.com/ethereum/go-ethereum/consensus"
+	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
+	"github.com/ethereum/go-ethereum/trie"
 )
 
 const (
@@ -389,15 +391,80 @@ func (e *Engine) Prepare(chain consensus.ChainHeaderReader, header *types.Header
 // which this client mirrors in core/state_transition.go. Doing it here as well
 // would double count it.
 //
-// It intentionally does not implement core's blockAssembler interface
-// (FinalizeAndAssemble): leaving it out makes core.AssembleBlock fall back to
-// this method. Production still fails earlier, in Seal.
+// This engine does implement core's blockAssembler interface, see
+// FinalizeAndAssemble below; the reason is recorded there.
 func (e *Engine) Finalize(chain consensus.ChainHeaderReader, header *types.Header, state vm.StateDB,
 	txs *[]*types.Transaction, uncles []*types.Header, withdrawals []*types.Withdrawal,
 	receipts *[]*types.Receipt, systemTxs *[]*types.Transaction, usedGas *uint64, tracer *tracing.Hooks) error {
 	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
 	header.UncleHash = types.CalcUncleHash(nil)
 	return nil
+}
+
+// FinalizeAndAssemble implements core's blockAssembler interface, the optional
+// interface core.AssembleBlock probes for before falling back to plain Finalize.
+//
+// It has to exist, and the reason is not this file's own convenience. When it
+// was missing, core.AssembleBlock fell back to Finalize, but on a node wired
+// with the height router the call never reached core's fallback: the router
+// implements the interface, so it delegated to itself and then found that *pgp
+// had no assembler, and reproduced core.AssembleBlock's fallback inside
+// consensus/router/router.go. That made the legacy assembly path exist twice —
+// once in core/state_processor.go and once in the router — with nothing tying
+// them together but a comment asking the next person to keep them in sync. Two
+// copies of a consensus rule is exactly the shape of the defect this work
+// started from, so the copy is gone: giving the engine the method it was missing
+// is what made deleting it possible.
+//
+// The body is a line-for-line move of the branch the router used to execute
+// inline; that branch has since been deleted (consensus/router/router.go,
+// FinalizeAndAssemble). The move itself changed nothing:
+//
+//   - the nil guard on body.Transactions: core's own fallback omits it, the
+//     router branch had it, and without it an empty body would hand Finalize a
+//     nil slice where it expects an addressable one;
+//   - &header.GasUsed as usedGas, and trie.NewStackTrie(nil) as the hasher, both
+//     as the deleted branch had them;
+//   - the tracer passed through to Finalize, again as the deleted branch did.
+//     Note that core/state_processor.go:567 passes nil here instead, so the two
+//     fallbacks were never byte-for-byte equivalent — this method is equivalent
+//     to the branch that was deleted, which is the claim that matters for the
+//     deletion;
+//   - the second header.Root assignment after Finalize. That one looks redundant
+//     because Finalize already recomputed the root, and it is redundant today.
+//     It is kept on purpose: it is what makes this method equivalent to the
+//     deleted copy under any future change to Finalize, instead of silently
+//     drifting from it the day Finalize starts doing more. It is a deliberate
+//     duplicate, not a leftover.
+//
+// One boundary is written down rather than measured: a bare *pgp.Engine, not
+// sitting behind the router, now reaches this method through core.AssembleBlock
+// instead of core's own fallback, and the only difference between the two is the
+// nil guard above — with an empty body core's path hands Finalize a nil
+// transaction slice, which the Finalize below ignores. That the two produce the
+// same block is a reading of the code, not a measurement. Nothing in this tree
+// takes that path today: chain.Engine() on a node is the router, so only a test
+// calling core.AssembleBlock with this engine directly would.
+//
+// This matches upstream pgp-chain, whose pbft.FinalizeAndAssemble
+// (pgp-chain/consensus/pbft/pbft.go:626-636) does the same three things: root,
+// uncle hash, NewBlock. consensus/pbft.Engine embeds *pgp.Engine, so it acquires
+// this method by embedding and must not define a second one of its own — and the
+// same goes for Finalize: pbft.Finalize has to forward here, because otherwise a
+// block this node assembles (root computed by the method below) and a block it
+// imports (root computed by pbft.Finalize) would run one rule through two
+// functions, and only one of them would get the next change.
+func (e *Engine) FinalizeAndAssemble(chain consensus.ChainHeaderReader, header *types.Header, state *state.StateDB,
+	body *types.Body, receipts []*types.Receipt, tracer *tracing.Hooks) (*types.Block, []*types.Receipt, error) {
+	if body.Transactions == nil {
+		body.Transactions = make([]*types.Transaction, 0)
+	}
+	if err := e.Finalize(chain, header, state, &body.Transactions, body.Uncles, body.Withdrawals,
+		&receipts, nil, &header.GasUsed, tracer); err != nil {
+		return nil, nil, err
+	}
+	header.Root = state.IntermediateRoot(chain.Config().IsEIP158(header.Number))
+	return types.NewBlock(header, body, receipts, trie.NewStackTrie(nil)), receipts, nil
 }
 
 // Seal implements consensus.Engine. The legacy chain is read-only for this
