@@ -256,3 +256,216 @@ func TestCreateBloomWithTxList(t *testing.T) {
 		t.Fatal("a creation has no recipient and must not mix one in")
 	}
 }
+
+// TestMergeBloomMatchesCreateBloomWithTxList pins the one invariant that ties the
+// block producer to the block validator together.
+//
+// The producer fills header.Bloom by merging the per-receipt blooms that
+// core.MakeReceipt already computed (MergeBloom, called from
+// core/types/block.go:327). The validator does not trust that value: it
+// recomputes the bloom from the receipts and the transactions
+// (CreateBloomWithTxList, core/block_validator.go:176). Those two have to agree
+// bit for bit, or the produced block is rejected by every peer — which is what
+// "invalid bloom (remote: 000…000 local: …0400…0080…)" was.
+//
+// The disagreement was a "no logs, nothing to merge" fast path in MergeBloom.
+// It is only valid when a receipt's bloom comes from its logs alone. On the
+// legacy pgp rules a receipt's bloom is logs ∪ sender ∪ recipient
+// (CreateBloomWithTx), so a receipt with no logs still has a non-empty bloom and
+// skipping it dropped the from/to bits. Because the bug lives in the fast path,
+// a fixture whose receipts all carry logs — like the rSmall/rLarge benchmark
+// fixtures above — can never exercise it. That is why every subtest below states
+// explicitly whether its receipts have logs.
+//
+// The assertions compare Bloom values with ==, i.e. byte for byte. Do not
+// weaken them to Bloom.Test(addr): a bloom can be missing bits and still answer
+// Test() true for a given address, so Test() passes on a partially wrong bloom.
+func TestMergeBloomMatchesCreateBloomWithTxList(t *testing.T) {
+	key, err := crypto.GenerateKey()
+	if err != nil {
+		t.Fatalf("failed to generate key: %v", err)
+	}
+	from := crypto.PubkeyToAddress(key.PublicKey)
+	recipient := common.HexToAddress("0x00000000000000000000000000000000000000aa")
+	logAddress := common.HexToAddress("0x00000000000000000000000000000000000000bb")
+	logTopic := common.HexToHash("0x00000000000000000000000000000000000000000000000000000000000000cc")
+
+	// sign returns an unprotected (Frontier) transaction, which is what the legacy
+	// history carries and what CreateBloomWithTxList recovers the sender with.
+	sign := func(t *testing.T, tx *Transaction) *Transaction {
+		t.Helper()
+		signed, err := SignTx(tx, FrontierSigner{}, key)
+		if err != nil {
+			t.Fatalf("failed to sign the transaction: %v", err)
+		}
+		return signed
+	}
+	// receipt mirrors what core.MakeReceipt produces on the legacy rules
+	// (core/state_processor.go:390-392): the bloom is set from the logs AND the
+	// transaction, and the processors that run afterwards must not touch it.
+	receipt := func(tx *Transaction, logs []*Log) *Receipt {
+		r := &Receipt{Type: tx.Type(), Status: ReceiptStatusSuccessful, TxHash: tx.Hash(), Logs: logs}
+		r.Bloom = CreateBloomWithTx(r, tx)
+		return r
+	}
+	plainTransfer := func(nonce uint64) *Transaction {
+		return sign(t, NewTransaction(nonce, recipient, big.NewInt(1), 21000, big.NewInt(1), nil))
+	}
+	loggingCall := func(nonce uint64) *Transaction {
+		return sign(t, NewTransaction(nonce, logAddress, big.NewInt(0), 100000, big.NewInt(1), []byte{0x60, 0x00, 0x60, 0x00, 0xa0}))
+	}
+	oneLog := []*Log{{Address: logAddress, Topics: []common.Hash{logTopic}}}
+
+	// Both sides recover the sender from the signature, so a signing problem would
+	// make them agree on the zero address and every assertion below would pass
+	// vacuously. Pin the recovery first.
+	probe, err := Sender(FrontierSigner{}, plainTransfer(0))
+	if err != nil || probe != from {
+		t.Fatalf("fixture problem: recovered %v (err %v) from the signed transaction, want %v", probe, err, from)
+	}
+
+	tests := []struct {
+		name string
+		// build returns the transactions of the block and the receipts the
+		// producer would hold, in block order.
+		build func(t *testing.T) (Transactions, Receipts)
+		// wantEmpty is the value MergeBloom has to return. It is spelled out per
+		// case rather than derived, so a change in the merge cannot silently
+		// redefine what "correct" means.
+		wantEmpty bool
+		// wantLogless is how many receipts of the block carry no logs. It is
+		// asserted, not documented: a case that claims to exercise the old fast
+		// path has to actually contain a log-less receipt, otherwise it would
+		// pass before the fix too and prove nothing.
+		wantLogless int
+	}{
+		{
+			// The devnet incident: a block holding one logging call and one plain
+			// transfer. Only the first receipt has logs, so only the first one
+			// used to contribute — the header bloom came out missing the
+			// transfer's from/to bits.
+			name: "mixed: one receipt with logs, one without",
+			build: func(t *testing.T) (Transactions, Receipts) {
+				withLogs, without := loggingCall(0), plainTransfer(1)
+				return Transactions{withLogs, without}, Receipts{receipt(withLogs, oneLog), receipt(without, nil)}
+			},
+			wantLogless: 1,
+		},
+		{
+			// Block 15 of the devnet run: nothing in the block emits a log, so the
+			// old fast path skipped every receipt and header.Bloom came out all
+			// zero while the validator recomputed three bits.
+			name: "no receipt has logs",
+			build: func(t *testing.T) (Transactions, Receipts) {
+				a, b := plainTransfer(0), plainTransfer(1)
+				return Transactions{a, b}, Receipts{receipt(a, nil), receipt(b, nil)}
+			},
+			wantLogless: 2,
+		},
+		{
+			name: "contract creation with no logs",
+			build: func(t *testing.T) (Transactions, Receipts) {
+				create := sign(t, NewContractCreation(0, big.NewInt(0), 53844, big.NewInt(1), []byte{0x60, 0x00}))
+				return Transactions{create}, Receipts{receipt(create, nil)}
+			},
+			wantLogless: 1,
+		},
+		{
+			// Control: every receipt has logs. This one passed before the fix too,
+			// because the fast path never fired. It is here so a future change
+			// cannot fix the log-less case by breaking this one.
+			name: "every receipt has logs",
+			build: func(t *testing.T) (Transactions, Receipts) {
+				a, b := loggingCall(0), loggingCall(1)
+				return Transactions{a, b}, Receipts{receipt(a, oneLog), receipt(b, oneLog)}
+			},
+			wantLogless: 0,
+		},
+		{
+			// An empty block: the header bloom is the zero value and block.go:310
+			// never even reaches MergeBloom. Kept so the "no receipts" shape is
+			// pinned alongside the rest.
+			name:      "no receipts at all",
+			build:     func(t *testing.T) (Transactions, Receipts) { return nil, nil },
+			wantEmpty: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			txs, receipts := tt.build(t)
+
+			// Fixture self-check first: a case that claims to hit the old fast path
+			// must really contain log-less receipts whose bloom is non-empty.
+			logless := 0
+			for i, r := range receipts {
+				if len(r.Logs) != 0 {
+					continue
+				}
+				logless++
+				if r.Bloom == EmptyBloom {
+					t.Fatalf("fixture problem: receipt %d has no logs and an empty bloom, "+
+						"so the case cannot exercise the merge at all", i)
+				}
+			}
+			if logless != tt.wantLogless {
+				t.Fatalf("fixture problem: %d log-less receipts, want %d", logless, tt.wantLogless)
+			}
+
+			merged := MergeBloom(receipts)
+			want := CreateBloomWithTxList(receipts, txs)
+			if merged != want {
+				t.Fatalf("MergeBloom(producer) = %x\nCreateBloomWithTxList(validator) = %x\n"+
+					"the two must agree or every peer rejects the block with \"invalid bloom\"", merged, want)
+			}
+			if tt.wantEmpty != (merged == EmptyBloom) {
+				t.Fatalf("bloom = %x, wantEmpty = %v", merged, tt.wantEmpty)
+			}
+		})
+	}
+
+	// Known asymmetry, recorded rather than fixed.
+	//
+	// CreateBloomWithTxList can only mix in the sender and the recipient of a
+	// receipt whose transaction is in the list; for a receipt it cannot resolve
+	// it emits the logs and skips the from/to bits (bloom9.go:158-161). MergeBloom
+	// has no such list and merges whatever the receipt carries. The two therefore
+	// disagree for an "orphan" receipt — one whose transaction is missing from the
+	// block body.
+	//
+	// That shape is unreachable through both paths that matter, because both keep
+	// receipts and transactions in lockstep: the miner appends them together
+	// (miner/worker.go:857-858) and block execution builds the receipt list from
+	// block.Transactions() (core/state_processor.go:193). The contract this
+	// subtest locks is: a caller that hands MergeBloom a receipt set must also
+	// hand the same transactions to CreateBloomWithTxList. If that ever stops
+	// holding, the symptom will be an "invalid bloom" that looks like this bug but
+	// is not.
+	t.Run("orphan receipt is a known asymmetry", func(t *testing.T) {
+		logging := loggingCall(0)
+		orphan := receipt(logging, oneLog)
+		merged := MergeBloom(Receipts{orphan})
+		validated := CreateBloomWithTxList(Receipts{orphan}, nil)
+
+		if merged == validated {
+			t.Fatal("the orphan case stopped being asymmetric; the contract documented above is stale")
+		}
+		// Bitwise containment, not Bloom.Test: every bit the validator derived has
+		// to be in the merged bloom (the logs are on both sides), and the merged
+		// bloom has to carry extra bits (the from/to pair it could not derive).
+		var extraBytes int
+		for i := range merged {
+			if validated[i]&^merged[i] != 0 {
+				t.Fatalf("byte %d: validator has bits the merge lost (0x%02x vs 0x%02x); "+
+					"the logs are supposed to be on both sides", i, validated[i], merged[i])
+			}
+			if merged[i]&^validated[i] != 0 {
+				extraBytes++
+			}
+		}
+		if extraBytes == 0 {
+			t.Fatalf("merged carries nothing beyond validated (both %x); the from/to bits are what "+
+				"makes this case asymmetric", merged)
+		}
+	})
+}

@@ -300,6 +300,35 @@ func TestReplayPGPBlock30115(t *testing.T) {
 		t.Fatalf("receipt bloom = %x, want %x: a different set of events was emitted than the chain recorded",
 			receipt.Bloom, block.Bloom())
 	}
+	// A necessary condition for the definition, on a block mainnet actually
+	// produced: the legacy bloom is logs ∪ sender ∪ recipient, so it cannot equal
+	// the logs-only one. Every other assertion in the tree compares our
+	// implementation against our own reading of what pgp-chain does; this one is
+	// pinned to real data.
+	//
+	// It is a necessary condition and not the definition. It pins "≠ logs-only" as
+	// a property of one recorded bloom — which is exactly the property the F-3b
+	// bug violated — while reproducing the exact value is what the assertion above
+	// checks. Together they close the loop at "necessary", not at "sufficient":
+	// they would not catch a formula that added a third component on top of
+	// logs ∪ from ∪ to.
+	//
+	// Guard first, because this is a property of the fixture and not of the code:
+	// block.Bloom() comes from the recorded block and CreateBloom(receipt) is a
+	// function of the logs the replay produced, which the assertion above has
+	// already pinned to the recorded receipt bloom. So if the two ever come out
+	// equal, the fixture has stopped being able to tell the two definitions
+	// apart — it does not mean the implementation regressed. The equal case is
+	// reachable whenever the sender and recipient bits happen to be covered by
+	// the log addresses and topics, which is a property of the address' keccak,
+	// not of the rule.
+	logsOnly := types.CreateBloom(receipt)
+	if logsOnly == block.Bloom() {
+		t.Fatalf("this block cannot distinguish logs-only from logs∪from∪to: its header bloom (%x) "+
+			"equals the logs-only bloom, so this assertion proves nothing and no implementation "+
+			"bug is implied. Replace the fixture with a block whose header bloom carries a "+
+			"sender or recipient bit that the logs do not.", block.Bloom())
+	}
 
 	// The third gate, and the one that settles the minted amount: status,
 	// cumulative gas, bloom and every byte of log data hash to the root in the

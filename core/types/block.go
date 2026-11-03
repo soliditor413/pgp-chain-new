@@ -311,9 +311,19 @@ func NewBlock(header *Header, body *Body, receipts []*Receipt, hasher ListHasher
 		b.header.ReceiptHash = EmptyReceiptsHash
 	} else {
 		b.header.ReceiptHash = DeriveSha(Receipts(receipts), hasher)
-		// Receipts must go through MakeReceipt to calculate the receipt's bloom
-		// already. Merge the receipt's bloom together instead of recalculating
-		// everything.
+		// The authoritative bloom is the one MakeReceipt (and its read-back
+		// counterpart DeriveFields) already put on each receipt; this line only
+		// merges them faithfully and adds no chain rule of its own.
+		//
+		// Do not "fix" it here by recomputing with a chain config. The validator
+		// never reads receipt.Bloom: CreateBloomWithTxList rebuilds the header
+		// bloom from the logs plus the sender and recipient of each transaction,
+		// so a recompute at this line is a consensus break, not a local change —
+		// and on a Parlia chain it would mix account bits into a bloom that must
+		// stay logs-only. It would not even be sufficient: receipt.Bloom also
+		// travels inside the receipts trie (core/types/receipt.go:380, EncodeIndex
+		// encodes r.Bloom), so the receipt hash one line above would still be the
+		// one derived from the wrong blooms.
 		b.header.Bloom = MergeBloom(receipts)
 	}
 

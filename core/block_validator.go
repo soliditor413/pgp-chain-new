@@ -158,9 +158,19 @@ func (v *BlockValidator) ValidateState(block *types.Block, statedb *state.StateD
 		func() error {
 			// The legacy pgp-chain header bloom is the union of the receipt logs
 			// AND the sender/recipient of every transaction
-			// (pgp-chain/core/block_validator.go:98). MergeBloom cannot be used
-			// for it: it skips receipts without logs, which would drop the
-			// from/to bits of a plain transfer.
+			// (pgp-chain/core/block_validator.go:98).
+			//
+			// It is rebuilt from the transactions, never merged from
+			// receipt.Bloom, because the validator must not trust a bloom the
+			// producer computed. CreateBloomWithTxList is the independent side of
+			// that comparison; merging the receipts would make validator and
+			// producer agree on whatever the producer wrote, which is worse than
+			// rejecting the block.
+			//
+			// Note this is not about MergeBloom skipping log-less receipts. It used
+			// to (that was the F-3b bug, fixed in core/types/bloom9.go), but the
+			// reason to recompute here survives that fix: who computed the bloom
+			// matters, not what MergeBloom does.
 			var rbloom types.Bloom
 			if v.config.IsPGPLegacy(block.Number()) {
 				rbloom = types.CreateBloomWithTxList(res.Receipts, block.Transactions())

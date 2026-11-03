@@ -188,13 +188,43 @@ func CreateBloomWithTx(receipt *Receipt, tx *Transaction) Bloom {
 // MergeBloom merges the precomputed bloom filters in the Receipts without
 // recalculating them. It assumes that each receipt’s Bloom field is already
 // correctly populated.
+//
+// Every receipt has to take part, including the ones that carry no logs. The
+// no-logs fast path that used to skip them is only valid when a receipt's bloom
+// is derived from its logs alone. On the pgp-chain legacy rules it is not: there
+// the per-receipt bloom is logs ∪ sender ∪ recipient (CreateBloomWithTx), so a
+// log-less receipt still has a non-empty bloom, and skipping it drops the
+// from/to bits. The validator recomputes the header bloom with the full formula
+// (core/block_validator.go:166, CreateBloomWithTxList), so a skipped receipt is
+// a guaranteed "invalid bloom" on every other node.
+//
+// On every other chain CreateBloom of zero logs is EmptyBloom, so OR-ing it in
+// is an identity and the merged result is unchanged.
+//
+// A known asymmetry, kept deliberately: this function ORs in every receipt it is
+// given, including one whose transaction is not part of the block, while
+// CreateBloomWithTxList skips such a receipt (it looks the transaction up by
+// TxHash and continues when the lookup fails). So for an orphan receipt the
+// producer is more tolerant than the validator, and the two blooms differ. It is
+// unreachable in production — the miner appends a transaction and its receipt
+// together, and a legacy block carries no system transaction — but it becomes
+// reachable the moment anyone adds a system transaction to the legacy segment or
+// lets a block's receipt and transaction lists differ in length (AddUncheckedTx,
+// AddUncheckedReceipt, the trimming at core/chain_makers.go:509-520). Whoever
+// does that will find this function on the wrong side of the check.
+//
+// Do not reinstate the "skip receipts without logs" fast path for performance.
+// OR-ing an empty bloom costs 256 bytes and nothing measurable, and on the
+// pgp-chain legacy rules that fast path is wrong. This is not a missing
+// optimisation, it is deliberately an unconditional OR: it was the root cause of
+// the "invalid bloom" rejections that only showed up once a legacy block
+// contained a transaction without logs, so a block without transactions never
+// exposed it.
 func MergeBloom(receipts Receipts) Bloom {
 	var bin Bloom
 	for _, receipt := range receipts {
-		if len(receipt.Logs) != 0 {
-			bl := receipt.Bloom.Bytes()
-			bitutil.ORBytes(bin[:], bin[:], bl)
-		}
+		bl := receipt.Bloom.Bytes()
+		bitutil.ORBytes(bin[:], bin[:], bl)
 	}
 	return bin
 }
