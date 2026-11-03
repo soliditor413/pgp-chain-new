@@ -997,6 +997,31 @@ func (s *Ethereum) PbftEngine() *pbft.Engine { return s.pbftEngine }
 // Finalize is called for every imported block, side branches included, so
 // advancing the irreversible height there would let a side chain move the
 // watermark. See docs/design/pbft-port-design.md D2.
+//
+// The loop also owns the subscription's life, and ends it when the engine
+// retires at the Parlia fork. Three reasons, in order of weight:
+//
+//   - "retired" has to mean nothing of this engine is still a live hook into
+//     the chain. A subscription is exactly such a hook, so leaving it open
+//     makes the name a lie and leaves the next reader of that state wrong.
+//   - geth dispatches chain-head events synchronously: feed.Send waits until
+//     every subscriber has taken the event. An engine that retires but stays
+//     subscribed keeps every new block waiting on a callback that now does
+//     nothing. Harmless per event, permanent in aggregate, and invisible.
+//   - a loop that keeps running invites the next change to add logic above the
+//     engine's fork gate, where it would run after the fork -- structurally
+//     the bug the retire mechanism exists to prevent. A loop that has returned
+//     cannot be extended that way.
+//
+// Both exits check Retired() AFTER OnBlockImported, never before: that call is
+// what retires the engine at the fork, so a check ahead of it can never see a
+// just-retired engine, and on the restart path the reconciliation call is the
+// only event there is.
+//
+// Unsubscribing here overlaps with Close (backend.go, the pbftChainHeadSub
+// branch) unsubscribing the same subscription. That is safe, and it is safe by
+// construction rather than by luck: feedSub.Unsubscribe in event/feed.go runs
+// behind errOnce, so the second call is a no-op instead of a double close.
 func (s *Ethereum) pbftLoop() {
 	// Reconcile with the head that already exists before waiting for new
 	// events: a node restarted into the Parlia era gets no chain-head event
@@ -1006,10 +1031,22 @@ func (s *Ethereum) pbftLoop() {
 	// retire path too. OnBlockImported handles a nil header or number itself,
 	// and a nil-blockchain Ethereum never starts this loop (see New).
 	s.pbftEngine.OnBlockImported(s.blockchain.CurrentBlock())
+	if s.pbftEngine.Retired() {
+		// A node that restarted already past the fork retires on the call
+		// above: there is no legacy block left to feed it.
+		s.pbftChainHeadSub.Unsubscribe()
+		return
+	}
 	for {
 		select {
 		case ev := <-s.pbftChainHeadCh:
 			s.pbftEngine.OnBlockImported(ev.Header)
+			if s.pbftEngine.Retired() {
+				// The event that crossed the fork has been processed; the
+				// blocks after it belong to Parlia. Leave the dispatch path.
+				s.pbftChainHeadSub.Unsubscribe()
+				return
+			}
 		case <-s.pbftChainHeadSub.Err():
 			return
 		}

@@ -19,12 +19,15 @@ package eth
 import (
 	"bytes"
 	"log/slog"
+	"math/big"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/ethereum/go-ethereum/consensus/pbft"
 	"github.com/ethereum/go-ethereum/core"
+	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/eth/ethconfig"
 	"github.com/ethereum/go-ethereum/log"
 	"github.com/ethereum/go-ethereum/params"
@@ -165,14 +168,186 @@ func TestPbftLoopReconcilesARestartPastTheFork(t *testing.T) {
 		time.Sleep(10 * time.Millisecond)
 	}
 
-	// The loop must still be a working event loop afterwards (unsubscribe
-	// makes Err fire and it returns); a loop that died on the reconciliation
-	// call would leave a fork-crossing node without its finality plumbing.
-	node.pbftChainHeadSub.Unsubscribe()
-	unsubscribed = true
+	// The loop ends by itself now that the engine is retired: it unsubscribes
+	// and returns (see pbftLoop). This select is the assertion that the restart
+	// path reaches that exit. The Unsubscribe after it is belt and braces --
+	// idempotent, and it keeps the subscription from leaking if a future change
+	// ever removes the loop's own call.
 	select {
 	case <-done:
 	case <-time.After(10 * time.Second):
-		t.Fatalf("pbftLoop did not exit after unsubscribe; the reconciliation changed the loop's lifecycle")
+		t.Fatalf("pbftLoop did not exit after retiring on the reconciliation call; a restarted-past-the-fork " +
+			"node would stay subscribed to every new block")
+	}
+	node.pbftChainHeadSub.Unsubscribe()
+	unsubscribed = true
+}
+
+// lockedBuffer is a bytes.Buffer that can be read while a goroutine writes log
+// lines into it. The tests above read their buffer only after a synchronous
+// call returned; the two below poll it while pbftLoop runs.
+type lockedBuffer struct {
+	mu  sync.Mutex
+	buf bytes.Buffer
+}
+
+func (b *lockedBuffer) Write(p []byte) (int, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.Write(p)
+}
+
+func (b *lockedBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.buf.String()
+}
+
+// captureStartPBFTLogsLocked is captureStartPBFTLogs for tests that read while
+// the loop is alive.
+func captureStartPBFTLogsLocked(t *testing.T) *lockedBuffer {
+	t.Helper()
+
+	buf := &lockedBuffer{}
+	previous := log.Root()
+	log.SetDefault(log.NewLogger(slog.NewTextHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug})))
+	t.Cleanup(func() { log.SetDefault(previous) })
+	return buf
+}
+
+// waitForLogCount polls buf until substr has appeared at least want times, and
+// fails the test if that does not happen inside the budget. Polling instead of
+// sleeping-then-reading keeps the test fast on a quiet machine while still
+// giving a loaded one room.
+func waitForLogCount(t *testing.T, buf *lockedBuffer, substr string, want int, timeout time.Duration) {
+	t.Helper()
+
+	deadline := time.Now().Add(timeout)
+	for {
+		if got := strings.Count(buf.String(), substr); got >= want {
+			return
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("timed out after %v waiting for %d occurrences of %q; the loop is not processing chain heads:\n%s",
+				timeout, want, substr, buf.String())
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+// TestPbftLoopStopsFeedingAfterRetire pins the forward half of the task: a loop
+// started with the head already past the fork retires on its reconciliation
+// call and then must leave, releasing the subscription.
+//
+// Why this matters beyond tidiness: chain-head dispatch is synchronous, so a
+// subscriber that never leaves stays on the hot path of every imported block
+// for the life of the node, calling a gate that returns immediately. The
+// assertions below are the three observable consequences: the loop returns, the
+// subscription's Err channel closes, and the channel it used to drain stays
+// full when fed.
+func TestPbftLoopStopsFeedingAfterRetire(t *testing.T) {
+	node, engine := newForkGateNode(t, 2) // head 3, fork 2: already in the Parlia era
+	buf := captureStartPBFTLogsLocked(t)
+
+	if err := node.startPBFTNetwork(); err != nil {
+		t.Fatalf("startPBFTNetwork past the fork returned %v, want nil", err)
+	}
+
+	node.pbftChainHeadCh = make(chan core.ChainHeadEvent, 16)
+	node.pbftChainHeadSub = node.blockchain.SubscribeChainHeadEvent(node.pbftChainHeadCh)
+	t.Cleanup(func() { node.pbftChainHeadSub.Unsubscribe() }) // idempotent
+
+	done := make(chan struct{})
+	go func() { node.pbftLoop(); close(done) }()
+
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatalf("pbftLoop started past the fork did not return: the engine is retired but the loop keeps " +
+			"every new block waiting on it")
+	}
+	if !engine.Retired() {
+		t.Fatalf("the loop returned without the engine being retired; it exited for some other reason")
+	}
+
+	// The subscription is cancelled, which is what Err closing means.
+	select {
+	case <-node.pbftChainHeadSub.Err():
+	default:
+		t.Fatalf("the subscription is still live after pbftLoop returned: Err() is not closed, so nothing " +
+			"would ever take this loop off the dispatch path")
+	}
+
+	retireLinesBefore := strings.Count(buf.String(), "PBFT: Parlia fork reached")
+
+	// Feed the channel the loop used to drain. Nobody consumes it now.
+	node.pbftChainHeadCh <- core.ChainHeadEvent{Header: node.blockchain.CurrentBlock()}
+	time.Sleep(100 * time.Millisecond)
+	if got := len(node.pbftChainHeadCh); got != 1 {
+		t.Fatalf("the chain-head channel holds %d events after being fed one, want 1: something is still "+
+			"consuming chain heads after the retire", got)
+	}
+	if got := strings.Count(buf.String(), "PBFT: Parlia fork reached"); got != retireLinesBefore {
+		t.Fatalf("the retire log line went from %d to %d after the loop returned: a retired engine was still "+
+			"fed a block", retireLinesBefore, got)
+	}
+}
+
+// TestPbftLoopKeepsRunningBelowTheFork is the reverse half, and the one a
+// wrong implementation fails: a loop that returns unconditionally would pass
+// the test above.
+//
+// Below the fork the loop is the only path that re-anchors the view grid, so it
+// must keep consuming: the test feeds two blocks and requires both to be
+// processed (each one logs the dispatcher's resetConsensus line), the
+// subscription to stay live, and the loop not to have returned.
+func TestPbftLoopKeepsRunningBelowTheFork(t *testing.T) {
+	node, engine := newForkGateNode(t, 100) // head 3, fork 100: the legacy era
+	buf := captureStartPBFTLogsLocked(t)
+
+	if err := node.startPBFTNetwork(); err != nil {
+		t.Fatalf("startPBFTNetwork below the fork returned %v, want nil", err)
+	}
+
+	node.pbftChainHeadCh = make(chan core.ChainHeadEvent, 16)
+	node.pbftChainHeadSub = node.blockchain.SubscribeChainHeadEvent(node.pbftChainHeadCh)
+	t.Cleanup(func() { node.pbftChainHeadSub.Unsubscribe() }) // idempotent
+
+	done := make(chan struct{})
+	go func() { node.pbftLoop(); close(done) }()
+
+	feed := func(height int64) {
+		t.Helper()
+		node.pbftChainHeadCh <- core.ChainHeadEvent{Header: &types.Header{Number: big.NewInt(height)}}
+	}
+
+	// The startup reconciliation itself feeds the existing head (height 3)
+	// through OnBlockImported, which logs one resetConsensus line below the
+	// fork. Take that as the baseline, otherwise the counts below would be
+	// satisfied by the reconciliation line plus one event, and a loop that
+	// processed only the first of the two fed events would pass.
+	waitForLogCount(t, buf, "[resetConsensus] start", 1, 5*time.Second)
+	base := strings.Count(buf.String(), "[resetConsensus] start")
+
+	// Two events, two processed resets: the second one is what rules out
+	// "processed one event and then stopped".
+	feed(4)
+	waitForLogCount(t, buf, "[resetConsensus] start", base+1, 5*time.Second)
+	feed(5)
+	waitForLogCount(t, buf, "[resetConsensus] start", base+2, 5*time.Second)
+
+	if engine.Retired() {
+		t.Fatalf("the engine retired below the fork (head 3, fork 100)")
+	}
+	select {
+	case <-node.pbftChainHeadSub.Err():
+		t.Fatalf("the subscription was cancelled below the fork: this node's view grid would stop being " +
+			"re-anchored for the rest of the legacy era")
+	default:
+	}
+	select {
+	case <-done:
+		t.Fatalf("pbftLoop returned below the fork: the legacy era has no chain-head feed left")
+	default:
 	}
 }
