@@ -132,6 +132,11 @@ type Engine struct {
 	stopCh         chan struct{}
 	stopOnce       sync.Once
 
+	// retired and retireOnce implement the fork-time shutdown. See (*Engine).retire
+	// for why the flag is atomic and the four effects run behind a Once.
+	retired    atomic.Bool
+	retireOnce sync.Once
+
 	// transport is the DPoS network, nil on a node that only verifies and on
 	// the single-node acceptance run. See transport.go.
 	transportMu sync.RWMutex
@@ -417,9 +422,91 @@ func (e *Engine) GetIrreversibleHeight() uint64 {
 	return e.dispatcher.GetFinishedHeight()
 }
 
+// retire takes the PBFT/DPoS machinery out of service, once, at the Parlia fork.
+//
+// It is called from OnBlockImported -- i.e. from the chain-head subscription --
+// and deliberately NOT from eth.pbftLoop: pbftLoop is one caller among possible
+// future ones (any path that reports imported blocks would re-anchor the legacy
+// view grid after the fork if the gate lived there), and with the gate in the
+// engine, pbftLoop can keep forwarding every event and the engine decides what
+// an event means. That is also why pbftLoop itself is left unchanged.
+//
+// Exactly once. Chain-head events can repeat a height (a restart that replays
+// the tail, a reorg), so the four effects below run behind a Once: the network's
+// Stop is idempotent, but the view flag, the log line and the retired flag are
+// ours, and a second pass would log "retired" twice at two different heights
+// while claiming to be one event.
+//
+// # Stopping the view loop
+//
+// changeViewLoop (view.go) selects on e.stopCh and, on every viewTick (1s),
+// re-reads enableViewLoop through viewLoopEnabled(). Close() closes stopCh
+// under stopOnce and is still going to run at node shutdown, so retire must NOT
+// close stopCh -- a second close panics. retire instead clears enableViewLoop
+// under viewMu, which is the same lock the loop's per-tick check reads: the
+// goroutine sees the flag on its next tick and returns within one second. The
+// channel stays open for Close(). ensureViewLoop checks the retired flag under
+// the same lock, so a late Prepare cannot start a replacement goroutine.
+//
+// # What is deliberately not done
+//
+// The inbound On* handlers in network_listener.go get no retired early return:
+// stopping the DPoS TCP server removes the transport that delivers those
+// messages, so they cannot fire, and gating a dozen handlers one by one would
+// be a shotgun with twelve chances to miss one. GetIrreversibleHeight is left
+// alone: its value freezes at the last legacy height, which is the correct
+// answer for the RPC that reads it, and Parlia finality takes over from here.
+func (e *Engine) retire(height uint64) {
+	e.retireOnce.Do(func() {
+		e.retired.Store(true)
+
+		// View loop: see "Stopping the view loop" above. Under viewMu so that a
+		// concurrent ensureViewLoop is fully ordered against this write.
+		e.viewMu.Lock()
+		e.enableViewLoop = false
+		e.viewMu.Unlock()
+
+		// Direct links down. The nil case is a verifier node, which never had a
+		// network attached; Stop's own stopOnce makes a second call a no-op, so
+		// a Close()-time double stop is not a concern here either.
+		e.transportMu.RLock()
+		network := e.network
+		e.transportMu.RUnlock()
+		if network != nil {
+			if err := network.Stop(); err != nil {
+				log.Warn("PBFT: error stopping the DPoS network at the fork", "err", err)
+			}
+		}
+
+		// GetIrreversibleHeight is the frozen finality watermark: the last height
+		// a legacy confirm finalised. Logging it at retire is the only chance an
+		// operator has to see where legacy finality ended, because nothing
+		// advances it past the fork.
+		var fork uint64
+		if e.legacy != nil {
+			fork = e.legacy.ForkHeight
+		}
+		log.Info("PBFT: Parlia fork reached, PBFT machinery retired",
+			"height", height, "forkHeight", fork,
+			"irreversible", e.GetIrreversibleHeight())
+	})
+}
+
+// Retired reports whether the engine has taken its machinery down at the
+// Parlia fork.
+//
+// It is the observable half of retire: the assembly layer (eth.pbftLoop's
+// startup reconciliation), the RPC status and the tests all need to ask "is
+// this engine still in service" without poking the unexported flag. A node that
+// restarted already past the fork must answer true here exactly like one that
+// crossed the fork while running -- before the reconciliation line existed the
+// restart case left the flag false and every downstream answer lied.
+func (e *Engine) Retired() bool { return e.retired.Load() }
+
 // OnBlockImported advances the irreversible height when an imported block is one
 // this node has a confirm for, and re-anchors the view grid on every imported
-// block.
+// block -- every legacy block: at LegacyConfig.ForkHeight and above it retires
+// the engine instead (see the gate below).
 //
 // It is driven by the node's chain-head subscription, NOT by Finalize: Finalize
 // runs for every imported block including side branches, so advancing finality
@@ -451,10 +538,28 @@ func (e *Engine) OnBlockImported(header *types.Header) {
 	if header == nil || header.Number == nil {
 		return
 	}
+	height := header.Number.Uint64()
+	// The Parlia fork ends the legacy era: from LegacyConfig.ForkHeight up, the
+	// block belongs to Parlia and the PBFT/DPoS machinery must stop working
+	// instead of re-anchoring a view grid nothing will use. This is the runtime
+	// half of the two retire gates; the other is eth.startPBFTNetwork, which
+	// covers a node that restarts already past the fork. The gate sits above the
+	// dispatcher nil check on purpose: a verifier-shaped engine with no
+	// dispatcher still has to take its (nil) network down.
+	//
+	// Below the fork nothing changes: legacy sync drives a chain-head event per
+	// imported block, and dropping the ResetConsensus re-anchor is what put
+	// nodes on different view grids -- see the comment above. e.legacy == nil
+	// is the no-fork compatibility path (New fills it in, so only a
+	// hand-built engine reaches it): no fork to retire at, keep the old
+	// behaviour everywhere.
+	if e.legacy != nil && height >= e.legacy.ForkHeight {
+		e.retire(height)
+		return
+	}
 	if e.dispatcher == nil {
 		return
 	}
-	height := header.Number.Uint64()
 	if confirm, ok := e.blockPool.GetConfirmByHeight(height); ok {
 		if sealHash := pgp.SealHash(header); common.Hash(confirm.Proposal.BlockHash) == sealHash {
 			e.dispatcher.FinishedProposal(height, elacom.Uint256(sealHash), header.Time)

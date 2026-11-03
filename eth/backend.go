@@ -968,6 +968,14 @@ func (s *Ethereum) PbftEngine() *pbft.Engine { return s.pbftEngine }
 // advancing the irreversible height there would let a side chain move the
 // watermark. See docs/design/pbft-port-design.md D2.
 func (s *Ethereum) pbftLoop() {
+	// Reconcile with the head that already exists before waiting for new
+	// events: a node restarted into the Parlia era gets no chain-head event
+	// for the blocks it already has, and startPBFTNetwork's fork gate leaves the
+	// engine running with its network unstarted -- half retired. One call
+	// through the same door the events use makes the restart case take the
+	// retire path too. OnBlockImported handles a nil header or number itself,
+	// and a nil-blockchain Ethereum never starts this loop (see New).
+	s.pbftEngine.OnBlockImported(s.blockchain.CurrentBlock())
 	for {
 		select {
 		case ev := <-s.pbftChainHeadCh:

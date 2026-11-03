@@ -52,13 +52,20 @@ import (
 //
 // It returns false when there is nothing to announce, which is the shape of a
 // verifier-only node: no account means it is not a producer, and a non-producer
-// has no business telling the set who to peer with.
+// has no business telling the set who to peer with. A retired engine answers
+// false for the same reason and one more: after the Parlia fork there is no set
+// to tell, and the announce would restart an address exchange whose DPoS server
+// retire has already stopped. Same early-return shape as the no-account case
+// below, so a reader does not have to learn a second idiom.
 //
 // CRPeers is left nil deliberately. peer.PeersInfo has three fields and upstream
 // producers fill only the first two; CRPeers is the chainbridge arbiter candidate
 // set, which is not ported (D10). Subscribers read all three, so the asymmetry is
 // load-bearing rather than sloppy -- keep it.
 func (e *Engine) AnnounceDAddr() bool {
+	if e.retired.Load() {
+		return false
+	}
 	if e.account == nil || e.dispatcher == nil {
 		log.Debug("AnnounceDAddr: node has no producer key, nothing to announce")
 		return false
@@ -120,17 +127,24 @@ func (e *Engine) WatchPeerSet() {
 // make it reject its own relayed records on a skewed machine.
 func (e *Engine) GetTimeSource() dtime.MedianTimeSource { return e.timeSource }
 
-// DPoSNetworkRunning reports whether a DPoS TCP server is attached at all.
+// DPoSNetworkRunning reports whether a DPoS TCP server is attached and in
+// service.
 //
 // This is the difference between "no peers connected" and "no server to connect
 // to", which the peer count alone cannot express: a verifier-only node and a
 // single-producer rig both report zero peers and neither runs a server, while a
 // misconfigured multi-node bench also reports zero peers but does. The RPC
 // status needs the distinction to point an operator at the right knob.
+//
+// The retired term is what keeps it honest after the Parlia fork: retire stops
+// the server but deliberately keeps the reference (transport and the block
+// store wiring still read e.network; clearing it would need an audit of every
+// reader), so "is the pointer non-nil" alone would answer true for a server
+// that is down. The reference stays, the answer changes.
 func (e *Engine) DPoSNetworkRunning() bool {
 	e.transportMu.RLock()
 	defer e.transportMu.RUnlock()
-	return e.network != nil
+	return e.network != nil && !e.retired.Load()
 }
 
 // DumpDPoSPeersInfo snapshots the DPoS TCP server's connect list, including

@@ -45,8 +45,14 @@ import (
 
 // startPBFTNetwork builds and starts the DPoS network for a producing node.
 //
-// It returns nil and does nothing in three cases, all of them legitimate:
+// It returns nil and does nothing in four cases, all of them legitimate:
 //
+//   - the chain head is already past LegacyConfig.ForkHeight: the legacy era is
+//     over, Parlia produces the blocks, and a DPoS server started now would
+//     only re-open the direct links the fork was supposed to end. This is the
+//     restart half of the retire mechanism -- a node that crossed the fork while
+//     running retires through pbft.Engine.OnBlockImported, and this gate is what
+//     keeps a restart from bringing the network back;
 //   - production is disabled: a verifier has no DPoS identity, so it is in
 //     nobody's producer set and nothing would dial it;
 //   - no keystore could be opened: same, plus there is no key to sign the address
@@ -68,13 +74,28 @@ func (s *Ethereum) startPBFTNetwork() error {
 	if !engine.IsProductionEnabled() {
 		return nil
 	}
+
+	// The fork gate, before anything is built: past the fork the DPoS network is
+	// not merely useless, it is actively wrong -- the direct links it opens are
+	// the thing the user asked to have end. Reading the head rather than the
+	// engine's state on purpose: a node can be restarted into any era, and the
+	// chain head is the one fact that says which era this is.
+	chainCfg := s.blockchain.Config()
+	if chainCfg.Legacy != nil {
+		head := s.blockchain.CurrentBlock()
+		if head != nil && head.Number != nil && head.Number.Uint64() >= chainCfg.Legacy.ForkHeight {
+			log.Info("PBFT: chain head is past fork height, DPoS network not started",
+				"head", head.Number.Uint64(), "forkHeight", chainCfg.Legacy.ForkHeight)
+			return nil
+		}
+	}
+
 	account := engine.DPOSAccount()
 	if account == nil {
 		log.Warn("PBFT: no producer key, DPoS network not started (node only verifies)")
 		return nil
 	}
 
-	chainCfg := s.blockchain.Config()
 	if chainCfg.Legacy == nil {
 		return nil
 	}

@@ -600,6 +600,18 @@ func (e *Engine) StartRecovery() {
 				return
 			default:
 			}
+			// retire does not close stopCh (Close owns that channel), so this
+			// loop needs its own fork gate, re-read every pass the same way
+			// changeViewLoop re-reads enableViewLoop every tick. Without it a
+			// node that crosses the Parlia fork while this wait is running
+			// spins here forever: retire stops the DPoS network, the peer count
+			// drops to zero, and this loop answers with the "still waiting for
+			// producers" warning every two minutes for as long as the node
+			// lives. Past the fork there is nothing left to recover -- the set
+			// is not producing any more -- so exiting is the whole remedy.
+			if e.retired.Load() {
+				return
+			}
 			need := e.minAcceptVoteCount()
 			have := e.activePeerCount()
 			want := need

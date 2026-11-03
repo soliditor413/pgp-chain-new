@@ -117,17 +117,22 @@ func (e *Engine) shouldRequestResetView(vo uint32) bool {
 // a round can be started twice by two racing Prepare calls, and the duplicate
 // merely doubles the view-change rate, which is a silent way to produce blocks
 // on a view the rest of the set has already left.
+//
+// The retired check is under viewMu, not before it: retire clears
+// enableViewLoop under the same lock, so checking before it would let a racing
+// pair through -- ensure past the early return, retire clearing the flag,
+// ensure setting it again -- and start a view loop that nothing ever stops. A
+// retired engine starts no rounds, so this is the only guard it needs.
 func (e *Engine) ensureViewLoop() {
 	if e.dispatcher == nil || e.account == nil {
 		return
 	}
 	e.viewMu.Lock()
-	if e.enableViewLoop {
-		e.viewMu.Unlock()
+	defer e.viewMu.Unlock()
+	if e.retired.Load() || e.enableViewLoop {
 		return
 	}
 	e.enableViewLoop = true
-	e.viewMu.Unlock()
 
 	go e.changeViewLoop()
 }
