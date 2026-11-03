@@ -210,7 +210,17 @@ func (args *TransactionArgs) setFeeDefaults(ctx context.Context, b Backend, head
 	}
 
 	// Sanity check the non-EIP-1559 fee parameters.
-	isLondon := b.ChainConfig().IsLondon(head.Number)
+	//
+	// A pgp-legacy header carries no BaseFee field at all -- the chain never
+	// activated EIP-1559 (core/evm.go substitutes 0 for the EVM context for the
+	// same reason). The 1559 arithmetic has nothing to work with there, so fall
+	// through to the legacy gas-price path instead of multiplying a nil.
+	//
+	// IsLondon alone is not the question: a devnet genesis sets londonBlock=0 so
+	// that modern transaction types are accepted, which makes IsLondon answer
+	// true for legacy-era blocks too. The header is what the fee defaults are
+	// computed from, so the header is what has to carry a base fee.
+	isLondon := b.ChainConfig().IsLondon(head.Number) && head.BaseFee != nil
 	if args.GasPrice != nil && !eip1559ParamsSet {
 		// Zero gas-price is not allowed after London fork
 		if args.GasPrice.ToInt().Sign() == 0 && isLondon {
@@ -255,6 +265,15 @@ func (args *TransactionArgs) setCancunFeeDefaults(config *params.ChainConfig, he
 
 // setLondonFeeDefaults fills in reasonable default fee values for unspecified fields.
 func (args *TransactionArgs) setLondonFeeDefaults(ctx context.Context, head *types.Header, b Backend) error {
+	// Defence in depth, not the primary guard: setFeeDefaults only takes this
+	// path when the header has a base fee (see isLondon there). If that ever
+	// stops being true, the failure has to be an error and not a nil
+	// dereference -- a panic in an RPC handler is reported to the caller as
+	// "method handler crashed" and takes the whole call down with no usable
+	// information about which field was missing.
+	if head.BaseFee == nil {
+		return errors.New("no base fee in the head header: EIP-1559 fee defaults cannot be derived")
+	}
 	// Set maxPriorityFeePerGas if it is missing.
 	if args.MaxPriorityFeePerGas == nil {
 		tip, err := b.SuggestGasTipCap(ctx)
