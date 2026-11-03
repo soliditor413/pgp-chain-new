@@ -278,6 +278,7 @@ var (
 		BerlinBlock:         big.NewInt(3),
 		LondonBlock:         big.NewInt(3),
 		ShanghaiTime:        newUint64(1761657650),
+		Parlia:              &ParliaConfig{},
 		Legacy: &LegacyConfig{
 			ForkHeight:           math.MaxUint64,
 			GasFeeRecipient:      DefaultGasFeeRecipient,
