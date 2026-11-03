@@ -133,7 +133,66 @@ type LegacyConfig struct {
 	// InitNextTurnDposInfo returned early forever and the "turn to Dpos mode"
 	// transition could never fire.
 	DynamicArbiterHeight uint64 `json:"dynamicArbiterHeight,omitempty"`
+
+	// ParliaGenesisValidators is the initial Parlia validator set, in the exact
+	// order it must be encoded into BSCValidatorSet.init(bytes,uint256).
+	//
+	// These four fields exist because the initial validator set is NOT a
+	// compile-time constant any more. It used to live in
+	// BSCValidatorSet.INIT_VALIDATORSET_BYTES / INIT_NUM_OF_CABINETS, which
+	// forced a separate bytecode per validator count -- so a 6-validator devnet
+	// and a 21-validator mainnet could never share a binary, and picking the
+	// wrong build silently produced a different state root at the fork block.
+	// The contract now takes both as init() arguments and the consensus engine
+	// packs them from here, so the single deployed bytecode serves both.
+	//
+	// CONSENSUS-CRITICAL ORDERING: the RLP payload is built in slice order, so
+	// swapping two entries changes the payload, changes the state root written
+	// at ForkHeight, and splits the chain. Do not treat this list as a set.
+	//
+	// An empty list on a Parlia chain is a hard startup failure, not "no
+	// validators configured yet": BSCValidatorSet.init requires a non-empty set,
+	// and a zero numOfCabinets would make getMiningValidators underflow.
+	//
+	// The name deliberately does not end in "Block" or "Time"; see the warning
+	// on LegacyConfig. core/forkid.gatherForks reflects over those suffixes and
+	// would otherwise treat this list as a fork activation point.
+	ParliaGenesisValidators []string `json:"parliaGenesisValidators,omitempty"`
+
+	// ParliaGenesisFeeAddrs is the per-validator fee address, parallel to
+	// ParliaGenesisValidators. Optional: when empty every validator uses its own
+	// consensus address.
+	//
+	// Note that these addresses are inert on this chain. Block rewards reach a
+	// validator through IStakeHub.distributeReward(consensusAddress) when the set
+	// is rotated (BSCValidatorSet.sol:213-219), not through Validator.feeAddress,
+	// so H2 and later never pay to this field. It is carried only because the
+	// 4-tuple RLP layout has a slot for it.
+	ParliaGenesisFeeAddrs []string `json:"parliaGenesisFeeAddrs,omitempty"`
+
+	// ParliaGenesisVotingPowers is the voting power per validator, parallel to
+	// ParliaGenesisValidators. Optional: when empty every validator gets
+	// DefaultParliaVotingPower.
+	ParliaGenesisVotingPowers []uint64 `json:"parliaGenesisVotingPowers,omitempty"`
+
+	// ParliaGenesisCabinets is the number of cabinet seats seeded into
+	// BSCValidatorSet.numOfCabinets at init. Zero means "one per validator",
+	// which is what both the devnet and mainnet use.
+	//
+	// It is seeded as a real numOfCabinets value rather than kept as a fallback
+	// constant, because numOfCabinets is the single source of truth for
+	// getMiningValidators / getWorkingValidatorCount / the maxNumOfMaintaining
+	// bound. Governance can change it later through updateParam("numOfCabinets"),
+	// but not before H2: updateParam validates against maxElectedValidators,
+	// which only exists once StakeHub has been initialized.
+	ParliaGenesisCabinets uint64 `json:"parliaGenesisCabinets,omitempty"`
 }
+
+// DefaultParliaVotingPower is the voting power given to a genesis validator when
+// ParliaGenesisVotingPowers does not spell it out. 100 matches the BSC devnet
+// configuration; the genesis set is static until Feynman, so the absolute value
+// only starts to matter when StakeHub takes over the election.
+const DefaultParliaVotingPower uint64 = 100
 
 // DefaultGasFeeRecipientRatio is the fee split used by pgp-chain mainnet since
 // genesis: 65% to the PG fee sink, 35% to the block producer.

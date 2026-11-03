@@ -33,7 +33,6 @@ import (
 	"github.com/ethereum/go-ethereum/consensus"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip1559"
 	"github.com/ethereum/go-ethereum/consensus/misc/eip4844"
-	"github.com/ethereum/go-ethereum/consensus/parlia"
 	"github.com/ethereum/go-ethereum/consensus/pbft"
 	"github.com/ethereum/go-ethereum/core"
 	"github.com/ethereum/go-ethereum/core/state"
@@ -504,7 +503,7 @@ func (w *worker) newWorkLoop(recommit time.Duration) {
 			}
 			clearPending(head.Header.Number.Uint64())
 			timestamp = time.Now().Unix()
-			if p, ok := w.engine.(*parlia.Parlia); ok {
+			if p, ok := w.engine.(parliaWorkerEngine); ok {
 				signedRecent, err := p.SignRecently(w.chain, head.Header)
 				if err != nil {
 					timer.Reset(recommit)
@@ -754,6 +753,41 @@ func (w *worker) recordMinedBlock(block *types.Block) bool {
 	return true
 }
 
+// parliaWorkerEngine is the slice of *parlia.Parlia's surface that the miner
+// needs on top of consensus.Engine.
+//
+// Every use of it has to be an assertion on this interface rather than on the
+// concrete *parlia.Parlia. On a chain that switches consensus at ForkHeight the
+// engine the worker holds is consensus/router.Engine, so a concrete assertion
+// fails on every block and each branch below silently degrades to "not Parlia".
+// For EstimateGasReservedForSystemTxs that is not a degradation but a chain
+// halt: gasReserved stays 0, user transactions fill the whole block, and the
+// system transactions the fork block and every epoch block must carry no longer
+// fit, so FinalizeAndAssemble fails with "gas consumption of system txs exceed
+// the gas limit" on exactly the blocks that matter most. The other four lose
+// only an optimization, but leaving them dead keeps the router half-transparent
+// and makes the next such bug harder to spot.
+//
+// consensus/router.Engine implements this interface and forwards each call to
+// whichever engine owns the height in question.
+type parliaWorkerEngine interface {
+	// SignRecently reports whether this validator signed too recently to be
+	// allowed to propose on top of parent, so the worker can skip building a
+	// block that Seal would refuse anyway.
+	SignRecently(chain consensus.ChainReader, parent *types.Header) (bool, error)
+	// IsLastBlockInTurn reports whether header is the last block of this
+	// validator's turn, which caps the local build budget.
+	IsLastBlockInTurn(chain consensus.ChainReader, header *types.Header) bool
+	// BlockInterval returns the block interval in milliseconds.
+	BlockInterval(chain consensus.ChainHeaderReader, header *types.Header) (uint64, error)
+	// NextProposalBlock returns the [start, end] block range of this
+	// validator's next proposal window.
+	NextProposalBlock(chain consensus.ChainHeaderReader, header *types.Header, proposer common.Address) (uint64, uint64, error)
+	// EstimateGasReservedForSystemTxs reports how much of the block gas limit
+	// the consensus engine reserves for the system transactions it appends.
+	EstimateGasReservedForSystemTxs(chain consensus.ChainHeaderReader, header *types.Header) uint64
+}
+
 // makeEnv creates a new environment for the sealing block.
 func (w *worker) makeEnv(parent *types.Header, header *types.Header, coinbase common.Address,
 	prevEnv *environment, witness bool) (*environment, error) {
@@ -787,8 +821,8 @@ func (w *worker) makeEnv(parent *types.Header, header *types.Header, coinbase co
 	// then matches the reservation-free gas pool used on block import
 	// (core.StateProcessor) instead of being inflated by the reservation.
 	var gasReserved uint64
-	if p, ok := w.engine.(*parlia.Parlia); ok {
-		gasReserved = p.EstimateGasReservedForSystemTxs(w.chain, header)
+	if r, ok := w.engine.(parliaWorkerEngine); ok {
+		gasReserved = r.EstimateGasReservedForSystemTxs(w.chain, header)
 		if gasReserved > header.GasLimit {
 			gasReserved = header.GasLimit
 		}
@@ -1393,7 +1427,7 @@ func (w *worker) delay(header *types.Header, leftOver *time.Duration) *time.Dura
 	if d == nil {
 		return nil
 	}
-	if p, ok := w.engine.(*parlia.Parlia); ok && p.IsLastBlockInTurn(w.chain, header) {
+	if p, ok := w.engine.(parliaWorkerEngine); ok && p.IsLastBlockInTurn(w.chain, header) {
 		blockInterval, err := p.BlockInterval(w.chain, header)
 		if err == nil {
 			if cap := time.Duration(blockInterval) * time.Millisecond / 4; *d > cap {
@@ -1470,7 +1504,7 @@ LOOP:
 			break
 		} else {
 			if !w.inTurn() && len(workList) == 1 {
-				if parliaEngine, ok := w.engine.(*parlia.Parlia); ok {
+				if parliaEngine, ok := w.engine.(parliaWorkerEngine); ok {
 					// When mining out of turn, continuous access to the txpool and trie database
 					// may cause lock contention, slowing down transaction insertion and block importing.
 					// Applying a backoff delay mitigates this issue and significantly reduces CPU usage.
@@ -1697,7 +1731,14 @@ LOOP:
 		}
 	}
 
-	w.commit(bestWork, w.fullTaskHook, start)
+	// The error was discarded until now, which made a failing Finalize() - the
+	// step that runs the consensus engine's system transactions, including
+	// BSCValidatorSet.init() at the fork height - completely silent: commitWork
+	// returned normally, no task ever reached taskLoop, and the node simply never
+	// produced a block. Report it instead.
+	if err := w.commit(bestWork, w.fullTaskHook, start); err != nil {
+		log.Error("commitWork failed to assemble a block", "number", bestWork.header.Number.Uint64(), "err", err)
+	}
 
 	// Swap out the old work with the new one, terminating any leftover
 	// prefetcher processes in the mean time and starting a new one.
@@ -1788,7 +1829,7 @@ func (w *worker) getSealingBlock(params *generateParams) *newPayloadResult {
 }
 
 func (w *worker) tryWaitProposalDoneWhenStopping() {
-	parlia, ok := w.engine.(*parlia.Parlia)
+	parliaEngine, ok := w.engine.(parliaWorkerEngine)
 	// if the consensus is not parlia, just skip waiting
 	if !ok {
 		return
@@ -1796,7 +1837,7 @@ func (w *worker) tryWaitProposalDoneWhenStopping() {
 
 	currentHeader := w.chain.CurrentBlock()
 	currentBlock := currentHeader.Number.Uint64()
-	startBlock, endBlock, err := parlia.NextProposalBlock(w.chain, currentHeader, w.coinbase)
+	startBlock, endBlock, err := parliaEngine.NextProposalBlock(w.chain, currentHeader, w.coinbase)
 	if err != nil {
 		log.Warn("Failed to get next proposal block, skip waiting", "err", err)
 		return
@@ -1808,7 +1849,7 @@ func (w *worker) tryWaitProposalDoneWhenStopping() {
 		log.Warn("next proposal end block has passed, ignore")
 		return
 	}
-	blockInterval, err := parlia.BlockInterval(w.chain, currentHeader)
+	blockInterval, err := parliaEngine.BlockInterval(w.chain, currentHeader)
 	if err != nil {
 		log.Debug("failed to get BlockInterval when tryWaitProposalDoneWhenStopping")
 	}

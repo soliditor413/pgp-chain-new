@@ -914,18 +914,48 @@ func (s *Ethereum) StartMining() error {
 			log.Error("Cannot start mining without etherbase", "err", err)
 			return fmt.Errorf("etherbase missing: %v", err)
 		}
-		if parlia, ok := s.engine.(*parlia.Parlia); ok {
+		if p, ok := s.engine.(*parlia.Parlia); ok {
 			wallet, err := s.accountManager.Find(accounts.Account{Address: eb})
 			if wallet == nil || err != nil {
 				log.Error("Etherbase account unavailable locally", "err", err)
 				return fmt.Errorf("signer missing: %v", err)
 			}
-			parlia.Authorize(eb, wallet.SignData, wallet.SignTx)
+			p.Authorize(eb, wallet.SignData, wallet.SignTx)
 
 			// Start a goroutine to handle node ID registration after sync
 			go func() {
-				s.waitForSyncAndMaxwell(parlia)
+				s.waitForSyncAndMaxwell(p)
 			}()
+		} else if auth, ok := s.engine.(interface {
+			Authorize(common.Address, parlia.SignerFn, parlia.SignerTxFn)
+		}); ok {
+			// The engine is not a bare *parlia.Parlia but still knows how to
+			// take a signer: on this tree that is consensus/router.Engine, which
+			// wraps Parlia when Legacy.ForkHeight is set.
+			//
+			// This branch exists because the assertion above used to be the only
+			// way to reach Parlia, and it stopped matching when the height router
+			// was introduced. The failure was silent and expensive to diagnose:
+			// Parlia kept p.val == 0, wrote a zero Coinbase into every candidate
+			// header, found no validator in turn, and produced nothing while
+			// logging the reason at DEBUG only.
+			wallet, err := s.accountManager.Find(accounts.Account{Address: eb})
+			if wallet == nil || err != nil {
+				log.Error("Etherbase account unavailable locally", "err", err)
+				return fmt.Errorf("signer missing: %v", err)
+			}
+			auth.Authorize(eb, wallet.SignData, wallet.SignTx)
+			log.Info("Authorized consensus signer through engine wrapper", "etherbase", eb)
+
+			if r, ok := s.engine.(interface {
+				Parlia() (*parlia.Parlia, bool)
+			}); ok {
+				if p, ok := r.Parlia(); ok {
+					go func() {
+						s.waitForSyncAndMaxwell(p)
+					}()
+				}
+			}
 		}
 
 		// A single-node producer has nobody to exchange consensus status with, so

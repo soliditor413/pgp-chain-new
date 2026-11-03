@@ -386,6 +386,34 @@ func (s *Snapshot) apply(headers []*types.Header, chain consensus.ChainHeaderRea
 				return nil, consensus.ErrUnknownAncestor
 			}
 
+			// On a chain whose Parlia era starts at ForkHeight > 0, the first
+			// validator-set switch can point its checkpoint at a block that
+			// predates the fork - including the legacy genesis header. That
+			// header's extra field is in the old consensus' layout (vanity plus
+			// seal, no address list), so parseValidators finds zero 20+48-byte
+			// records and fails with "invalid validators bytes", after which the
+			// node can no longer prepare headers and stops sealing.
+			//
+			// It triggers exactly when the switch height minus
+			// minerHistoryCheckLen() is below ForkHeight. That length is
+			// (len(Validators)/2+1)*TurnLength-1: zero for one seat (so the
+			// checkpoint is the epoch block itself and nothing is wrong), three
+			// for six seats, ten for twenty-one. Which is why a single-validator
+			// devnet never showed it and a six-validator one cannot get past
+			// block 3.
+			//
+			// Keeping the current set is the exact answer, not a workaround:
+			// before ForkHeight the validator set is a constant taken from
+			// LegacyConfig, so "re-read it from the checkpoint header" has
+			// nothing to read and nothing to change. pgpAnchorSnapshot() in
+			// pgp_validator_init.go establishes the same set at ForkHeight-1.
+			if isPreForkCheckpoint(chainConfig, checkpointHeader) {
+				log.Debug("Skipping validator set switch from a pre-fork checkpoint",
+					"number", number, "checkpoint", checkpointHeader.Number.Uint64(),
+					"forkHeight", chainConfig.Legacy.ForkHeight, "validators", len(snap.Validators))
+				continue
+			}
+
 			oldVersionsLen := snap.versionHistoryCheckLen()
 			// get turnLength from headers and use that for new turnLength
 			turnLength, err := parseTurnLength(checkpointHeader, chainConfig, epochLength)
@@ -534,6 +562,23 @@ func (s *Snapshot) indexOfVal(validator common.Address) int {
 		}
 	}
 	return -1
+}
+
+// isPreForkCheckpoint reports whether a validator-set checkpoint header belongs
+// to the pre-Parlia era, i.e. whether its extra field is in the legacy layout
+// rather than the Parlia one.
+//
+// A zero or MaxUint64 ForkHeight means "no fork is scheduled", in which case
+// every block is Parlia's and there is nothing to special-case.
+func isPreForkCheckpoint(chainConfig *params.ChainConfig, header *types.Header) bool {
+	if chainConfig == nil || chainConfig.Legacy == nil || header == nil || header.Number == nil {
+		return false
+	}
+	fork := chainConfig.Legacy.ForkHeight
+	if fork == 0 || fork == math.MaxUint64 {
+		return false
+	}
+	return header.Number.Uint64() < fork
 }
 
 func parseValidators(header *types.Header, chainConfig *params.ChainConfig, epochLength uint64) ([]common.Address, []types.BLSPublicKey, error) {

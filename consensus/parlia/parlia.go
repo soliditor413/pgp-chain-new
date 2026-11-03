@@ -266,6 +266,13 @@ type Parlia struct {
 	validatorSetABI            abi.ABI
 	slashABI                   abi.ABI
 	stakeHubABI                abi.ABI
+
+	// pgpInit is the pre-computed BSCValidatorSet.init() calldata for a chain
+	// that switches to Parlia at a non-zero height. Nil means "no switch", in
+	// which case this engine behaves exactly like upstream: the validator set
+	// comes from the genesis header and the contracts are inited in block 1.
+	// See pgp_validator_init.go.
+	pgpInit *pgpInitPlan
 }
 
 // New creates a Parlia consensus engine.
@@ -293,6 +300,18 @@ func New(
 			panic(fmt.Sprintf("invalid validator set ABI selector for %s", methodName))
 		}
 	}
+	// The init() signature is load bearing here in a way it is not upstream.
+	// This chain calls init(bytes,uint256) with the validator set as an
+	// argument, so if the ABI in this binary still carried the old no-argument
+	// init(), Pack would happily produce a selector the deployed contract does
+	// not have, every init call would revert, and the failure would only show up
+	// at ForkHeight. Pin the selector to the one C1-a produced.
+	if initMethod, ok := vABI.Methods["init"]; !ok {
+		panic("validator set ABI has no init method")
+	} else if !bytes.Equal(initMethod.ID, pgpValidatorSetInitSelector) {
+		panic(fmt.Sprintf("invalid validator set init selector: have 0x%x, want 0x%x (the ABI must expose init(bytes,uint256))",
+			initMethod.ID, pgpValidatorSetInitSelector))
+	}
 	sABI, err := abi.JSON(strings.NewReader(slashABI))
 	if err != nil {
 		panic(err)
@@ -300,6 +319,19 @@ func New(
 	stABI, err := abi.JSON(strings.NewReader(stakeABI))
 	if err != nil {
 		panic(err)
+	}
+	// Build the init() calldata once, here, so that a malformed validator set in
+	// the chain config stops the node at startup instead of at ForkHeight.
+	pgpInit, err := newPGPInitPlan(chainConfig)
+	if err != nil {
+		panic(fmt.Sprintf("invalid parlia genesis validator set: %v", err))
+	}
+	if pgpInit != nil {
+		log.Info("Parlia init injection enabled",
+			"forkHeight", chainConfig.Legacy.ForkHeight,
+			"validators", len(chainConfig.Legacy.ParliaGenesisValidators),
+			"cabinets", pgpInit.cabinets,
+			"payloadLen", len(pgpInit.payload))
 	}
 	c := &Parlia{
 		chainConfig:                chainConfig,
@@ -315,6 +347,7 @@ func New(
 		slashABI:                   sABI,
 		stakeHubABI:                stABI,
 		signer:                     types.LatestSigner(chainConfig),
+		pgpInit:                    pgpInit,
 	}
 
 	return c
@@ -825,6 +858,30 @@ func (p *Parlia) snapshot(chain consensus.ChainHeaderReader, number uint64, hash
 			}
 		}
 
+		// If the snapshot chain is anchored at a legacy block - i.e. this chain
+		// had a working consensus before Parlia took over - stop there instead of
+		// walking on to number 0. The genesis header is a legacy header: its
+		// extra field holds a PBFT producer set and a P-256 confirm signature,
+		// not a 20-byte address list and a secp256k1 seal, so parseValidators
+		// would either fail or return garbage.
+		//
+		// The anchor is exact: before ForkHeight the validator set is a constant
+		// taken from the chain config. See pgp_validator_init.go.
+		if anchor, ok := p.pgpSnapshotAnchorNumber(); ok && number == anchor {
+			s, err := p.pgpAnchorSnapshot(number, hash)
+			if err != nil {
+				return nil, err
+			}
+			// Store it, so a restart does not have to rebuild it and so the
+			// checkpoint lookup at the top of this loop finds it next time.
+			if err := s.store(p.db); err != nil {
+				return nil, err
+			}
+			log.Info("Stored parlia snapshot anchor", "number", number, "hash", hash, "validators", len(s.Validators))
+			snap = s
+			break
+		}
+
 		// If we're at the genesis, snapshot the initial state. Alternatively if we have
 		// piled up more headers than allowed to be reorged (chain reinit from a freezer),
 		// consider the checkpoint trusted and snapshot it.
@@ -1329,6 +1386,24 @@ func (p *Parlia) distributeFinalityReward(chain consensus.ChainHeaderReader, sta
 		if head == nil {
 			return fmt.Errorf("header is nil at height %d", height)
 		}
+		// Stop at the fork. The reward window is a Parlia concept: legacy
+		// blocks carry no vote attestation and therefore contribute nothing to
+		// accumulatedWeights. Walking into them is not just useless, it fails:
+		// the epochLength() call below asks for a snapshot of height-1, which
+		// on a chain that switched to Parlia at ForkHeight is below the
+		// snapshot anchor at ForkHeight-1. The lookup then falls through to the
+		// genesis header, whose extra field is in the legacy consensus layout,
+		// so parseValidators finds no address records and returns "invalid
+		// validators bytes" - which surfaces as the first epoch block being
+		// impossible to assemble, with nothing in the log pointing at this
+		// loop. Heights decrease monotonically, so break rather than continue.
+		//
+		// finalityRewardInterval is 200, so the very first epoch block reaches
+		// 199 heights back and crosses the fork on any chain whose ForkHeight is
+		// below 200. It does not reproduce when ForkHeight >= 200.
+		if p.chainConfig.IsPGPLegacy(head.Number) {
+			break
+		}
 		epochLength, err := p.epochLength(chain, head, nil)
 		if err != nil {
 			return err
@@ -1462,10 +1537,14 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 	}
 
 	// No block rewards in PoA, so the state remains as is and uncles are dropped
-	if header.Number.Cmp(common.Big1) == 0 {
+	//
+	// On a chain that switches to Parlia at ForkHeight, the role of block 1 is
+	// played by block ForkHeight: that is the first block Parlia executes, so it
+	// is where the system contracts have to be created.
+	if header.Number.Cmp(common.Big1) == 0 || p.isPGPInitBlock(header.Number) {
 		err := p.initContract(state, header, cx, txs, receipts, systemTxs, usedGas, systemTxImporting, tracer)
 		if err != nil {
-			return errors.New("init contract failed")
+			return fmt.Errorf("init contract failed: %w", err)
 		}
 	}
 	if header.Difficulty.Cmp(diffInTurn) != 0 {
@@ -1570,7 +1649,7 @@ func (p *Parlia) finalizeAndAssemble(chain consensus.ChainHeaderReader, header *
 		}
 	}
 
-	if header.Number.Cmp(common.Big1) == 0 {
+	if header.Number.Cmp(common.Big1) == 0 || p.isPGPInitBlock(header.Number) {
 		err := p.initContract(state, header, cx, &body.Transactions, &receipts, nil, &header.GasUsed, mode, tracer)
 		if err != nil {
 			return nil, nil, errors.New("init contract failed")
@@ -2074,8 +2153,6 @@ func (p *Parlia) slash(spoiledVal common.Address, state vm.StateDB, header *type
 // init contract
 func (p *Parlia) initContract(state vm.StateDB, header *types.Header, chain core.ChainContext,
 	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mode systemTxMode, tracer *tracing.Hooks) error {
-	// method
-	method := "init"
 	// contracts
 	contracts := []string{
 		systemcontracts.ValidatorContract,
@@ -2086,18 +2163,38 @@ func (p *Parlia) initContract(state vm.StateDB, header *types.Header, chain core
 		systemcontracts.RelayerIncentivizeContract,
 		systemcontracts.CrossChainContract,
 	}
-	// get packed data
-	data, err := p.validatorSetABI.Pack(method)
-	if err != nil {
-		log.Error("Unable to pack tx for init validator set", "error", err)
-		return err
+	// On a chain that switches to Parlia at ForkHeight, the validator set has to
+	// travel with the init call instead of being read out of the bytecode, so
+	// the validator contract gets a different calldata from the other six.
+	//
+	// Everything else keeps receiving the bare init() selector, which is what
+	// upstream sent to all seven contracts. It can no longer be packed from
+	// validatorSetABI - that ABI now describes init(bytes,uint256) and nothing
+	// else - so it comes from pgpPlainInitSelector, which evaluates to the same
+	// 0xe1c7392a the old no-argument ABI method id produced.
+	validatorSetData := pgpPlainInitSelector
+	if p.isPGPInitBlock(header.Number) {
+		packed, err := p.validatorSetABI.Pack("init", p.pgpInit.payload, new(big.Int).SetUint64(p.pgpInit.cabinets))
+		if err != nil {
+			log.Error("Unable to pack tx for init validator set", "error", err)
+			return err
+		}
+		validatorSetData = packed
+		log.Info("Initializing validator set from chain config",
+			"block", header.Number.Uint64(),
+			"cabinets", p.pgpInit.cabinets,
+			"payloadLen", len(p.pgpInit.payload))
 	}
+
 	for _, c := range contracts {
+		data := pgpPlainInitSelector
+		if c == systemcontracts.ValidatorContract {
+			data = validatorSetData
+		}
 		msg := p.getSystemMessage(header.Coinbase, common.HexToAddress(c), data, common.Big0)
 		// apply message
 		log.Trace("init contract", "block hash", header.Hash(), "contract", c)
-		err = p.applyTransaction(msg, state, header, chain, txs, receipts, receivedTxs, usedGas, mode, tracer)
-		if err != nil {
+		if err := p.applyTransaction(msg, state, header, chain, txs, receipts, receivedTxs, usedGas, mode, tracer); err != nil {
 			return err
 		}
 	}

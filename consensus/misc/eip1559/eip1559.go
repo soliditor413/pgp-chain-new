@@ -45,8 +45,19 @@ func VerifyEIP1559Header(config *params.ChainConfig, parent, header *types.Heade
 	if header.BaseFee == nil {
 		return errors.New("header is missing baseFee")
 	}
-	// Verify the parent header is not malformed
-	if config.IsLondon(parent.Number) && parent.BaseFee == nil {
+	// Verify the parent header is not malformed.
+	//
+	// pgp-chain's legacy history predates EIP-1559: its headers carry no baseFee
+	// field at all, even at heights its chain config reports as London (pgp
+	// mainnet turns LondonBlock on at block 3, and blocks 3..ForkHeight-1 still
+	// have a nil BaseFee). A missing field means zero, which is exactly what
+	// CalcBaseFee returns for a legacy parent below, so the comparison at the
+	// end of this function still runs and still constrains the block.
+	//
+	// The exemption has to exist here rather than in the genesis: the first
+	// Parlia block is validated against such a legacy parent, so without it
+	// every fork block is rejected by every node that did not mine it.
+	if config.IsLondon(parent.Number) && parent.BaseFee == nil && !config.IsPGPLegacy(parent.Number) {
 		return errors.New("parent header is missing baseFee")
 	}
 	// Verify the baseFee is correct based on the parent header.

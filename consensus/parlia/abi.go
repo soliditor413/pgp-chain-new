@@ -2395,7 +2395,18 @@ const validatorSetABI = `
   {
     "type": "function",
     "name": "init",
-    "inputs": [],
+    "inputs": [
+      {
+        "name": "initValidatorSetBytes",
+        "type": "bytes",
+        "internalType": "bytes"
+      },
+      {
+        "name": "initNumOfCabinets",
+        "type": "uint256",
+        "internalType": "uint256"
+      }
+    ],
     "outputs": [],
     "stateMutability": "nonpayable"
   },
