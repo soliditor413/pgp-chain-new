@@ -58,11 +58,17 @@ import (
 // Both limits are recorded here so nobody reads a green run as proving more
 // than it does.
 
-// retireCountingNetwork is the dpos.DPOSNetwork stub; it exists to count Stop
-// calls, which is the one interaction retire has with the direct-link network.
+// retireCountingNetwork is the dpos.DPOSNetwork stub; it counts Stop calls
+// (the one interaction retire has with the direct-link network) and the two
+// read paths the RPC status uses, so "a retired engine does not ask a stopped
+// server" can be asserted as a call count rather than as a value.
 type retireCountingNetwork struct {
 	mu    sync.Mutex
 	stops int
+
+	peers       int
+	peerQueries int
+	dumpQueries int
 }
 
 func (n *retireCountingNetwork) Start()      {}
@@ -71,7 +77,35 @@ func (n *retireCountingNetwork) Stop() error { n.mu.Lock(); defer n.mu.Unlock();
 func (n *retireCountingNetwork) SendMessageToPeer(dpeer.PID, elap2p.Message) error { return nil }
 func (n *retireCountingNetwork) BroadcastMessage(elap2p.Message)                   {}
 func (n *retireCountingNetwork) UpdatePeers(current, next []dpeer.PID)             {}
-func (n *retireCountingNetwork) GetActivePeers() []elp2p.Peer                      { return nil }
+
+func (n *retireCountingNetwork) GetActivePeers() []elp2p.Peer {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.peerQueries++
+	return make([]elp2p.Peer, n.peers)
+}
+
+// DumpPeersInfo makes the stub satisfy dpos.PeersDumper, which is the assertion
+// DumpDPoSPeersInfo uses to reach the server; a non-empty answer keeps "nil
+// after retire" distinguishable from "the type assertion failed".
+func (n *retireCountingNetwork) DumpPeersInfo() []*elp2p.PeerInfo {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.dumpQueries++
+	return []*elp2p.PeerInfo{{Addr: "stub"}}
+}
+
+func (n *retireCountingNetwork) setPeers(count int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	n.peers = count
+}
+
+func (n *retireCountingNetwork) queryCounts() (peerQueries, dumpQueries int) {
+	n.mu.Lock()
+	defer n.mu.Unlock()
+	return n.peerQueries, n.dumpQueries
+}
 
 func (n *retireCountingNetwork) stopCount() int {
 	n.mu.Lock()
@@ -255,6 +289,58 @@ func TestRetireWithoutAttachedNetworkDoesNotPanic(t *testing.T) {
 	}
 	if engine.AnnounceDAddr() {
 		t.Fatalf("AnnounceDAddr answered true on a retired verifier")
+	}
+}
+
+// TestRetiredEngineDoesNotQueryTheNetwork pins the RPC half of the fork
+// shutdown, which is the field symptom "pbft.status() hangs after the fork".
+//
+// The status RPC reads ActiveDPoSPeers and, on the peers variant,
+// DumpDPoSPeersInfo. Both end at p2pServer.ConnectedPeers/DumpPeersInfo, which
+// post into a channel the server's peerHandler stops reading once its quit case
+// fires -- so the call blocks, it does not fail. retire stops that server; this
+// test requires the engine to stop asking it as well.
+//
+// Split around the fork like the network test, for the same reason: the counts
+// must move below the fork or "unchanged after retire" would also hold for an
+// engine that never asks at all.
+func TestRetiredEngineDoesNotQueryTheNetwork(t *testing.T) {
+	const fork = uint64(10)
+	engine, network := newRetireEngine(t, fork)
+	network.setPeers(3)
+
+	// ---- Below the fork: the queries reach the network ----
+	if got := engine.ActiveDPoSPeers(); got != 3 {
+		t.Fatalf("ActiveDPoSPeers below the fork = %d, want the stub's 3: the fixture is not wired and the "+
+			"post-retire assertion would be vacuous", got)
+	}
+	if got := engine.DumpDPoSPeersInfo(); len(got) == 0 {
+		t.Fatalf("DumpDPoSPeersInfo below the fork returned nothing: the stub's non-empty answer is what makes " +
+			"nil after retire mean 'not asked'")
+	}
+	peerQueries, dumpQueries := network.queryCounts()
+	if peerQueries != 1 || dumpQueries != 1 {
+		t.Fatalf("below the fork the network saw %d peer queries and %d dumps, want 1 and 1", peerQueries, dumpQueries)
+	}
+
+	// ---- At the fork: retire ----
+	engine.OnBlockImported(retireTestHeader(fork))
+
+	if got := engine.ActiveDPoSPeers(); got != 0 {
+		t.Fatalf("ActiveDPoSPeers after retire = %d, want 0", got)
+	}
+	if got := engine.DumpDPoSPeersInfo(); got != nil {
+		t.Fatalf("DumpDPoSPeersInfo after retire = %v, want nil", got)
+	}
+	if got := engine.ActiveDPoSPeerInfos(); got != nil {
+		t.Fatalf("ActiveDPoSPeerInfos after retire = %v, want nil", got)
+	}
+
+	peerQueriesAfter, dumpQueriesAfter := network.queryCounts()
+	if peerQueriesAfter != peerQueries || dumpQueriesAfter != dumpQueries {
+		t.Fatalf("the retired engine queried the stopped network (%d peer queries, was %d; %d dumps, was %d): "+
+			"against a real server each of those calls blocks on a channel nobody reads any more",
+			peerQueriesAfter, peerQueries, dumpQueriesAfter, dumpQueries)
 	}
 }
 

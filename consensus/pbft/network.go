@@ -159,7 +159,17 @@ func (e *Engine) DPoSNetworkRunning() bool {
 //
 // It returns nil, not an empty slice, when no server is attached, so a caller
 // can tell "not running" from "running with nothing connected".
+//
+// A retired engine answers nil without touching the network. This is the second
+// line of defence behind dpos.Network.stopped: the flag inside the network is
+// set by Stop, so a caller that enters here a hair before Stop stores its flag
+// would still reach the server. Asking a retired engine is a question whose
+// answer is known -- there is no server to ask -- so it does not ask. See the
+// deadlock note on ActiveDPoSPeers.
 func (e *Engine) DumpDPoSPeersInfo() []*dpp2p.PeerInfo {
+	if e.retired.Load() {
+		return nil
+	}
 	e.transportMu.RLock()
 	n := e.network
 	e.transportMu.RUnlock()
@@ -187,7 +197,26 @@ func (e *Engine) DumpDPoSPeersInfo() []*dpp2p.PeerInfo {
 // one row and calls it 2WayConnection. Comparing this against majoritycount is
 // therefore conservative, never optimistic, which is the right direction for a
 // gate -- but do not read it as a peer count.
+//
+// # Why a retired engine answers 0 without asking
+//
+// This is the call pbft.status() hung on in the field. The chain: this method
+// -> Network.GetActivePeers -> p2pServer.ConnectedPeers, which posts a request
+// into the server's s.query channel and waits for the reply on it. Once
+// p2pServer.Stop() has run, the peerHandler goroutine takes its quit case and
+// never reads s.query again, so the reply never comes and the RPC blocks
+// forever -- not slow, blocked.
+//
+// The dpos layer now goes silent itself (Network.stopped), but the flag there
+// is set inside Stop, leaving a narrow window between a caller's check and the
+// store. A retired engine does not need to ask at all: retire stops the server
+// before it returns, and the answer for every later caller is zero by
+// construction. Both checks are kept on purpose -- neither one alone closes
+// every path into a stopped server.
 func (e *Engine) ActiveDPoSPeers() int {
+	if e.retired.Load() {
+		return 0
+	}
 	e.transportMu.RLock()
 	n := e.network
 	e.transportMu.RUnlock()
@@ -205,7 +234,14 @@ func (e *Engine) ActiveDPoSPeers() int {
 // PID is not in the connect list would appear in neither outboundPeers nor
 // connectPeers, and that is exactly the shape of an address-book or magic
 // mismatch. This path walks the live peers instead.
+//
+// A retired engine answers nil for the same reason ActiveDPoSPeers answers 0:
+// the walk starts at Network.GetActivePeers, which is the call that blocks once
+// the server is down.
 func (e *Engine) ActiveDPoSPeerInfos() []*dpp2p.PeerInfo {
+	if e.retired.Load() {
+		return nil
+	}
 	e.transportMu.RLock()
 	n := e.network
 	e.transportMu.RUnlock()

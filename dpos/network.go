@@ -25,6 +25,7 @@ import (
 	"errors"
 	"net"
 	"sync"
+	"sync/atomic"
 
 	dmsg "github.com/ethereum/go-ethereum/dpos/msg"
 
@@ -134,6 +135,14 @@ type NetworkEventListener interface {
 	OnProducersMsg(msg *dmsg.ProducersMsg)
 }
 
+// ErrNetworkStopped is what SendMessageToPeer returns once Stop has begun.
+//
+// It exists so a caller can tell "the server refused this message" apart from
+// "there is no server": after the Parlia fork the DPoS server is gone for good,
+// and a producer-path caller reading the error needs to know it will never
+// succeed again rather than retry.
+var ErrNetworkStopped = errors.New("dpos network stopped")
+
 type messageItem struct {
 	ID      peer.PID
 	Message elap2p.Message
@@ -152,6 +161,21 @@ type Network struct {
 	quit     chan struct{}
 	stopOnce sync.Once
 
+	// stopped is set before quit is closed, and every entry point that would
+	// touch the server -- or post to a channel whose only reader is the Start
+	// goroutine -- checks it.
+	//
+	// Why it is needed at all: p2pServer.Stop() makes the server's peerHandler
+	// exit (its select takes the quit case and never reads s.query again), but
+	// nothing makes the *interface* safe afterwards. ConnectedPeers and
+	// DumpPeersInfo write a request into that unread channel and block forever
+	// on the reply; the channel posts block on a channel the Start loop no
+	// longer selects. That is the observed symptom: RPC pbft.status() deadlocks
+	// the moment the chain crosses the Parlia fork, because retire stops the
+	// server and the RPC keeps asking it questions. See the p2p package's
+	// server.go:828 (Stop) and :632-660 (peerHandler select).
+	stopped atomic.Bool
+
 	badNetworkChan chan bool
 	changeViewChan chan bool
 	recoverChan    chan bool
@@ -159,11 +183,24 @@ type Network struct {
 	GetCurrentHeight func(pid peer.PID) uint64
 }
 
+// GetActivePeers answers nil once the network is stopped.
+//
+// The nil is load-bearing, not cosmetic: ConnectedPeers sends a request into a
+// channel the server's peerHandler stops reading the moment it exits, so asking
+// a stopped server this question is a permanent block. Every caller (RPC
+// pbft.status, the recovery gate) treats nil as "no peers", which is the truth
+// after the fork.
 func (n *Network) GetActivePeers() []p2p.Peer {
+	if n.stopped.Load() {
+		return nil
+	}
 	return n.p2pServer.ConnectedPeers()
 }
 
 func (n *Network) notifyFlag(flag p2p.NotifyFlag) {
+	if n.stopped.Load() {
+		return
+	}
 	if flag == p2p.NFBadNetwork {
 		n.badNetworkChan <- true
 
@@ -202,20 +239,36 @@ func (n *Network) Start() {
 // failed startup, and a hang there is indistinguishable from a slow boot.
 // routes.go:218-223 in the same package already gets this right; this is the
 // same CAS-once + close shape.
+//
+// stopped goes up before quit closes, so a concurrent caller that has not yet
+// taken its early return sees the flag on its own check rather than racing the
+// close. The reverse order would leave a window in which a caller reads
+// stopped == false, then blocks on a channel whose reader has just exited.
 func (n *Network) Stop() error {
 	var err error
 	n.stopOnce.Do(func() {
+		n.stopped.Store(true)
 		close(n.quit)
 		err = n.p2pServer.Stop()
 	})
 	return err
 }
 
+// PostChangeViewTask and PostRecoverTask hand work to the Start goroutine over
+// unbuffered channels. Once Stop has closed quit that goroutine is gone, so the
+// send would block forever -- these are the same hang as GetActivePeers, one
+// channel earlier in the path.
 func (n *Network) PostChangeViewTask() {
+	if n.stopped.Load() {
+		return
+	}
 	n.changeViewChan <- true
 }
 
 func (n *Network) PostRecoverTask() {
+	if n.stopped.Load() {
+		return
+	}
 	n.recoverChan <- true
 }
 
@@ -334,6 +387,9 @@ func (n *Network) changeView() {
 }
 
 func (n *Network) UpdatePeers(currentPeers []peer.PID, nextPeers []peer.PID) {
+	if n.stopped.Load() {
+		return
+	}
 	Info("[UpdatePeers]", "self account:", common.BytesToHexString(n.publicKey))
 	for _, p := range currentPeers {
 		if bytes.Equal(n.publicKey, p[:]) {
@@ -352,7 +408,14 @@ func (n *Network) UpdatePeers(currentPeers []peer.PID, nextPeers []peer.PID) {
 	n.p2pServer.ConnectPeers(nil, nil)
 }
 
+// handleMessage is the p2p server's inbound callback. It is handed to the
+// server at construction (NewNetwork), and the server's own shutdown is what
+// stops it being called -- but a message already in flight when quit closes
+// would land here after the Start goroutine exited and block on messageQueue.
 func (n *Network) handleMessage(pid peer.PID, msg elap2p.Message) {
+	if n.stopped.Load() {
+		return
+	}
 	n.messageQueue <- &messageItem{pid, msg}
 }
 
@@ -367,15 +430,24 @@ func (n *Network) recover() {
 }
 
 func (n *Network) AddDirectLinkAddr(pid peer.PID, addr string) {
+	if n.stopped.Load() {
+		return
+	}
 	n.p2pServer.AddAddr(pid, addr)
 }
 
 func (n *Network) SendMessageToPeer(id peer.PID, msg elap2p.Message) error {
+	if n.stopped.Load() {
+		return ErrNetworkStopped
+	}
 	Info("[SendMessageToPeer] msg:", msg.CMD(), id.String())
 	return n.p2pServer.SendMessageToPeer(id, msg)
 }
 
 func (n *Network) BroadcastMessage(msg elap2p.Message) {
+	if n.stopped.Load() {
+		return
+	}
 	Info("[BroadcastMessage] msg:", msg.CMD())
 	n.p2pServer.BroadcastMessage(msg)
 }
@@ -384,7 +456,15 @@ func (n *Network) BroadcastMessage(msg elap2p.Message) {
 //
 // This function is safe for concurrent access and is part of the IServer
 // interface implementation.
+//
+// It answers nil once stopped, for the same reason GetActivePeers does: the
+// dump walks server state under a lock the shutdown path is tearing down, and
+// reaches the unread s.query channel. pbft.status's peer table (the RPC
+// DumpDPoSPeersInfo) is the caller that hung.
 func (n *Network) DumpPeersInfo() []*p2p.PeerInfo {
+	if n.stopped.Load() {
+		return nil
+	}
 	return n.p2pServer.DumpPeersInfo()
 }
 
