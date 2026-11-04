@@ -6,23 +6,30 @@ import (
 	"testing"
 )
 
-func TestApplyPGPForkHeightFillsEveryBlockFork(t *testing.T) {
+func TestApplyPGPForkHeightSchedulesLubanAtTheFork(t *testing.T) {
 	cfg := &ChainConfig{ChainID: big.NewInt(860621), Legacy: &LegacyConfig{ForkHeight: 642}}
 
 	cfg.ApplyPGPForkHeight()
 
+	// Luban defines what a validator set is (BLS vote addresses, the extra-data
+	// layout), and the fork block is the first one Parlia produces, so it has to
+	// be active there rather than a block later.
+	if cfg.LubanBlock == nil || cfg.LubanBlock.Uint64() != 642 {
+		t.Fatalf("lubanBlock = %v, want 642", cfg.LubanBlock)
+	}
 	for _, fork := range cfg.pgpDerivedBlockForks() {
-		if *fork == nil {
+		if *fork.target == nil {
 			t.Fatal("a block fork was left nil")
 		}
-		if (*fork).Uint64() != 643 {
-			t.Fatalf("fork scheduled at %v, want 643", *fork)
+		want := uint64(642) + fork.offset
+		if (*fork.target).Uint64() != want {
+			t.Fatalf("fork scheduled at %v, want %d", *fork.target, want)
 		}
 	}
 }
 
-// The sentinel matters: math.MaxUint64+1 wraps to zero, and a fork at block 0
-// means "active since genesis" -- the opposite of "never".
+// The sentinel matters: incrementing math.MaxUint64 wraps to zero, and a fork at
+// block 0 means "active since genesis" -- the opposite of "never".
 func TestApplyPGPForkHeightIgnoresTheSentinel(t *testing.T) {
 	for _, height := range []uint64{0, math.MaxUint64} {
 		cfg := &ChainConfig{Legacy: &LegacyConfig{ForkHeight: height}}
