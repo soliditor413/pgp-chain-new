@@ -543,10 +543,25 @@ func LoadChainConfig(db ethdb.Database, genesis *Genesis) (cfg *params.ChainConf
 func (g *Genesis) chainConfigOrDefault(ghash common.Hash, stored *params.ChainConfig) *params.ChainConfig {
 	conf := params.GetBuiltInChainConfig(ghash)
 	if conf != nil {
+		// No-op for the built-in configs (their ForkHeight is the "never fork"
+		// sentinel), but keeps the derivation in one place for a built-in chain
+		// that ever pins a real height.
+		conf.ApplyPGPForkHeight()
 		return conf
 	}
 	if g != nil {
-		return g.Config // it could be a custom config for QA test, just return
+		// It could be a custom config for QA test or a devnet genesis, which is
+		// where a real ForkHeight normally comes from.
+		if g.Config != nil {
+			g.Config.ApplyPGPForkHeight()
+		}
+		return g.Config
+	}
+	if stored != nil {
+		// A configuration read back from the database carries whatever was
+		// written the first time; filling nil forks keeps an operator-pinned
+		// value intact while bringing an older datadir up to the same shape.
+		stored.ApplyPGPForkHeight()
 	}
 	return stored
 }
