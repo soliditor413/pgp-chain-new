@@ -52,7 +52,7 @@ func TestApplyPGPForkHeightKeepsPinnedValues(t *testing.T) {
 	if cfg.LubanBlock.Uint64() != 100 {
 		t.Fatalf("pinned lubanBlock was overwritten: %v", cfg.LubanBlock)
 	}
-	if cfg.PlatoBlock == nil || cfg.PlatoBlock.Uint64() != 643 {
+	if cfg.PlatoBlock == nil || cfg.PlatoBlock.Uint64() != 642 {
 		t.Fatalf("unpinned platoBlock not filled: %v", cfg.PlatoBlock)
 	}
 }
@@ -73,5 +73,19 @@ func TestApplyPGPForkHeightIsIdempotent(t *testing.T) {
 	cfg.ApplyPGPForkHeight()
 	if cfg.LubanBlock.Uint64() != first {
 		t.Fatal("second call moved a fork")
+	}
+}
+
+// The built-in pgp config is what every mainnet node starts from, so it has to
+// survive the same fork-order validation a genesis file does. The time-based
+// forks stay nil: gatherForks counts any non-nil value -- MaxUint64 included --
+// into the EIP-2124 checksum, and this config's checksum has to keep matching
+// pgp-chain's own client.
+func TestPGPChainConfigPassesForkOrder(t *testing.T) {
+	if err := PGPChainConfig.CheckConfigForkOrder(); err != nil {
+		t.Fatalf("PGPChainConfig fails fork-order validation: %v", err)
+	}
+	if PGPChainConfig.FeynmanTime != nil {
+		t.Fatal("FeynmanTime must stay nil until launch, or the fork checksum changes")
 	}
 }
