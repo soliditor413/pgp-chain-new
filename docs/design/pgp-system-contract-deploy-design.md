@@ -243,6 +243,12 @@ jenner/pascal 版 `updateValidatorSetV2` 在 epoch 结束会对每个 incoming �
 
 **未定之前不应批准编码。**
 
+> **2026-11-05 决定**：时间型分叉（`KeplerTime` / `FeynmanTime` / `PascalTime` / `LorentzTime` / `MaxwellTime` / `CancunTime` 等）**全部先不启用**，只保留 `PGPChainConfig` 里既有的 `ShanghaiTime`（它早于创世时间，是 forkid 校验和的一部分，改动会让节点握手不上）。
+>
+> 直接后果：`IsFeynman` 恒 false ⇒ `updateValidatorSetV2` 不会被调用 ⇒ StakeHub 的选举与 `distributeReward` 路径休眠，**§7.5 的奖励全部流入 0x1002 的问题在当前配置下不触发**。0x2002 可以先部署但不参与共识，也可以先不部署。
+>
+> 反过来要注意：`Plato` 是**区块型**分叉，按 §5.1 的规则落在 `ForkHeight+1` ⇒ `IsPlato` 从 F+1 起为真 ⇒ `distributeFinalityReward` 会被调用，因此 `0x1000` 的字节码必须暴露该方法（pascal 产物有）。
+
 ---
 
 ## 8. 与 ForkHeight 的衔接
