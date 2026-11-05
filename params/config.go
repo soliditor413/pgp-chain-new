@@ -1579,6 +1579,12 @@ func (c *ChainConfig) CheckCompatible(newcfg *ChainConfig, height uint64, time u
 // CheckConfigForkOrder checks that we don't "skip" any forks, geth isn't pluggable enough
 // to guarantee that forks can be implemented in a different order than on official networks
 func (c *ChainConfig) CheckConfigForkOrder() error {
+	// Legacy deploy height first: a chain with Legacy configured but Parlia not
+	// yet enabled is exactly the one IsNotInBSC would skip, and it is the one
+	// that gets this wrong.
+	if err := c.checkDeployHeight(); err != nil {
+		return err
+	}
 	// skip checking for non-Parlia egine
 	if c.IsNotInBSC() {
 		return nil

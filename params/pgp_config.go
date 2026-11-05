@@ -19,6 +19,7 @@ package params
 import (
 	"bytes"
 	"encoding/hex"
+	"fmt"
 	"math"
 	"math/big"
 
@@ -41,6 +42,14 @@ type LegacyConfig struct {
 	// rules. It is a placeholder (math.MaxUint64) until the fork height is
 	// fixed, which keeps the whole chain on the legacy rules.
 	ForkHeight uint64 `json:"forkHeight,omitempty"`
+
+	// SystemContractDeployHeight is the block at which the pgp-chain system
+	// contracts are installed and initialised by the protocol. It must satisfy
+	// 1 <= SystemContractDeployHeight <= ForkHeight-2: the fork block reads the
+	// validator set from 0x1000, and one spare block is kept so a failed
+	// injection can be retried instead of halting the chain at the fork.
+	// Zero disables the injection (non-pgp chains).
+	SystemContractDeployHeight uint64 `json:"systemContractDeployHeight,omitempty"`
 
 	// GasFeeRecipient is the PG gas fee collector. Legacy rules route
 	// GasFeeRecipientRatio percent of every transaction fee to this address and
@@ -278,15 +287,19 @@ var (
 		BerlinBlock:         big.NewInt(3),
 		LondonBlock:         big.NewInt(3),
 		ShanghaiTime:        newUint64(1761657650),
+		LubanBlock:          big.NewInt(math.MaxInt64),
 		Parlia:              &ParliaConfig{},
 		Legacy: &LegacyConfig{
-			ForkHeight:           math.MaxUint64,
-			GasFeeRecipient:      DefaultGasFeeRecipient,
-			GasFeeRecipientRatio: DefaultGasFeeRecipientRatio,
-			PassBalance:          DefaultPassBalance,
-			DynamicArbiterHeight: DefaultDynamicArbiterHeight,
-			Producers:            DefaultLegacyProducers,
-			VerifySeal:           true,
+			ForkHeight:                math.MaxUint64,
+			GasFeeRecipient:           DefaultGasFeeRecipient,
+			GasFeeRecipientRatio:      DefaultGasFeeRecipientRatio,
+			PassBalance:               DefaultPassBalance,
+			DynamicArbiterHeight:      DefaultDynamicArbiterHeight,
+			Producers:                 DefaultLegacyProducers,
+			VerifySeal:                true,
+			ParliaGenesisValidators:   []string{},
+			ParliaGenesisVotingPowers: []uint64{},
+			ParliaGenesisCabinets:     21,
 		},
 	}
 )
@@ -304,6 +317,52 @@ func (c *ChainConfig) IsPGPLegacy(num *big.Int) bool {
 		return true
 	}
 	return num.Uint64() < c.Legacy.ForkHeight
+}
+
+// checkDeployHeight validates Legacy.SystemContractDeployHeight.
+//
+// It runs from CheckConfigForkOrder before the non-BSC early return, because a
+// legacy chain that has not configured Parlia yet is exactly the chain most
+// likely to get this wrong, and IsNotInBSC would otherwise skip the check.
+//
+// The rules, and why each exists:
+//
+//   - zero means "no injection", which is the only legal value on a chain with
+//     no fork at all (ForkHeight is a placeholder there);
+//   - one spare block below the fork, because the fork block reads the
+//     validator set out of 0x1000: if the injection fails at D the operator can
+//     still resync and retry at D+1 without the chain being stuck at the fork;
+//   - the deploy height has to be in the legacy era, because the very next
+//     Parlia block assumes the code exists, and the legacy rules are what
+//     produced every block up to ForkHeight-1.
+//
+// A negative value cannot be expressed: the field is uint64, so "D < 1" and
+// "D == 0" are the same rule and the zero case above already covers it.
+func (c *ChainConfig) checkDeployHeight() error {
+	if c == nil || c.Legacy == nil {
+		return nil
+	}
+	d := c.Legacy.SystemContractDeployHeight
+	if d == 0 {
+		return nil
+	}
+	f := c.Legacy.ForkHeight
+	if f == 0 || f == math.MaxUint64 {
+		return fmt.Errorf("legacy.systemContractDeployHeight = %d requires a fixed legacy.forkHeight, got %d", d, f)
+	}
+	if f < 3 {
+		return fmt.Errorf("legacy.forkHeight %d leaves no room for a system contract deploy height: it must be at "+
+			"least 3 so that 1 <= deployHeight <= forkHeight-2", f)
+	}
+	if d > f-2 {
+		return fmt.Errorf("legacy.systemContractDeployHeight %d must be at most forkHeight-2 (%d, forkHeight %d): "+
+			"the fork block reads the validator set from 0x1000, and the spare block allows a retry", d, f-2, f)
+	}
+	if !c.IsPGPLegacy(new(big.Int).SetUint64(d)) {
+		return fmt.Errorf("legacy.systemContractDeployHeight %d is not in the legacy era (forkHeight %d): the "+
+			"contracts have to be installed before the fork", d, f)
+	}
+	return nil
 }
 
 // IsPGPLegacyAt is IsPGPLegacy for call sites that work with (number, time).
