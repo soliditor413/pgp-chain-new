@@ -6,7 +6,7 @@
 // the Free Software Foundation, either version 3 of the License, or
 // (at your option) any later version.
 
-package pgp
+package pgpinit
 
 // This file builds the arguments of BSCValidatorSet.init(bytes,uint256).
 //

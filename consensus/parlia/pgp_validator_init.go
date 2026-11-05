@@ -21,7 +21,7 @@ import (
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
-	"github.com/ethereum/go-ethereum/core/systemcontracts/pgp"
+	"github.com/ethereum/go-ethereum/core/systemcontracts/pgpinit"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
@@ -55,17 +55,17 @@ import (
 // protocol's deployment step (core/pgp_systemcontract_deploy.go) needs the same
 // bytes, and core cannot import parlia. These are the thin local names the
 // engine's own callers and tests keep using.
-type pgpGenesisValidatorSet = pgp.ValidatorSet
+type pgpGenesisValidatorSet = pgpinit.ValidatorSet
 
 // newPGPGenesisValidatorSet validates LegacyConfig's validator fields through
 // the shared encoder.
 func newPGPGenesisValidatorSet(cfg *params.LegacyConfig) (*pgpGenesisValidatorSet, error) {
-	return pgp.FromLegacy(cfg)
+	return pgpinit.FromLegacy(cfg)
 }
 
 // pgpValidatorInitArgs builds the two arguments BSCValidatorSet.init takes.
 func pgpValidatorInitArgs(cfg *params.LegacyConfig) ([]byte, uint64, error) {
-	return pgp.ValidatorInitArgs(cfg)
+	return pgpinit.ValidatorInitArgs(cfg)
 }
 
 // pgpValidatorSetInitSelector is the 4-byte selector of
