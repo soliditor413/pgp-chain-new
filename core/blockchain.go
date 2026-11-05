@@ -871,13 +871,19 @@ func (bc *BlockChain) loadLastState() error {
 	//
 	// This runs before any InsertChain, so an operator finds out at startup
 	// rather than after the node has already accepted blocks.
+	//
+	// A state that cannot be opened is NOT evidence of a bad database. After a
+	// hard kill the head state is often only partially flushed, and the node
+	// recovers by rewinding and re-syncing; refusing to start on that would
+	// brick a perfectly good datadir. Only the case that can actually be read
+	// and is definitely missing the code is fatal.
 	if legacy := bc.chainConfig.Legacy; legacy != nil && legacy.SystemContractDeployHeight > 0 {
 		if headNumber := headBlock.NumberU64(); headNumber >= legacy.SystemContractDeployHeight {
 			statedb, err := bc.StateAt(headHeader)
 			if err != nil {
-				return fmt.Errorf("failed to open the state at head %d to verify the system contracts: %w", headNumber, err)
-			}
-			if err := checkSystemContractsAtHead(legacy, headNumber, statedb); err != nil {
+				log.Warn("Cannot read the head state, skipping the system-contract check",
+					"head", headNumber, "deployHeight", legacy.SystemContractDeployHeight, "err", err)
+			} else if err := checkSystemContractsAtHead(legacy, headNumber, statedb); err != nil {
 				return err
 			}
 		}
