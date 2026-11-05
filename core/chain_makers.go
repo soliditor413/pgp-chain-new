@@ -428,6 +428,13 @@ func GenerateChain(config *params.ChainConfig, parent *types.Block, engine conse
 		b.lane = lane
 
 		systemcontracts.TryUpdateBuildInSystemContract(config, b.header.Number, parent.Time(), b.header.Time, statedb, true)
+
+		// Deploy the pgp system contracts at the configured height. GenerateChain has
+		// no error return; the lane resolution above panics for the same reason, and a
+		// chain built past the deploy height must match what a real node executes.
+		if err := TryDeployPGPSystemContracts(config, b.header, cm, statedb, vm.Config{}); err != nil {
+			panic(fmt.Errorf("deploying the pgp system contracts at block %v: %w", b.header.Number, err))
+		}
 		if config.IsPrague(b.header.Number, b.header.Time) || config.IsUBT(b.header.Number, b.header.Time) {
 			// EIP-2935
 			blockContext := NewEVMBlockContext(b.header, cm, &b.header.Coinbase)

@@ -253,6 +253,10 @@ func (eth *Ethereum) stateAtTransaction(ctx context.Context, block *types.Block,
 	}
 	// upgrade built-in system contract before normal txs if Feynman is not enabled
 	systemcontracts.TryUpdateBuildInSystemContract(eth.blockchain.Config(), block.Number(), parent.Time(), block.Time(), statedb, true)
+
+	if err := core.TryDeployPGPSystemContracts(eth.blockchain.Config(), block.Header(), eth.blockchain, statedb, vm.Config{}); err != nil {
+		return nil, vm.BlockContext{}, nil, nil, err
+	}
 	// Insert parent beacon block root in the state as per EIP-4788.
 	context := core.NewEVMBlockContext(block.Header(), eth.blockchain, nil)
 	evm := vm.NewEVM(context, statedb, eth.blockchain.Config(), vm.Config{})

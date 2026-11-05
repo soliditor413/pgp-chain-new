@@ -1369,6 +1369,10 @@ func (api *BlockChainAPI) replay(ctx context.Context, block *types.Block, accoun
 	// system contracts touched here keep their parent values and transactions reading them diverge.
 	config := api.b.ChainConfig()
 	systemcontracts.TryUpdateBuildInSystemContract(config, block.Number(), parent.Time(), block.Time(), statedb, true)
+
+	if err := core.TryDeployPGPSystemContracts(config, block.Header(), api.b.Chain(), statedb, vm.Config{}); err != nil {
+		return nil, nil, err
+	}
 	evm := vm.NewEVM(core.NewEVMBlockContext(block.Header(), api.b.Chain(), nil), statedb, config, vm.Config{})
 	defer evm.Release()
 	if beaconRoot := block.BeaconRoot(); beaconRoot != nil {

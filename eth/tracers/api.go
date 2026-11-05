@@ -396,6 +396,11 @@ func (api *API) traceChain(start, end *types.Block, config *TraceConfig, closed 
 			// upgrade built-in system contract before normal txs if Feynman is not enabled
 			systemcontracts.TryUpdateBuildInSystemContract(api.backend.ChainConfig(), next.Number(), block.Time(), next.Time(), statedb, true)
 
+			if err := core.TryDeployPGPSystemContracts(api.backend.ChainConfig(), next.Header(), api.chainContext(ctx), statedb, vm.Config{}); err != nil {
+				failed = err
+				break
+			}
+
 			// Insert block's parent beacon block root in the state
 			// as per EIP-4788.
 			context := core.NewEVMBlockContext(next.Header(), api.chainContext(ctx), nil)
@@ -549,6 +554,10 @@ func (api *API) IntermediateRoots(ctx context.Context, hash common.Hash, config 
 	// upgrade built-in system contract before normal txs if Feynman is not enabled
 	systemcontracts.TryUpdateBuildInSystemContract(api.backend.ChainConfig(), block.Number(), parent.Time(), block.Time(), statedb, true)
 
+	if err := core.TryDeployPGPSystemContracts(api.backend.ChainConfig(), block.Header(), api.chainContext(ctx), statedb, vm.Config{}); err != nil {
+		return nil, err
+	}
+
 	var (
 		roots              []common.Hash
 		signer             = types.MakeSigner(api.backend.ChainConfig(), block.Number(), block.Time())
@@ -639,6 +648,10 @@ func (api *API) traceBlock(ctx context.Context, block *types.Block, config *Trac
 
 	// upgrade built-in system contract before normal txs if Feynman is not enabled
 	systemcontracts.TryUpdateBuildInSystemContract(api.backend.ChainConfig(), block.Number(), parent.Time(), block.Time(), statedb, true)
+
+	if err := core.TryDeployPGPSystemContracts(api.backend.ChainConfig(), block.Header(), api.chainContext(ctx), statedb, vm.Config{}); err != nil {
+		return nil, err
+	}
 	blockCtx := core.NewEVMBlockContext(block.Header(), api.chainContext(ctx), nil)
 	evm := vm.NewEVM(blockCtx, statedb, api.backend.ChainConfig(), vm.Config{})
 	defer evm.Release()
@@ -836,6 +849,10 @@ func (api *API) standardTraceBlockToFile(ctx context.Context, block *types.Block
 
 	// upgrade built-in system contract before normal txs if Feynman is not enabled
 	systemcontracts.TryUpdateBuildInSystemContract(api.backend.ChainConfig(), block.Number(), parent.Time(), block.Time(), statedb, true)
+
+	if err := core.TryDeployPGPSystemContracts(api.backend.ChainConfig(), block.Header(), api.chainContext(ctx), statedb, vm.Config{}); err != nil {
+		return nil, err
+	}
 
 	// Retrieve the tracing configurations, or use default values
 	var (
@@ -1067,6 +1084,10 @@ func (api *API) TraceCall(ctx context.Context, args ethapi.TransactionArgs, bloc
 			return nil, err
 		}
 		systemcontracts.TryUpdateBuildInSystemContract(api.backend.ChainConfig(), block.Number(), parent.Time(), block.Time(), statedb, true)
+
+		if err := core.TryDeployPGPSystemContracts(api.backend.ChainConfig(), block.Header(), api.chainContext(ctx), statedb, vm.Config{}); err != nil {
+			return nil, err
+		}
 	}
 
 	h := block.Header()

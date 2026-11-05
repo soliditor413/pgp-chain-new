@@ -1208,6 +1208,12 @@ func (w *worker) prepareWork(genParams *generateParams, witness bool) (*environm
 	// Handle upgrade built-in system contract code
 	systemcontracts.TryUpdateBuildInSystemContract(w.chainConfig, header.Number, parent.Time, header.Time, env.state, true)
 
+	// Install and initialise the pgp system contracts on the deployment block.
+	// Failing here means this node must not produce the block at all.
+	if err := core.TryDeployPGPSystemContracts(w.chainConfig, header, w.chain, env.state, env.evm.Config); err != nil {
+		return nil, err
+	}
+
 	if header.ParentBeaconRoot != nil {
 		core.ProcessBeaconBlockRoot(*header.ParentBeaconRoot, env.evm)
 	}

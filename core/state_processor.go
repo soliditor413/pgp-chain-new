@@ -162,6 +162,14 @@ func (p *StateProcessor) Process(ctx context.Context, block *types.Block, stated
 	// Handle upgrade built-in system contract code
 	systemcontracts.TryUpdateBuildInSystemContract(p.chain.Config(), blockNumber, lastBlock.Time, block.Time(), statedb, true)
 
+	// Install and initialise the pgp system contracts on the deployment block,
+	// before any transaction runs. A failure here makes the block invalid; it is
+	// returned rather than panicked so an imported bad block cannot take the node
+	// down.
+	if err := TryDeployPGPSystemContracts(config, header, p.chain, statedb, cfg); err != nil {
+		return nil, err
+	}
+
 	var (
 		context vm.BlockContext
 		signer  = types.MakeSigner(p.chain.Config(), header.Number, header.Time)
