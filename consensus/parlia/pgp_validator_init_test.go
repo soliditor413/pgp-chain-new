@@ -345,38 +345,6 @@ func TestNewPGPInitPlanBuildsForForkedChain(t *testing.T) {
 	}
 }
 
-// TestIsPGPInitBlock checks the predicate that replaces upstream's `number == 1`.
-func TestIsPGPInitBlock(t *testing.T) {
-	cfg := &params.ChainConfig{ChainID: big.NewInt(1), Legacy: devnetLegacyConfig()}
-	plan, err := newPGPInitPlan(cfg)
-	if err != nil {
-		t.Fatalf("newPGPInitPlan: %v", err)
-	}
-	p := &Parlia{chainConfig: cfg, pgpInit: plan}
-
-	for _, tc := range []struct {
-		number *big.Int
-		want   bool
-	}{
-		{big.NewInt(0), false},
-		{big.NewInt(1), false}, // block 1 is legacy here, not the init block
-		{big.NewInt(1099), false},
-		{big.NewInt(1100), true},
-		{big.NewInt(1101), false},
-		{nil, false},
-	} {
-		if got := p.isPGPInitBlock(tc.number); got != tc.want {
-			t.Errorf("isPGPInitBlock(%v) = %v, want %v", tc.number, got, tc.want)
-		}
-	}
-
-	// Without a plan there is never an init block.
-	empty := &Parlia{chainConfig: cfg}
-	if empty.isPGPInitBlock(big.NewInt(1100)) {
-		t.Error("isPGPInitBlock must be false when no init plan exists")
-	}
-}
-
 // TestPGPSnapshotAnchorNumber checks the anchor height.
 func TestPGPSnapshotAnchorNumber(t *testing.T) {
 	cfg := &params.ChainConfig{ChainID: big.NewInt(1), Legacy: devnetLegacyConfig()}

@@ -330,9 +330,13 @@ func pgpValidatorInitArgs(cfg *params.LegacyConfig) (payload []byte, cabinets ui
 	return payload, set.Cabinets, nil
 }
 
-// pgpInitPlan is the pre-computed init() calldata, built once at engine
-// construction so that a bad validator configuration fails at startup rather
-// than at ForkHeight, i.e. right when the chain is supposed to switch over.
+// pgpInitPlan is the pre-computed validator init arguments, built once at
+// engine construction so that a bad validator configuration fails at startup
+// rather than at the block that would consume it. Consumers: the deploy-time
+// injection (core/systemcontracts/deploy_pgp.go) and the startup log.
+//
+// The calldata is deliberately not packed here: Pack needs the ABI, and the
+// deploy step builds it where the ABI is already needed for the selector.
 type pgpInitPlan struct {
 	// payload is the RLP blob passed as the first init() argument.
 	payload []byte
@@ -363,17 +367,24 @@ func newPGPInitPlan(chainConfig *params.ChainConfig) (*pgpInitPlan, error) {
 	return &pgpInitPlan{payload: payload, cabinets: cabinets}, nil
 }
 
-// isPGPInitBlock reports whether the system contracts have to be initialised in
-// this block, i.e. whether it is the first Parlia block.
+// shouldInitContract reports whether Finalize/FinalizeAndAssemble run the
+// system-contract initialisation for this block.
 //
-// Upstream only ever inits in block 1. On this chain the role of block 1 is
-// played by block ForkHeight, because that is where the Parlia state - and with
-// it the system contracts that Parlia creates - begins.
-func (p *Parlia) isPGPInitBlock(number *big.Int) bool {
-	if p.pgpInit == nil || number == nil {
+// Block 1 only. Upstream initialises there and so does this chain: block 1 is a
+// legacy block whose alloc carries no code, so the call is a no-op, and
+// replaying the history depends on it staying a no-op.
+//
+// The Parlia-era initialisation deliberately does NOT run here any more. It
+// happens at Legacy.SystemContractDeployHeight, before the fork block, in the
+// protocol's own deployment step (core/systemcontracts/deploy_pgp.go), which
+// installs real code and initialises it. Running initContract at ForkHeight as
+// well would send init() to contracts that are already initialised, they would
+// revert, and the revert would fail the fork block and halt the chain.
+func (p *Parlia) shouldInitContract(number *big.Int) bool {
+	if number == nil {
 		return false
 	}
-	return number.Uint64() == p.chainConfig.Legacy.ForkHeight
+	return number.Cmp(common.Big1) == 0
 }
 
 // pgpSnapshotAnchorNumber returns the height at which the Parlia snapshot

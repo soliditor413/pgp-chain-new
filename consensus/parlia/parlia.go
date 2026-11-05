@@ -320,14 +320,16 @@ func New(
 	if err != nil {
 		panic(err)
 	}
-	// Build the init() calldata once, here, so that a malformed validator set in
-	// the chain config stops the node at startup instead of at ForkHeight.
+	// Build the init calldata once, here, so that a malformed validator set in
+	// the chain config stops the node at startup instead of at the block that
+	// needs it. The calldata itself is consumed by the deploy-time injection
+	// (core/systemcontracts/deploy_pgp.go), not by initContract.
 	pgpInit, err := newPGPInitPlan(chainConfig)
 	if err != nil {
 		panic(fmt.Sprintf("invalid parlia genesis validator set: %v", err))
 	}
 	if pgpInit != nil {
-		log.Info("Parlia init injection enabled",
+		log.Info("Parlia genesis validator set configured",
 			"forkHeight", chainConfig.Legacy.ForkHeight,
 			"validators", len(chainConfig.Legacy.ParliaGenesisValidators),
 			"cabinets", pgpInit.cabinets,
@@ -1538,10 +1540,16 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 
 	// No block rewards in PoA, so the state remains as is and uncles are dropped
 	//
-	// On a chain that switches to Parlia at ForkHeight, the role of block 1 is
-	// played by block ForkHeight: that is the first block Parlia executes, so it
-	// is where the system contracts have to be created.
-	if header.Number.Cmp(common.Big1) == 0 || p.isPGPInitBlock(header.Number) {
+	// Upstream initialises the system contracts in block 1, and so does this
+	// chain: block 1 is a legacy block whose alloc carries no code, so the call
+	// is a no-op, and replaying history depends on it staying that way.
+	//
+	// The Parlia-era initialisation does NOT happen here any more. It happens at
+	// Legacy.SystemContractDeployHeight, in the protocol, before the fork block
+	// (core/systemcontracts/deploy_pgp.go). Initialising at ForkHeight as well
+	// would revert every contract: they are already initialised by then, and a
+	// revert here fails the block and halts the chain at the fork.
+	if p.shouldInitContract(header.Number) {
 		err := p.initContract(state, header, cx, txs, receipts, systemTxs, usedGas, systemTxImporting, tracer)
 		if err != nil {
 			return fmt.Errorf("init contract failed: %w", err)
@@ -1649,7 +1657,10 @@ func (p *Parlia) finalizeAndAssemble(chain consensus.ChainHeaderReader, header *
 		}
 	}
 
-	if header.Number.Cmp(common.Big1) == 0 || p.isPGPInitBlock(header.Number) {
+	// See Finalize: only block 1 initialises the system contracts here. The
+	// Parlia-era set is installed at Legacy.SystemContractDeployHeight instead,
+	// so re-initialising at ForkHeight would revert and halt the chain.
+	if p.shouldInitContract(header.Number) {
 		err := p.initContract(state, header, cx, &body.Transactions, &receipts, nil, &header.GasUsed, mode, tracer)
 		if err != nil {
 			return nil, nil, errors.New("init contract failed")
@@ -2163,34 +2174,22 @@ func (p *Parlia) initContract(state vm.StateDB, header *types.Header, chain core
 		systemcontracts.RelayerIncentivizeContract,
 		systemcontracts.CrossChainContract,
 	}
-	// On a chain that switches to Parlia at ForkHeight, the validator set has to
-	// travel with the init call instead of being read out of the bytecode, so
-	// the validator contract gets a different calldata from the other six.
+	// Every contract receives the bare init() selector.
 	//
-	// Everything else keeps receiving the bare init() selector, which is what
-	// upstream sent to all seven contracts. It can no longer be packed from
-	// validatorSetABI - that ABI now describes init(bytes,uint256) and nothing
-	// else - so it comes from pgpPlainInitSelector, which evaluates to the same
-	// 0xe1c7392a the old no-argument ABI method id produced.
-	validatorSetData := pgpPlainInitSelector
-	if p.isPGPInitBlock(header.Number) {
-		packed, err := p.validatorSetABI.Pack("init", p.pgpInit.payload, new(big.Int).SetUint64(p.pgpInit.cabinets))
-		if err != nil {
-			log.Error("Unable to pack tx for init validator set", "error", err)
-			return err
-		}
-		validatorSetData = packed
-		log.Info("Initializing validator set from chain config",
-			"block", header.Number.Uint64(),
-			"cabinets", p.pgpInit.cabinets,
-			"payloadLen", len(p.pgpInit.payload))
-	}
-
+	// The validator contract is no exception any more. Its init(bytes,uint256)
+	// is sent once, at Legacy.SystemContractDeployHeight, by the protocol's own
+	// deployment step (core/systemcontracts/deploy_pgp.go), which is the only
+	// place that has both the validator set and an EVM for that block. Sending
+	// it here as well would revert: by ForkHeight every contract is already
+	// initialised, and a revert fails the block.
+	//
+	// The selector comes from pgpPlainInitSelector rather than from
+	// validatorSetABI, which describes init(bytes,uint256) and has no
+	// no-argument init() left to Pack. It is the same 0xe1c7392a upstream's
+	// no-argument method id produced, so the seven contracts keep receiving
+	// exactly the calldata they always did.
 	for _, c := range contracts {
 		data := pgpPlainInitSelector
-		if c == systemcontracts.ValidatorContract {
-			data = validatorSetData
-		}
 		msg := p.getSystemMessage(header.Coinbase, common.HexToAddress(c), data, common.Big0)
 		// apply message
 		log.Trace("init contract", "block hash", header.Hash(), "contract", c)
