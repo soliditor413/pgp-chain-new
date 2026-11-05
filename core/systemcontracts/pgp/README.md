@@ -108,10 +108,12 @@ and an import in both directions is a cycle. The external test package asserts
 the same property without that constraint.
 
 `imageHash` is `keccak256(UTF8(canonicalJSON(entries)))` — keys sorted, no
-whitespace, numbers as decimal strings, arrays in order. Provenance fields are
+whitespace, integers emitted verbatim as JSON numbers (plain compact JSON, not a
+custom "numbers as strings" dialect), arrays in order. Provenance fields are
 excluded, so the same image built from a different git state keeps the same
 hash. `image_test.go` recomputes it with an encoder written independently of both
-the generator and `image.go`.
+the generator and `image.go`, and pins the expected literal so any encoding drift
+turns red immediately.
 
 Design rationale (deploy height, initialisation order, what is still open) lives
 in `docs/design/pgp-system-contract-deploy-design.md`; this file documents the

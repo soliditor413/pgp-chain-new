@@ -20,6 +20,7 @@ import (
 	"math/big"
 	"os"
 	"sort"
+	"strconv"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -29,10 +30,11 @@ import (
 )
 
 // canonicalJSON is the imageHash serialisation (design doc §7.4), written here
-// independently of the generator: keys sorted, no whitespace, UTF-8, numbers as
-// decimal strings, arrays in order. Independence is the point -- if the test
-// reused the generator's or image.go's encoder, a shared mistake would agree
-// with itself and prove nothing.
+// independently of the generator: keys sorted, no whitespace, UTF-8, arrays in
+// order, and integers emitted VERBATIM as JSON numbers (unquoted) -- plain
+// compact JSON, which is what every stdlib reproduces. Independence is the
+// point: if the test reused the generator's or image.go's encoder, a shared
+// mistake would agree with itself and prove nothing.
 func canonicalJSON(t *testing.T, v any) string {
 	t.Helper()
 	switch x := v.(type) {
@@ -44,7 +46,9 @@ func canonicalJSON(t *testing.T, v any) string {
 		}
 		return "false"
 	case json.Number:
-		// Already the decimal text; the rule is "numbers are decimal strings".
+		// json.Number.String() is the decimal text exactly as it appeared;
+		// emitting it unquoted is the rule, and quoting it here is the mistake
+		// the pinning test below exists to catch.
 		return x.String()
 	case string:
 		b, err := json.Marshal(x)
@@ -315,4 +319,94 @@ func TestEntriesAreSorted(t *testing.T) {
 			t.Fatalf("entries are not in ascending address order: %s before %s", prev, cur)
 		}
 	}
+}
+
+// wantImageHash is the imageHash literal: the third opinion.
+//
+// TestImageHashRecomputes above proves that the encoder and manifest.json agree
+// with each other -- which a shared mistake would also satisfy, and did: an
+// earlier revision of the comments described "numbers as decimal strings" while
+// the code emitted them verbatim, so a reader self-checking against the comment
+// would have concluded the opposite of what the bytes said. This constant is not
+// derived at test time from anything in the tree: it was produced when the image
+// landed and independently cross-checked with `cast keccak`. Any drift -- in the
+// generator's rules, in this encoder, or in the entries themselves -- turns red
+// here, which is what design doc §7.4 means by "规范形态由钉子测试保证".
+const wantImageHash = "0xf2e29a3c51531a2a32a9a98e94e101bc929d199e770738b62973f2f9c3978a6a"
+
+// TestImageHashIsPinned breaks the circularity: encoder-vs-manifest, encoder-vs-
+// literal, and a negative control proving the literal is not satisfied by
+// anything at all.
+func TestImageHashIsPinned(t *testing.T) {
+	want := common.HexToHash(wantImageHash)
+
+	doc := readManifest(t)
+	entries, ok := doc["entries"].([]any)
+	if !ok {
+		t.Fatalf("manifest entries is not an array")
+	}
+
+	// 1. The encoder in this file must produce the pinned value. A failure here
+	//    is an implementation drift: the serialisation rule changed under us.
+	if got := crypto.Keccak256Hash([]byte(canonicalJSON(t, entries))); got != want {
+		t.Fatalf("canonical encoder drifted: it hashes to %s, the pinned imageHash is %s. "+
+			"Design doc §7.4 fixes the form (keys sorted, compact, integers verbatim, entries only); "+
+			"do not update this constant to match a new encoder without deciding that change explicitly",
+			got, want)
+	}
+
+	// 2. The manifest's own claim must equal the same literal. A failure here
+	//    means manifest.json was edited by hand or regenerated from different
+	//    artifacts -- not that the encoder is wrong.
+	declared, ok := doc["imageHash"].(string)
+	if !ok {
+		t.Fatalf("manifest imageHash is not a string")
+	}
+	if common.HexToHash(declared) != want {
+		t.Fatalf("manifest.json declares imageHash %s, but the pinned value is %s: the file was edited or "+
+			"regenerated; regenerate with scripts/pgp-image-gen.py instead of hand-editing", declared, want)
+	}
+
+	// 3. Negative control: if a one-byte change to an entry still hashed to the
+	//    pinned value, the assertion above would be vacuous (a constant-returning
+	//    encoder would pass it). Mutating codeLen by one changes the canonical
+	//    bytes without needing any keccak of its own.
+	if got := crypto.Keccak256Hash([]byte(canonicalJSON(t, decrementCodeLen(t, entries, 0)))); got == want {
+		t.Fatalf("pinned imageHash is satisfied by a mutated entry: the canonical encoder or this test is " +
+			"vacuous")
+	}
+}
+
+// decrementCodeLen returns a deep copy of entries with entries[idx].codeLen
+// reduced by one, leaving the caller's decoded manifest untouched.
+func decrementCodeLen(t *testing.T, entries []any, idx int) []any {
+	t.Helper()
+
+	out := make([]any, len(entries))
+	copy(out, entries)
+	for i, raw := range entries {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			t.Fatalf("entry %d is not an object", i)
+		}
+		clone := make(map[string]any, len(m))
+		for k, v := range m {
+			clone[k] = v
+		}
+		out[i] = clone
+	}
+	entry, ok := out[idx].(map[string]any)
+	if !ok {
+		t.Fatalf("entry %d is not an object", idx)
+	}
+	num, ok := entry["codeLen"].(json.Number)
+	if !ok {
+		t.Fatalf("entry %d has no numeric codeLen, so the canonical form under test is not the shipped one", idx)
+	}
+	n, err := strconv.ParseInt(num.String(), 10, 64)
+	if err != nil {
+		t.Fatalf("entry %d codeLen %q is not an integer: %v", idx, num, err)
+	}
+	entry["codeLen"] = json.Number(strconv.FormatInt(n-1, 10))
+	return out
 }

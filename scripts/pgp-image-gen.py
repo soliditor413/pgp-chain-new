@@ -100,9 +100,13 @@ def keccak_selftest():
 def canonical_json(value):
     """Canonical serialisation for imageHash (design doc §7.4).
 
-    Object keys sorted, no whitespace, UTF-8, numbers as decimal strings, arrays
-    keep their order. Only the entries array is ever canonicalised: provenance
-    (sourceCommit / dirtyDiffSha256) is excluded so the same image built from a
+    Keys sorted, no whitespace, UTF-8, arrays keep their order, and integers are
+    emitted VERBATIM as JSON numbers (unquoted) -- that is plain compact JSON, so
+    any language's stdlib reproduces it. Booleans are true/false literals; this
+    image has no floats and the spec forbids them.
+
+    Only the entries array is ever canonicalised: provenance (sourceCommit /
+    dirtyDiffSha256 / foundry) is excluded so the same image built from a
     different git state keeps the same hash.
     """
     if isinstance(value, bool):
