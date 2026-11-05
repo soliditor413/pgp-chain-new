@@ -62,6 +62,14 @@ VERBOSITY=${VERBOSITY:-3}
 # 预留的 2000 万在 4000 万上限里看不出对用户交易的实际挤压。
 GAS_LIMIT=${GAS_LIMIT:-0x2625a00}
 MINER_GAS_LIMIT=${MINER_GAS_LIMIT:-30000000}
+# 协议注入（Legacy.systemContractDeployHeight）。设成非 0 时，17 个系统合约
+# 不再由 genesis alloc 带进来，而是在这个高度的块首由协议 SetCode + init。
+#   DEPLOY_HEIGHT=38 OMIT_SYSTEM_ALLOC=1 ./multi.sh init 6 40
+# 注意：D 必须 >= 2（EIP-150）且 <= ForkHeight-2。
+DEPLOY_HEIGHT=${DEPLOY_HEIGHT:-0}
+OMIT_SYSTEM_ALLOC=${OMIT_SYSTEM_ALLOC:-0}
+# 1 = lubanBlock 钉哨兵（Luban 不启用，全程 pre-Luban 的 extraData 格式）。
+LUBAN_SENTINEL=${LUBAN_SENTINEL:-0}
 
 mkdir -p "$LOG_DIR"
 
@@ -148,12 +156,18 @@ print(m["producers"][0])
     echo "legacy 生产者（自派生 P-256，与主网无关）: $prod"
   fi
 
+  local -a deploy_args=()
+  [ "$DEPLOY_HEIGHT" != "0" ] && deploy_args+=(--deploy-height "$DEPLOY_HEIGHT")
+  [ "$OMIT_SYSTEM_ALLOC" != "0" ] && deploy_args+=(--omit-system-contract-alloc)
+  [ "$LUBAN_SENTINEL" != "0" ] && deploy_args+=(--luban-sentinel)
+
   python3 "$SELF_DIR/gen-genesis.py" \
     --contracts-out "$CONTRACT_ROOT/out" \
     --validators "$HOME_DIR/validators.conf" \
     --fork-height "$fork_height" \
     --cabinets "$seats" \
     --gas-limit "$GAS_LIMIT" \
+    "${deploy_args[@]}" \
     "${producer_args[@]}" \
     "${balances[@]}" \
     --out "$GENESIS"

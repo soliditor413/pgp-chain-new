@@ -53,6 +53,12 @@ CONTRACTS = [
 # 也是所有系统交易的 from。模板里的值是 0xffff…fFFE，保持一致。
 SYSTEM_COINBASE = "0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE"
 
+# lubanBlock 的哨兵值：与 Legacy.ForkHeight 的 math.MaxUint64 是同一套约定
+# ——「排在这个高度」在执行上等价于「永不启用」，因为区块高度到不了这里。
+# params.CheckConfigForkOrder 会把 >= math.MaxInt64 的块型 fork 当作未排期，
+# 所以它不会要求 planck 等前驱分叉先被启用，也不会约束 plato 等后继分叉。
+LUBAN_SENTINEL = 2**63 - 1
+
 
 def load_bytecode(out_dir: str, sol_file: str, name: str) -> str:
     path = os.path.join(out_dir, sol_file, name + ".json")
@@ -128,8 +134,9 @@ def build_config(args, validators):
         "planckBlock": 0,
         "berlinBlock": 0,
         "londonBlock": 0,
-        # 现代档，与共识切换同高度
-        "lubanBlock": args.fork_height,
+        # 现代档，与共识切换同高度。lubanBlock 单独处理：哨兵值表示不启用，
+        # 见 --luban-sentinel。
+        "lubanBlock": LUBAN_SENTINEL if args.luban_sentinel else args.fork_height,
         "platoBlock": args.fork_height,
         "hertzBlock": args.fork_height,
         "hertzfixBlock": args.fork_height,
@@ -137,6 +144,8 @@ def build_config(args, validators):
         "parlia": {},
         "legacy": {
             "forkHeight": args.fork_height,
+            # 0 表示不启用协议注入（旧行为：代码由下面的 alloc 带进来）。
+            "systemContractDeployHeight": args.deploy_height,
             "gasFeeRecipient": args.gas_fee_recipient,
             "gasFeeRecipientRatio": args.gas_fee_recipient_ratio,
             "passBalance": 0,
@@ -177,11 +186,32 @@ def main() -> int:
     ap.add_argument("--verify-seal", choices=["true", "false"], default=None,
                     help="是否校验 PBFT confirm。默认在有 producers 时为 true，否则 false")
     ap.add_argument("--out", required=True)
+    ap.add_argument("--deploy-height", type=int, default=0,
+                    help="Legacy.systemContractDeployHeight：协议在这个高度安装并初始化 17 个"
+                         "系统合约。0 表示不启用（沿用 genesis alloc 带代码的旧行为）。"
+                         "启用时必须满足 2 <= D <= ForkHeight-2。")
+    ap.add_argument("--luban-sentinel", action="store_true",
+                    help="把 lubanBlock 钉在哨兵高度，表示 Luban 不启用：引擎全程走 "
+                         "pre-Luban 的 extraData 格式（无 validator count 前缀、无 BLS 公钥、"
+                         "无 vote attestation）。不写这个开关时 lubanBlock 与 ForkHeight 同高。")
+    ap.add_argument("--omit-system-contract-alloc", action="store_true",
+                    help="不把 17 个系统合约写进 genesis alloc，让 0x1000..0x3000 在 D 块之前"
+                         "保持空账户，由协议注入安装。配合 --deploy-height 使用。")
     args = ap.parse_args()
 
     validators = parse_validators(args.validators)
     if args.fork_height <= 0:
         sys.exit("--fork-height 必须 > 0；这里是「从哪个高度起切 Parlia」，不是「Parlia 从 0 开始」")
+    if args.deploy_height:
+        if args.deploy_height < 2:
+            sys.exit("--deploy-height 必须 >= 2：12 个初始化调用会把剩余 gas 全部转发给"
+                     "子调用，EIP-150 的 63/64 上限没生效时会在扣费阶段直接 out of gas")
+        if args.deploy_height > args.fork_height - 2:
+            sys.exit(f"--deploy-height={args.deploy_height} 必须 <= fork-height-2="
+                     f"{args.fork_height - 2}：ForkHeight 块要读 0x1000 的验证人集合，"
+                     "并留一个块给注入失败时补救")
+    elif args.omit_system_contract_alloc:
+        sys.exit("--omit-system-contract-alloc 必须配 --deploy-height，否则 0x1000 永远没有代码")
     if args.cabinets and args.cabinets != len(validators):
         sys.exit(f"--cabinets={args.cabinets} 与验证人数 {len(validators)} 不一致")
 
@@ -217,8 +247,14 @@ def main() -> int:
     args.verify_seal = verify_seal
 
     alloc = {}
-    for addr, name, sol in CONTRACTS:
-        alloc[addr] = {"balance": "0x0", "code": load_bytecode(args.contracts_out, sol, name)}
+    if args.omit_system_contract_alloc:
+        # 0x1000..0x3000 保持空账户：这正是线上 pgp-chain 的形态（创世已上线、
+        # alloc 不可改），代码与初始状态改由 D 块的协议注入安装。冒烟必须走这条
+        # 路，否则「D 之前没有代码」这个前提根本没被验证过。
+        pass
+    else:
+        for addr, name, sol in CONTRACTS:
+            alloc[addr] = {"balance": "0x0", "code": load_bytecode(args.contracts_out, sol, name)}
     alloc[SYSTEM_COINBASE.lower()] = {"balance": "0x0"}
 
     for item in args.balance:
