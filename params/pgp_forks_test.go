@@ -82,10 +82,68 @@ func TestApplyPGPForkHeightIsIdempotent(t *testing.T) {
 // into the EIP-2124 checksum, and this config's checksum has to keep matching
 // pgp-chain's own client.
 func TestPGPChainConfigPassesForkOrder(t *testing.T) {
-	if err := PGPChainConfig.CheckConfigForkOrder(); err != nil {
+	// The production path applies ApplyPGPForkHeight before validating
+	// (core/genesis.go), so validating the bare literal checks a configuration
+	// that never runs. Copy first: Apply mutates, and the global must stay
+	// pristine for the other tests in this package.
+	cfg := *PGPChainConfig
+	cfg.ApplyPGPForkHeight()
+	if err := cfg.CheckConfigForkOrder(); err != nil {
 		t.Fatalf("PGPChainConfig fails fork-order validation: %v", err)
 	}
 	if PGPChainConfig.FeynmanTime != nil {
 		t.Fatal("FeynmanTime must stay nil until launch, or the fork checksum changes")
+	}
+}
+
+// TestForkOrderTreatsSentinelAsUnscheduled pins the rule that lets Luban sit at
+// math.MaxInt64 while Plato sits at ForkHeight: a fork at or above the sentinel
+// is "never", so it neither requires its predecessors nor constrains its
+// successors.
+func TestForkOrderTreatsSentinelAsUnscheduled(t *testing.T) {
+	const f = uint64(642)
+	// The whole pre-Luban chain has to be present. CheckConfigForkOrder skips
+	// the first missing non-optional fork, so a config that starts at Planck
+	// reports "gibbsBlock not enabled" before it ever reaches Luban.
+	base := func() *ChainConfig {
+		return &ChainConfig{
+			ChainID:         big.NewInt(1),
+			MirrorSyncBlock: new(big.Int).SetUint64(f - 6),
+			BrunoBlock:      new(big.Int).SetUint64(f - 5),
+			EulerBlock:      new(big.Int).SetUint64(f - 4),
+			GibbsBlock:      new(big.Int).SetUint64(f - 3),
+			PlanckBlock:     new(big.Int).SetUint64(f - 2),
+			PlatoBlock:      new(big.Int).SetUint64(f),
+			// Without Parlia, IsNotInBSC is true and CheckConfigForkOrder
+			// returns nil on its second line: every assertion below would pass
+			// without checking anything.
+			Parlia: &ParliaConfig{},
+		}
+	}
+
+	// Scheduled never + successors scheduled at F: accepted.
+	ok := base()
+	if ok.IsNotInBSC() {
+		t.Fatal("this test is vacuous: the config is not in BSC, so CheckConfigForkOrder returns nil " +
+			"immediately and the sentinel rule is never exercised")
+	}
+	ok.LubanBlock = big.NewInt(math.MaxInt64)
+	if err := ok.CheckConfigForkOrder(); err != nil {
+		t.Fatalf("luban at the sentinel must not constrain plato: %v", err)
+	}
+
+	// The negative control: a fork that is merely ABSENT must still be
+	// rejected. If this passes, the sentinel rule has quietly disabled the
+	// skip detection it was supposed to leave alone.
+	missing := base()
+	if err := missing.CheckConfigForkOrder(); err == nil {
+		t.Fatal("a nil luban fork must still be rejected when plato is scheduled")
+	}
+
+	// A real luban before plato is the normal case and must still pass.
+	normal := base()
+	normal.LubanBlock = new(big.Int).SetUint64(f - 1)
+	if err := normal.CheckConfigForkOrder(); err != nil {
+		t.Fatalf("normal luban ordering was rejected: %v", err)
 	}
 }

@@ -1630,6 +1630,15 @@ func (c *ChainConfig) CheckConfigForkOrder() error {
 		{name: "bpo5", timestamp: c.BPO5Time, optional: true},
 		{name: "amsterdam", timestamp: c.AmsterdamTime, optional: true},
 	} {
+		// A fork pinned at or above the sentinel is not scheduled at all, the
+		// same convention Legacy.ForkHeight uses (math.MaxUint64 == never).
+		// Treat it as absent so it neither requires its predecessors nor
+		// constrains its successors. A nil fork is NOT this case: nil means
+		// "not configured", and the order check must keep rejecting a chain
+		// that skips it.
+		if cur.block != nil && (!cur.block.IsInt64() || cur.block.Int64() >= math.MaxInt64) {
+			cur.block, cur.optional = nil, true
+		}
 		if lastFork.name != "" {
 			switch {
 			// Non-optional forks must all be present in the chain config up to the last defined fork
