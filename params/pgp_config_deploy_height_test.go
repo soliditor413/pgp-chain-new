@@ -33,13 +33,14 @@ func TestCheckDeployHeight(t *testing.T) {
 		{"no injection on a forked chain", 100, 0, ""},
 		{"normal", 100, 10, ""},
 		{"tightest legal", 100, 98, ""},
-		{"one block below the fork", 3, 1, ""},
+		{"two blocks below the fork", 4, 2, ""},
+		{"before EIP-150", 10, 1, "before EIP-150"},
 		{"at the fork", 100, 100, "forkHeight-2"},
 		{"one above the tightest legal", 100, 99, "forkHeight-2"},
 		{"past the fork", 100, 101, "forkHeight-2"},
 		{"no fork height", math.MaxUint64, 10, "requires a fixed legacy.forkHeight"},
 		{"fork height zero", 0, 10, "requires a fixed legacy.forkHeight"},
-		{"fork height too small", 2, 1, "leaves no room"},
+		{"fork height too small", 2, 2, "leaves no room"},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
