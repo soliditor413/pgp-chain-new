@@ -877,8 +877,8 @@ func (bc *BlockChain) loadLastState() error {
 			if err != nil {
 				return fmt.Errorf("failed to open the state at head %d to verify the system contracts: %w", headNumber, err)
 			}
-			if len(statedb.GetCode(common.HexToAddress(systemcontracts.ValidatorContract))) == 0 {
-				return fmt.Errorf("system contracts are missing at head %d although the deploy height is %d: this database was produced by a binary without the deployment, resync with the matching binary", headNumber, legacy.SystemContractDeployHeight)
+			if err := checkSystemContractsAtHead(legacy, headNumber, statedb); err != nil {
+				return err
 			}
 		}
 	}
