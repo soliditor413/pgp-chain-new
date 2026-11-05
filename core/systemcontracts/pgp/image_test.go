@@ -263,6 +263,47 @@ func TestEntriesAndCodeAreCopies(t *testing.T) {
 	}
 }
 
+// TestValidatorBytecodeContainsInitSelector is the F-1 regression, and it is
+// deliberately about the BYTECODE rather than the ABI: an ABI that declares
+// init(bytes,uint256) is useless if the deployed code does not dispatch it.
+//
+// 0x63 is PUSH4, so the five-byte sequence 63 1663df00 can only appear where the
+// contract compares the incoming selector. Before the fork's ABI fix the
+// validator contract dispatched only 63 e1c7392a (init()), and Parlia refused to
+// start with "invalid validator set init selector".
+//
+// The loop then requires the same of every entry the protocol will initialise:
+// a deployInit entry whose selector is absent from its own bytecode would fail
+// at the deploy height, on chain, in front of every node at once.
+func TestValidatorBytecodeContainsInitSelector(t *testing.T) {
+	validator := common.HexToAddress(systemcontracts.ValidatorContract)
+	code, ok := pgp.Code(validator)
+	if !ok {
+		t.Fatalf("image has no code for the validator contract %s", validator)
+	}
+	want := []byte{0x63, 0x16, 0x63, 0xdf, 0x00} // PUSH4 0x1663df00
+	if !bytes.Contains(code, want) {
+		t.Fatalf("validator bytecode does not dispatch init(bytes,uint256) (0x1663df00); the ABI fix is not " +
+			"in this artifact and Parlia will refuse to start")
+	}
+	old := []byte{0x63, 0xe1, 0xc7, 0x39, 0x2a} // PUSH4 0xe1c7392a = init()
+	if bytes.Contains(code, old) {
+		t.Logf("validator bytecode also dispatches init() (0xe1c7392a); acceptable as long as init(bytes,uint256) " +
+			"is present, which it is")
+	}
+
+	for _, e := range pgp.Entries() {
+		if !e.DeployInit || e.InitSignature == "" {
+			continue
+		}
+		sel := append([]byte{0x63}, e.InitSelector[:]...)
+		if !bytes.Contains(e.Code, sel) {
+			t.Fatalf("%s: bytecode does not dispatch %s (%x), so the deploy-time initialization would fail",
+				e.Name, e.InitSignature, sel)
+		}
+	}
+}
+
 // TestEntriesAreSorted keeps the documented ordering honest; callers rely on it
 // instead of sorting the deployment sequence themselves.
 func TestEntriesAreSorted(t *testing.T) {
