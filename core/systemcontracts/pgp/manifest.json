@@ -1,0 +1,202 @@
+{
+  "version": 1,
+  "sourceRepo": "github.com/pgprotocol/bsc-genesis-contract",
+  "sourceCommit": "041881a02475638b19f3d840871b7621cdebd8f8",
+  "sourceDirty": true,
+  "dirtyDiffSha256": "0xa173ccee45afa97842dd1802af0ed3fcb601e8081510f1c65f2342bf4255442e",
+  "foundry": {
+    "optimizer": true,
+    "optimizerRuns": 200,
+    "bytecodeHash": "none"
+  },
+  "entries": [
+    {
+      "address": "0x0000000000000000000000000000000000001000",
+      "name": "BSCValidatorSet",
+      "source": "contracts/BSCValidatorSet.sol",
+      "solc": "0.6.4",
+      "codeLen": 28458,
+      "codeHash": "0x5ead5409a4b591204810852025c6e6eaf7fe51be6d9dc404f839408a162437ec",
+      "initSignature": "init(bytes,uint256)",
+      "initSelector": "0x1663df00",
+      "deployInit": true
+    },
+    {
+      "address": "0x0000000000000000000000000000000000001001",
+      "name": "SlashIndicator",
+      "source": "contracts/SlashIndicator.sol",
+      "solc": "0.6.4",
+      "codeLen": 13215,
+      "codeHash": "0x8c008541986bb5dc1f025f54655a940f0875b502496331f757c1b6fc14447ee5",
+      "initSignature": "init()",
+      "initSelector": "0xe1c7392a",
+      "deployInit": true
+    },
+    {
+      "address": "0x0000000000000000000000000000000000001002",
+      "name": "SystemReward",
+      "source": "contracts/SystemReward.sol",
+      "solc": "0.6.4",
+      "codeLen": 3224,
+      "codeHash": "0x1e43dfdc69e6f7b0b74b532911133839572dc838c34fb82ab0624cec5c3522f2",
+      "initSignature": "",
+      "initSelector": "",
+      "deployInit": false
+    },
+    {
+      "address": "0x0000000000000000000000000000000000001003",
+      "name": "TendermintLightClient",
+      "source": "contracts/deprecated/TendermintLightClient.sol",
+      "solc": "0.6.4",
+      "codeLen": 3667,
+      "codeHash": "0x2147bdc726d41e372f681424764fcdf49c5c4b74729cdea6e7aeb030b4931121",
+      "initSignature": "init()",
+      "initSelector": "0xe1c7392a",
+      "deployInit": true
+    },
+    {
+      "address": "0x0000000000000000000000000000000000001004",
+      "name": "TokenHub",
+      "source": "contracts/TokenHub.sol",
+      "solc": "0.6.4",
+      "codeLen": 8288,
+      "codeHash": "0x6704e507908ddd250c2b8944dbca0edd07f1d477ca18783b3182645eddbfc946",
+      "initSignature": "init()",
+      "initSelector": "0xe1c7392a",
+      "deployInit": true
+    },
+    {
+      "address": "0x0000000000000000000000000000000000001005",
+      "name": "RelayerIncentivize",
+      "source": "contracts/deprecated/RelayerIncentivize.sol",
+      "solc": "0.6.4",
+      "codeLen": 2782,
+      "codeHash": "0xa6f7936c21040c09abe4d023ef23bfb262e6d190f191bdf57c4b3a95c47dbf64",
+      "initSignature": "init()",
+      "initSelector": "0xe1c7392a",
+      "deployInit": true
+    },
+    {
+      "address": "0x0000000000000000000000000000000000001006",
+      "name": "RelayerHub",
+      "source": "contracts/deprecated/RelayerHub.sol",
+      "solc": "0.6.4",
+      "codeLen": 2736,
+      "codeHash": "0x9f81c06fbf3492a3d8e79b337183ac220eb8d14bdd00944a6891d06ccaa2d6b3",
+      "initSignature": "init()",
+      "initSelector": "0xe1c7392a",
+      "deployInit": true
+    },
+    {
+      "address": "0x0000000000000000000000000000000000001007",
+      "name": "GovHub",
+      "source": "contracts/GovHub.sol",
+      "solc": "0.6.4",
+      "codeLen": 2853,
+      "codeHash": "0x6a36da0beacdc93402355ac5342ee8a289febe898f2b847bdfd687cec8b55801",
+      "initSignature": "",
+      "initSelector": "",
+      "deployInit": false
+    },
+    {
+      "address": "0x0000000000000000000000000000000000001008",
+      "name": "TokenManager",
+      "source": "contracts/deprecated/TokenManager.sol",
+      "solc": "0.6.4",
+      "codeLen": 3670,
+      "codeHash": "0x6dfee55d00c8cebbb2defa251e3eedc5f30c15dbc02390efd6f69a98ca370027",
+      "initSignature": "",
+      "initSelector": "",
+      "deployInit": false
+    },
+    {
+      "address": "0x0000000000000000000000000000000000002000",
+      "name": "CrossChain",
+      "source": "contracts/deprecated/CrossChain.sol",
+      "solc": "0.6.4",
+      "codeLen": 6074,
+      "codeHash": "0x9b5c61b811d9453d840d42b2eebd092fb860723b59b1786dba490a6ecaa1dffd",
+      "initSignature": "init()",
+      "initSelector": "0xe1c7392a",
+      "deployInit": true
+    },
+    {
+      "address": "0x0000000000000000000000000000000000002001",
+      "name": "Staking",
+      "source": "contracts/deprecated/Staking.sol",
+      "solc": "0.6.4",
+      "codeLen": 4765,
+      "codeHash": "0x35a889657ec2cf10a0a04bff7fb45b273d4c8be8e4d7ce590bb299cce7d45f13",
+      "initSignature": "",
+      "initSelector": "",
+      "deployInit": false
+    },
+    {
+      "address": "0x0000000000000000000000000000000000002002",
+      "name": "StakeHub",
+      "source": "contracts/StakeHub.sol",
+      "solc": "0.8.17",
+      "codeLen": 47087,
+      "codeHash": "0x341e701c8e472ed6db6b48cdb54829c3c5888dbb184338acf523eb0cf9a244ed",
+      "initSignature": "initialize()",
+      "initSelector": "0x8129fc1c",
+      "deployInit": true
+    },
+    {
+      "address": "0x0000000000000000000000000000000000002003",
+      "name": "StakeCredit",
+      "source": "contracts/StakeCredit.sol",
+      "solc": "0.8.17",
+      "codeLen": 8855,
+      "codeHash": "0xa3ef5fa83ce08196570d81e37f34222524e0b9c3d95307ae4d1406e565dccac0",
+      "initSignature": "initialize(address,string)",
+      "initSelector": "0xf399e22e",
+      "deployInit": false
+    },
+    {
+      "address": "0x0000000000000000000000000000000000002004",
+      "name": "BSCGovernor",
+      "source": "contracts/BSCGovernor.sol",
+      "solc": "0.8.17",
+      "codeLen": 28490,
+      "codeHash": "0x47db0de501988fb2fb6411b7837ee19732c03b7a28a359b022a49ead63d5bee1",
+      "initSignature": "initialize()",
+      "initSelector": "0x8129fc1c",
+      "deployInit": true
+    },
+    {
+      "address": "0x0000000000000000000000000000000000002005",
+      "name": "GovToken",
+      "source": "contracts/GovToken.sol",
+      "solc": "0.8.17",
+      "codeLen": 9840,
+      "codeHash": "0x48f34dad37ac8a08935bce5f0022c8c082dbdd6e4ae1ceeacb74d4f56d09102d",
+      "initSignature": "initialize()",
+      "initSelector": "0x8129fc1c",
+      "deployInit": true
+    },
+    {
+      "address": "0x0000000000000000000000000000000000002006",
+      "name": "BSCTimelock",
+      "source": "contracts/BSCTimelock.sol",
+      "solc": "0.8.17",
+      "codeLen": 9607,
+      "codeHash": "0x7bfa2da4931e9c80e00d06fda2b1876a950d503c4ce8fa0deaed5658f2171659",
+      "initSignature": "initialize()",
+      "initSelector": "0x8129fc1c",
+      "deployInit": true
+    },
+    {
+      "address": "0x0000000000000000000000000000000000003000",
+      "name": "TokenRecoverPortal",
+      "source": "contracts/TokenRecoverPortal.sol",
+      "solc": "0.8.17",
+      "codeLen": 7542,
+      "codeHash": "0x10d84e2933e3db7c354b31d1cadf2ad1c5fb3de818d8fd12e73954ac292817e2",
+      "initSignature": "initialize()",
+      "initSelector": "0x8129fc1c",
+      "deployInit": true
+    }
+  ],
+  "imageHash": "0xf2e29a3c51531a2a32a9a98e94e101bc929d199e770738b62973f2f9c3978a6a"
+}

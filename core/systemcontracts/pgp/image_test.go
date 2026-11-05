@@ -1,0 +1,277 @@
+// Copyright 2026 The pgp-chain Authors
+// This file is part of the pgp-chain library.
+//
+// The pgp-chain library is free software: you can redistribute it and/or modify
+// it under the terms of the GNU Lesser General Public License as published by
+// the Free Software Foundation, either version 3 of the License, or
+// (at your option) any later version.
+
+// Package pgp_test is an external test package on purpose: it imports
+// core/systemcontracts to compare the image's addresses with the chain's own
+// constants, and the deployment code in that package will import core/
+// systemcontracts/pgp in turn. An internal test file would make that pair an
+// import cycle the day the wiring lands; an external one cannot.
+package pgp_test
+
+import (
+	"bytes"
+	"encoding/hex"
+	"encoding/json"
+	"math/big"
+	"os"
+	"sort"
+	"testing"
+
+	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/systemcontracts"
+	"github.com/ethereum/go-ethereum/core/systemcontracts/pgp"
+	"github.com/ethereum/go-ethereum/crypto"
+)
+
+// canonicalJSON is the imageHash serialisation (design doc §7.4), written here
+// independently of the generator: keys sorted, no whitespace, UTF-8, numbers as
+// decimal strings, arrays in order. Independence is the point -- if the test
+// reused the generator's or image.go's encoder, a shared mistake would agree
+// with itself and prove nothing.
+func canonicalJSON(t *testing.T, v any) string {
+	t.Helper()
+	switch x := v.(type) {
+	case nil:
+		return "null"
+	case bool:
+		if x {
+			return "true"
+		}
+		return "false"
+	case json.Number:
+		// Already the decimal text; the rule is "numbers are decimal strings".
+		return x.String()
+	case string:
+		b, err := json.Marshal(x)
+		if err != nil {
+			t.Fatalf("canonicalJSON: %v", err)
+		}
+		return string(b)
+	case []any:
+		var out bytes.Buffer
+		out.WriteByte('[')
+		for i, item := range x {
+			if i > 0 {
+				out.WriteByte(',')
+			}
+			out.WriteString(canonicalJSON(t, item))
+		}
+		out.WriteByte(']')
+		return out.String()
+	case map[string]any:
+		keys := make([]string, 0, len(x))
+		for k := range x {
+			keys = append(keys, k)
+		}
+		sort.Strings(keys)
+		var out bytes.Buffer
+		out.WriteByte('{')
+		for i, k := range keys {
+			if i > 0 {
+				out.WriteByte(',')
+			}
+			kb, err := json.Marshal(k)
+			if err != nil {
+				t.Fatalf("canonicalJSON: %v", err)
+			}
+			out.Write(kb)
+			out.WriteByte(':')
+			out.WriteString(canonicalJSON(t, x[k]))
+		}
+		out.WriteByte('}')
+		return out.String()
+	default:
+		t.Fatalf("canonicalJSON: unsupported type %T", v)
+		return ""
+	}
+}
+
+// readManifest decodes manifest.json with numbers preserved as text, which is
+// what the canonical rule needs.
+func readManifest(t *testing.T) map[string]any {
+	t.Helper()
+
+	raw, err := os.ReadFile("manifest.json")
+	if err != nil {
+		t.Fatalf("cannot read manifest.json: %v", err)
+	}
+	dec := json.NewDecoder(bytes.NewReader(raw))
+	dec.UseNumber()
+	var doc map[string]any
+	if err := dec.Decode(&doc); err != nil {
+		t.Fatalf("manifest.json is not valid JSON: %v", err)
+	}
+	return doc
+}
+
+// TestCodeHashesMatchImageFiles is the primary integrity test: the bytes on disk
+// hash to what the manifest claims, and decode to the claimed length.
+//
+// It also enforces two properties of the build output that the generator gates
+// on, because a hand-edited image would bypass the generator: no unresolved
+// library placeholder, and no ipfs metadata hash (foundry.toml sets
+// bytecode_hash='none', so an ipfs marker means a different build).
+func TestCodeHashesMatchImageFiles(t *testing.T) {
+	entries := pgp.Entries()
+	if len(entries) != 17 {
+		t.Fatalf("image has %d entries, want 17", len(entries))
+	}
+	for _, e := range entries {
+		hexCode, err := os.ReadFile("image/" + e.Name)
+		if err != nil {
+			t.Fatalf("%s: cannot read image/%s: %v", e.Name, e.Name, err)
+		}
+		if bytes.ContainsAny(hexCode, "\r\n") {
+			t.Fatalf("%s: image file contains a line break; the format is a single bare hex string", e.Name)
+		}
+		code, err := hex.DecodeString(string(hexCode))
+		if err != nil {
+			t.Fatalf("%s: image is not valid hex: %v", e.Name, err)
+		}
+		if len(code) != e.CodeLen {
+			t.Fatalf("%s: image decodes to %d bytes, entry says %d", e.Name, len(code), e.CodeLen)
+		}
+		if got := crypto.Keccak256Hash(code); got != e.CodeHash {
+			t.Fatalf("%s: keccak(code) = %s, entry says %s", e.Name, got, e.CodeHash)
+		}
+		if bytes.Contains(code, []byte("__")) {
+			t.Fatalf("%s: bytecode carries a library link placeholder", e.Name)
+		}
+		tail := code[len(code)-64:]
+		if bytes.Contains(tail, []byte("ipfs")) {
+			t.Fatalf("%s: metadata tail carries an ipfs hash; this image is expected to be built with "+
+				"bytecode_hash='none'", e.Name)
+		}
+	}
+}
+
+// TestImageHashRecomputes pins imageHash to the canonical encoding of the
+// entries array. Provenance is excluded by construction: only entries are
+// serialised, so rebuilding the same image from a different git state keeps the
+// same hash.
+func TestImageHashRecomputes(t *testing.T) {
+	doc := readManifest(t)
+
+	entries, ok := doc["entries"].([]any)
+	if !ok {
+		t.Fatalf("manifest entries is not an array")
+	}
+	declared, ok := doc["imageHash"].(string)
+	if !ok {
+		t.Fatalf("manifest imageHash is not a string")
+	}
+
+	calc := crypto.Keccak256Hash([]byte(canonicalJSON(t, entries)))
+	if calc != common.HexToHash(declared) {
+		t.Fatalf("imageHash mismatch: canonical entries hash to %s, manifest says %s", calc, declared)
+	}
+	if calc != pgp.ImageHash() {
+		t.Fatalf("pgp.ImageHash() = %s, canonical recomputation says %s", pgp.ImageHash(), calc)
+	}
+}
+
+// TestAddressesMatchConstants requires the image's address set to be exactly the
+// chain's system-contract constants. A missing or extra account is a deployment
+// that either skips an initialization or writes code where nothing expects it.
+func TestAddressesMatchConstants(t *testing.T) {
+	want := []string{
+		systemcontracts.ValidatorContract,
+		systemcontracts.SlashContract,
+		systemcontracts.SystemRewardContract,
+		systemcontracts.LightClientContract,
+		systemcontracts.TokenHubContract,
+		systemcontracts.RelayerIncentivizeContract,
+		systemcontracts.RelayerHubContract,
+		systemcontracts.GovHubContract,
+		systemcontracts.TokenManagerContract,
+		systemcontracts.CrossChainContract,
+		systemcontracts.StakingContract,
+		systemcontracts.StakeHubContract,
+		systemcontracts.StakeCreditContract,
+		systemcontracts.GovernorContract,
+		systemcontracts.GovTokenContract,
+		systemcontracts.TimelockContract,
+		systemcontracts.TokenRecoverPortalContract,
+	}
+
+	have := make(map[common.Address]string, 17)
+	for _, e := range pgp.Entries() {
+		have[e.Address] = e.Name
+	}
+	if len(have) != len(want) {
+		t.Fatalf("image has %d distinct addresses, the constant set has %d", len(have), len(want))
+	}
+	for _, s := range want {
+		addr := common.HexToAddress(s)
+		if _, ok := have[addr]; !ok {
+			t.Fatalf("image is missing %s (%s)", s, addr)
+		}
+	}
+	for addr, name := range have {
+		if _, ok := pgp.Code(addr); !ok {
+			t.Fatalf("%s: Entries() lists it but Code() does not", name)
+		}
+	}
+}
+
+// TestPaymentLaneIsAbsent keeps a deliberate omission deliberate: bsc-genesis-
+// contract has no source for 0x2007, so shipping the unattributed jenner blob
+// under this image's provenance would be a lie about where the bytes came from.
+func TestPaymentLaneIsAbsent(t *testing.T) {
+	addr := common.HexToAddress(systemcontracts.PaymentLaneContract)
+	if code, ok := pgp.Code(addr); ok {
+		t.Fatalf("image contains 0x2007 PaymentLane (%d bytes); it is excluded on purpose", len(code))
+	}
+	for _, e := range pgp.Entries() {
+		if e.Address == addr {
+			t.Fatalf("Entries() lists 0x2007 PaymentLane")
+		}
+	}
+}
+
+// TestEntriesAndCodeAreCopies pins the defensive-copy contract: a caller that
+// mutates what it got must not change what the next caller sees.
+func TestEntriesAndCodeAreCopies(t *testing.T) {
+	first := pgp.Entries()
+	if len(first) == 0 {
+		t.Fatal("no entries")
+	}
+	original := first[0].CodeHash
+	first[0].Code[0] ^= 0xff
+
+	second := pgp.Entries()
+	if second[0].CodeHash != original {
+		t.Fatalf("mutating a returned entry changed the image")
+	}
+	if got := crypto.Keccak256Hash(second[0].Code); got != original {
+		t.Fatalf("mutating a returned Code slice changed the stored bytes")
+	}
+
+	code, ok := pgp.Code(second[0].Address)
+	if !ok {
+		t.Fatal("Code() does not know an address it just listed")
+	}
+	code[0] ^= 0xff
+	again, _ := pgp.Code(second[0].Address)
+	if got := crypto.Keccak256Hash(again); got != original {
+		t.Fatalf("mutating Code()'s return value changed the stored bytes")
+	}
+}
+
+// TestEntriesAreSorted keeps the documented ordering honest; callers rely on it
+// instead of sorting the deployment sequence themselves.
+func TestEntriesAreSorted(t *testing.T) {
+	entries := pgp.Entries()
+	for i := 1; i < len(entries); i++ {
+		prev := entries[i-1].Address
+		cur := entries[i].Address
+		if new(big.Int).SetBytes(prev[:]).Cmp(new(big.Int).SetBytes(cur[:])) >= 0 {
+			t.Fatalf("entries are not in ascending address order: %s before %s", prev, cur)
+		}
+	}
+}
