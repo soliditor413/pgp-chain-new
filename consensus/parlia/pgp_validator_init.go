@@ -17,16 +17,14 @@
 package parlia
 
 import (
-	"errors"
-	"fmt"
 	"math"
 	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/core/systemcontracts/pgp"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
-	"github.com/ethereum/go-ethereum/rlp"
 )
 
 // This file adapts Parlia to a chain whose history was produced by another
@@ -47,196 +45,27 @@ import (
 //     chain config instead of from a header. It is exact rather than
 //     approximate: before ForkHeight the validator set is a constant, because
 //     it comes from LegacyConfig.
-//  2. An init block predicate so BSCValidatorSet.init() runs in block
-//     ForkHeight, and it is fed the validator set as an argument rather than
-//     reading it from a compile-time constant.
+//  2. The validator set that the deploy-time injection feeds to
+//     BSCValidatorSet.init(bytes,uint256) at Legacy.SystemContractDeployHeight,
+//     i.e. before the fork, instead of the compile-time constant the contract
+//     used to read. The init itself does NOT run at ForkHeight any more: see
+//     shouldInitContract.
 
-const (
-	// maxPGPGenesisValidators bounds the genesis set by the width of the
-	// validator-count byte in the header extra field. prepareValidators writes
-	// it as byte(len(newValidators)) (parlia.go:1034), so anything above 255
-	// would wrap around silently and produce a header that cannot be parsed
-	// back.
-	maxPGPGenesisValidators = 255
+// The validator-set encoding itself lives in core/systemcontracts/pgp: the
+// protocol's deployment step (core/pgp_systemcontract_deploy.go) needs the same
+// bytes, and core cannot import parlia. These are the thin local names the
+// engine's own callers and tests keep using.
+type pgpGenesisValidatorSet = pgp.ValidatorSet
 
-	// pgpValidatorPackageType is the packageType discriminator of
-	// BSCValidatorSet's validator set RLP. decodeValidatorSet dispatches on it,
-	// and 0 selects decodeValidatorSetSynPackage, which is the 4-tuple-per-
-	// validator layout this encoder produces.
-	pgpValidatorPackageType = 0
-)
-
-// ErrNoPGPGenesisValidators is returned when a chain has a Parlia fork height
-// but no genesis validator set configured.
-//
-// It is a hard error and not "no validators yet": BSCValidatorSet.init requires
-// a non-empty set, and a zero numOfCabinets makes getMiningValidators
-// underflow (BSCValidatorSet.sol:366-367 allocates a zero-length array and then
-// indexes it). A chain that reaches ForkHeight without a validator set can only
-// stop, so it is better to refuse to start.
-var ErrNoPGPGenesisValidators = errors.New("parlia fork height is set but parliaGenesisValidators is empty")
-
-// pgpGenesisValidatorSet is the validated, ready-to-encode form of
-// LegacyConfig's four validator fields.
-//
-// The addresses are kept as three parallel slices rather than a struct because
-// that is the order the RLP tuple wants; keeping them separate makes the
-// mapping to the contract's field names explicit at the one place that matters
-// (pgpValidatorInitArgs).
-type pgpGenesisValidatorSet struct {
-	// Consensus addrs, in config order. This order is consensus critical: it
-	// is the order the RLP payload is built in, so it fixes the state root
-	// written at ForkHeight.
-	Consensus []common.Address
-
-	// BSCFee addrs, parallel to Consensus. Decoded by the contract as
-	// BBCFeeAddress (index 2 of the tuple) - see the ordering note in
-	// pgpValidatorInitArgs.
-	BSCFee []common.Address
-
-	// Fee addrs, parallel to Consensus. Decoded by the contract as feeAddress
-	// (index 1 of the tuple).
-	Fee []common.Address
-
-	// Voting powers, parallel to Consensus.
-	Powers []uint64
-
-	// Cabinets is the value seeded into BSCValidatorSet.numOfCabinets.
-	Cabinets uint64
-}
-
-// newPGPGenesisValidatorSet validates LegacyConfig's validator fields and fills
-// in the optional ones.
-//
-// Validation is strict on purpose. Every one of these conditions, if let
-// through, produces a node that starts fine and then writes a state root that
-// no other node agrees with, which is far harder to debug than a refusal to
-// start.
+// newPGPGenesisValidatorSet validates LegacyConfig's validator fields through
+// the shared encoder.
 func newPGPGenesisValidatorSet(cfg *params.LegacyConfig) (*pgpGenesisValidatorSet, error) {
-	if cfg == nil {
-		return nil, errors.New("no legacy config: cannot build the parlia genesis validator set")
-	}
-	n := len(cfg.ParliaGenesisValidators)
-	if n == 0 {
-		return nil, ErrNoPGPGenesisValidators
-	}
-	if n > maxPGPGenesisValidators {
-		return nil, fmt.Errorf("too many parlia genesis validators: %d > %d (the header extra count byte is a uint8)",
-			n, maxPGPGenesisValidators)
-	}
-
-	// The optional parallel lists are either absent or exactly n long. A
-	// shorter or longer list is a configuration mistake, not something to pad:
-	// padding would silently attach the wrong fee address to the wrong
-	// validator, and the resulting payload would still be well-formed.
-	if l := len(cfg.ParliaGenesisFeeAddrs); l != 0 && l != n {
-		return nil, fmt.Errorf("parliaGenesisFeeAddrs has %d entries but parliaGenesisValidators has %d; must be empty or match exactly", l, n)
-	}
-	if l := len(cfg.ParliaGenesisVotingPowers); l != 0 && l != n {
-		return nil, fmt.Errorf("parliaGenesisVotingPowers has %d entries but parliaGenesisValidators has %d; must be empty or match exactly", l, n)
-	}
-
-	set := &pgpGenesisValidatorSet{
-		Consensus: make([]common.Address, n),
-		BSCFee:    make([]common.Address, n),
-		Fee:       make([]common.Address, n),
-		Powers:    make([]uint64, n),
-	}
-
-	// Duplicate detection. A repeated consensus address makes
-	// currentValidatorSetMap point the second copy at the first, so the
-	// contract would report a smaller mining set than the header announces and
-	// every epoch block would fail verifyValidators.
-	seen := make(map[common.Address]int, n)
-
-	for i, raw := range cfg.ParliaGenesisValidators {
-		addr, err := parsePGPValidatorAddress(raw)
-		if err != nil {
-			return nil, fmt.Errorf("parliaGenesisValidators[%d] %q: %w", i, raw, err)
-		}
-		if addr == (common.Address{}) {
-			return nil, fmt.Errorf("parliaGenesisValidators[%d] is the zero address", i)
-		}
-		if first, ok := seen[addr]; ok {
-			return nil, fmt.Errorf("parliaGenesisValidators[%d] and [%d] are both %s; the set must be unique", first, i, addr)
-		}
-		seen[addr] = i
-		set.Consensus[i] = addr
-		set.Fee[i] = addr
-		set.BSCFee[i] = addr
-	}
-
-	for i, raw := range cfg.ParliaGenesisFeeAddrs {
-		addr, err := parsePGPValidatorAddress(raw)
-		if err != nil {
-			return nil, fmt.Errorf("parliaGenesisFeeAddrs[%d] %q: %w", i, raw, err)
-		}
-		if addr == (common.Address{}) {
-			return nil, fmt.Errorf("parliaGenesisFeeAddrs[%d] is the zero address", i)
-		}
-		set.Fee[i] = addr
-	}
-
-	if len(cfg.ParliaGenesisVotingPowers) == 0 {
-		for i := range set.Powers {
-			set.Powers[i] = params.DefaultParliaVotingPower
-		}
-	} else {
-		for i, power := range cfg.ParliaGenesisVotingPowers {
-			// Zero is rejected rather than defaulted: a zero voting power is a
-			// valid uint64 that the contract accepts, and it produces a
-			// validator that can never win an election once StakeHub takes
-			// over. Refusing it here is the only place it can be caught.
-			if power == 0 {
-				return nil, fmt.Errorf("parliaGenesisVotingPowers[%d] is zero", i)
-			}
-			set.Powers[i] = power
-		}
-	}
-
-	// Zero means "one seat per validator", which is what both the devnet and
-	// mainnet want; anything else must at least be non-zero, or
-	// getMiningValidators underflows.
-	set.Cabinets = cfg.ParliaGenesisCabinets
-	if set.Cabinets == 0 {
-		set.Cabinets = uint64(n)
-	}
-	if set.Cabinets > uint64(n) {
-		return nil, fmt.Errorf("parliaGenesisCabinets is %d but only %d validators are configured", set.Cabinets, n)
-	}
-
-	return set, nil
+	return pgp.FromLegacy(cfg)
 }
 
-// parsePGPValidatorAddress accepts the address forms that appear in a genesis
-// JSON file and rejects everything else.
-//
-// common.HexToAddress is deliberately not used on its own: it never fails. It
-// truncates or zero-pads whatever it is given, so "0xzz" silently becomes the
-// zero address and a 39-character address silently becomes a different,
-// perfectly valid-looking address. Either would change the RLP payload and
-// fork the chain against every node that did read the file correctly.
-func parsePGPValidatorAddress(s string) (common.Address, error) {
-	const hexLen = 2 * common.AddressLength
-
-	body := s
-	if len(body) >= 2 && (body[:2] == "0x" || body[:2] == "0X") {
-		body = body[2:]
-	}
-	if len(body) != hexLen {
-		return common.Address{}, fmt.Errorf("expected %d hex characters, got %d", hexLen, len(body))
-	}
-	for i := 0; i < len(body); i++ {
-		c := body[i]
-		switch {
-		case c >= '0' && c <= '9':
-		case c >= 'a' && c <= 'f':
-		case c >= 'A' && c <= 'F':
-		default:
-			return common.Address{}, fmt.Errorf("invalid hex character %q at offset %d", c, i)
-		}
-	}
-	return common.HexToAddress(s), nil
+// pgpValidatorInitArgs builds the two arguments BSCValidatorSet.init takes.
+func pgpValidatorInitArgs(cfg *params.LegacyConfig) ([]byte, uint64, error) {
+	return pgp.ValidatorInitArgs(cfg)
 }
 
 // pgpValidatorSetInitSelector is the 4-byte selector of
@@ -262,73 +91,6 @@ var pgpValidatorSetInitSelector = crypto.Keccak256([]byte("init(bytes,uint256)")
 // for init() and what the previous no-argument ABI method id was - so the six
 // non-validator contracts keep receiving exactly the calldata they always did.
 var pgpPlainInitSelector = crypto.Keccak256([]byte("init()"))[:4]
-
-// pgpValidatorTuple is one element of the validator set list as it is encoded
-// into the RLP payload.
-//
-// Field order is consensus critical and does NOT match the field names in
-// LegacyConfig. The contract's decodeValidator (BSCValidatorSet.sol) reads:
-//
-//	idx 0 -> consensusAddress
-//	idx 1 -> feeAddress
-//	idx 2 -> BBCFeeAddress
-//	idx 3 -> votingPower
-//
-// so the second slot is the *BBC* fee address and the third is the *fee*
-// address. Encoders that align by name instead of by position swap those two
-// addresses. The payload stays well-formed, decodes cleanly, and produces a
-// different state root - which is why every implementation of this tuple
-// (this one, scripts/gen-pgp-genesis-config.py, scripts/validators.js) carries
-// the order explicitly.
-//
-// Only four fields are emitted. decodeValidator sets success = true once idx
-// reaches 3, so the trailing BLS public key is optional, and leaving it out is
-// what keeps the payload identical to the one produced by the pre-Luban
-// tooling. A 5-tuple with a BLS key would encode the same 4 fields plus 48
-// bytes, i.e. a different payload.
-type pgpValidatorTuple struct {
-	Consensus common.Address
-	BSCFee    common.Address
-	Fee       common.Address
-	Power     uint64
-}
-
-// pgpValidatorInitArgs builds the two arguments BSCValidatorSet.init takes.
-//
-// The payload is RLP([packageType, validators]) where packageType is encoded as
-// the empty string per RLP's integer rule, i.e. 0x80 and not 0x00. Both decode
-// to 0, but only 0x80 is what every other encoder produces and therefore what
-// the payload hash in the design doc was computed over. Getting this wrong does
-// not break the contract - it breaks cross-implementation comparison, which is
-// the only way to check an encoder before it has ever run on chain.
-func pgpValidatorInitArgs(cfg *params.LegacyConfig) (payload []byte, cabinets uint64, err error) {
-	set, err := newPGPGenesisValidatorSet(cfg)
-	if err != nil {
-		return nil, 0, err
-	}
-
-	tuples := make([]pgpValidatorTuple, len(set.Consensus))
-	for i := range set.Consensus {
-		tuples[i] = pgpValidatorTuple{
-			Consensus: set.Consensus[i],
-			BSCFee:    set.BSCFee[i],
-			Fee:       set.Fee[i],
-			Power:     set.Powers[i],
-		}
-	}
-
-	// rlp.EncodeToBytes on a struct encodes its fields as a list, which is the
-	// tuple. The outer []interface{} is a list of two elements: the package
-	// type and the validator list.
-	payload, err = rlp.EncodeToBytes([]interface{}{
-		uint8(pgpValidatorPackageType),
-		tuples,
-	})
-	if err != nil {
-		return nil, 0, fmt.Errorf("failed to RLP-encode the parlia genesis validator set: %w", err)
-	}
-	return payload, set.Cabinets, nil
-}
 
 // pgpInitPlan is the pre-computed validator init arguments, built once at
 // engine construction so that a bad validator configuration fails at startup
