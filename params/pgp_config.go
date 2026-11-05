@@ -350,6 +350,14 @@ func (c *ChainConfig) checkDeployHeight() error {
 	if f == 0 || f == math.MaxUint64 {
 		return fmt.Errorf("legacy.systemContractDeployHeight = %d requires a fixed legacy.forkHeight, got %d", d, f)
 	}
+	// Two is the hard floor, not one: without EIP-150 the 63/64 gas cap does not
+	// apply, the initialisers forward their whole remaining budget into nested
+	// calls and run out of gas. PGPChainConfig schedules EIP-150 at block 2, so a
+	// deploy height of 1 would fail on mainnet with a bare "out of gas".
+	if d < 2 {
+		return fmt.Errorf("legacy.systemContractDeployHeight %d is before EIP-150 (block 2): the initialisers "+
+			"forward all remaining gas and would run out", d)
+	}
 	if f < 3 {
 		return fmt.Errorf("legacy.forkHeight %d leaves no room for a system contract deploy height: it must be at "+
 			"least 3 so that 1 <= deployHeight <= forkHeight-2", f)
