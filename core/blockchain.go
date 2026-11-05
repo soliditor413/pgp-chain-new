@@ -862,6 +862,27 @@ func (bc *BlockChain) loadLastState() error {
 	justifiedBlockGauge.Update(int64(bc.GetJustifiedNumber(headBlock.Header())))
 	finalizedBlockGauge.Update(int64(bc.GetFinalizedNumber(headBlock.Header())))
 
+	// Refuse to start on a database that predates the system-contract
+	// deployment. Those contracts are installed at a fixed height by the
+	// protocol; if the head is already past it and 0x1000 still has no code,
+	// this database was written by a binary without the deployment. Carrying
+	// on would produce blocks whose state diverges from the rest of the
+	// network, and the divergence is silent until the first epoch boundary.
+	//
+	// This runs before any InsertChain, so an operator finds out at startup
+	// rather than after the node has already accepted blocks.
+	if legacy := bc.chainConfig.Legacy; legacy != nil && legacy.SystemContractDeployHeight > 0 {
+		if headNumber := headBlock.NumberU64(); headNumber >= legacy.SystemContractDeployHeight {
+			statedb, err := bc.StateAt(headHeader)
+			if err != nil {
+				return fmt.Errorf("failed to open the state at head %d to verify the system contracts: %w", headNumber, err)
+			}
+			if len(statedb.GetCode(common.HexToAddress(systemcontracts.ValidatorContract))) == 0 {
+				return fmt.Errorf("system contracts are missing at head %d although the deploy height is %d: this database was produced by a binary without the deployment, resync with the matching binary", headNumber, legacy.SystemContractDeployHeight)
+			}
+		}
+	}
+
 	// Restore the last known head header
 	if head := rawdb.ReadHeadHeaderHash(bc.db); head != (common.Hash{}) {
 		if header := bc.GetHeaderByHash(head); header != nil {
