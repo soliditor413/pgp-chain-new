@@ -42,7 +42,7 @@ func DefaultPGPGenesisBlock() *Genesis {
 }
 ```
 
-而 BSC 需要 18 个系统合约地址（`core/systemcontracts/const.go:3-23`）：`0x1000–0x1008`（9 个）、`0x2000–0x2007`（8 个）、`0x3000`（1 个）。这些地址在 pgp 链上是空账户。
+而 BSC 需要 18 个系统合约地址（`core/systemcontracts/const.go:3-23`）：`0x1000–0x1008`（9 个）、`0x2000–0x2007`（8 个）、`0x3000`（1 个）。这些地址在 pgp 链上是空账户。**PGP 本轮只注入其中 17 个**：`0x2007` PaymentLane 在 `bsc-genesis-contract` 里既无源码也无编译产物，有意缺省（见 §6.2）。
 
 ### 1.2 现状会怎样失败
 
@@ -106,7 +106,7 @@ S3 需要在块首执行 EVM 调用，当前签名只有 `(config, blockNumber, 
 
 ### 4.3 D 块的执行顺序
 
-1. 18 个 `SetCode`（tracing 标签 `CodeChangeSystemContractUpgrade`）+ `SetNonce(addr, 1)`（与 `HistoryStorageAddress` 的既有做法一致，见 `upgrade.go:1154-1155`；v1 写 `nonce: 0` 是错的）；
+1. **17 个** `SetCode`（tracing 标签 `CodeChangeSystemContractUpgrade`）+ `SetNonce(addr, 1)`（与 `HistoryStorageAddress` 的既有做法一致，见 `upgrade.go:1154-1155`；v1 写 `nonce: 0` 是错的）；
 2. 协议内 EVM 调用完成初始化（**不再手种 `alreadyInit`**，见 §7）；
 3. 自检：逐账户比对 `GetCodeHash` 与清单；
 4. **幂等语义**：`codeHash` 已相等 ⇒ no-op；不相等 ⇒ `error`。**只有 `Process`（导入）路径把 error 升级为 panic**，`trace` / `eth_call` 回放路径返回错误即可——否则一次只读回放就能把进程打挂（评审 F-8）。
@@ -172,11 +172,12 @@ if !chainConfig.IsLuban(header.Number) { /* 走 pre-Luban ABI */ }
 
 ### 6.2 必须做的事
 
-1. **从 `bsc-genesis-contract` 的 pgp 分支编译 18 个合约**，产出新的 `deployedBytecode`；
-2. 新建 embed 包（如 `core/systemcontracts/pgpimage/`），**不复用** `pascal/` 或 `jenner/` 目录；
+1. **从 `bsc-genesis-contract` 的 pgp 分支编译 17 个合约**，产出新的 `deployedBytecode`（`0x2007` PaymentLane 无源码，见 §7.1 表）；
+2. 新建 embed 包 `core/systemcontracts/pgp/`，**不复用** `pascal/` 或 `jenner/` 目录；
 3. 生成脚本入仓（编译器版本、optimizer、commit 全部记录），产出 `CodeHash` 清单；
 4. 测试断言 `keccak(hexDecode(embedVar)) == CodeHash`，且 **`0x1000` 的字节码必须包含 `631663df00`**（这条断言直接回归 F-1）；
-5. 删除 v1 §6.1「与主网逐字节相同」的全部表述——它现在是错的，且会误导审计。
+5. 删除 v1 §6.1「与主网逐字节相同」的全部表述——它现在是错的，且会误导审计；
+6. **产物校验必须读 metadata 尾部的版本字节**，不要从目录名或注释猜编译器：尾部 CBOR 是 `a1 64 "solc" 43 <0x00MMmmpp> 00 0a`，其中 `0x000604` = **0.6.4**、`0x000811` = **0.8.17**（patch 字节 `0x11` 是 17，不是 11）。本轮 17 个合约的分布是 11 个 0.6.4（evmVersion istanbul）+ 6 个 0.8.17（london），`/Users/apple/Documents/github.com/pgprotocol/bsc` 的镜像 manifest 逐条记录，不做顶层合并——写死一个版本是错的。
 
 ### 6.3 地址一致性还要证明什么
 
@@ -194,13 +195,26 @@ if !chainConfig.IsLuban(header.Number) { /* 走 pre-Luban ABI */ }
 
 对 `bsc-genesis-contract/contracts` 逐个核对的结果：
 
-| 类 | 合约 | 初始化入口 | 做法 |
-|---|---|---|---|
-| A1 | `0x1000` Validator | `init(bytes,uint256)`，`external onlyNotInit`（`BSCValidatorSet.sol:162`） | 协议内 EVM 调用，payload 由 `Legacy.ParliaGenesis*` 编码（selector `0x1663df00`） |
-| A2 | `0x1001` Slash、`0x1003` LightClient、`0x1004` TokenHub、`0x1005` RelayerIncentivize、`0x1006` RelayerHub、`0x2000` CrossChain | `init()`，`onlyNotInit` | 协议内 EVM 调用，selector `0xe1c7392a` |
-| B1 | `0x2002` StakeHub、`0x2004` Governor、`0x2005` GovToken、`0x2006` Timelock、`0x3000` TokenRecoverPortal | `initialize()`，`initializer onlyCoinbase onlyZeroGasPrice` | **协议内 EVM 调用**（`from = coinbase`、`gasPrice = 0` 天然满足修饰器） |
-| B2 | `0x1002` SystemReward、`0x1007` GovHub、`0x1008` TokenManager、`0x2001` Staking、`0x2007` PaymentLane | 无一次性初始化入口 | 只 `SetCode` |
-| C | `0x2003` StakeCredit | `initialize(address,string)`，`onlyStakeHub` | **不在此列**——由 StakeHub 按验证人逐个创建/初始化 |
+| 类 | 地址 | 合约 | source file | 初始化入口 | 做法 |
+|---|---|---|---|---|---|
+| A1 | `0x1000` | BSCValidatorSet | `contracts/BSCValidatorSet.sol` | `init(bytes,uint256)`，`external onlyNotInit`（`BSCValidatorSet.sol:162`） | 协议内 EVM 调用，payload 由 `Legacy.ParliaGenesis*` 编码（selector `0x1663df00`） |
+| A2 | `0x1001` | SlashIndicator | `contracts/SlashIndicator.sol` | `init()`，`onlyNotInit` | 协议内 EVM 调用，selector `0xe1c7392a` |
+| A2 | `0x1003` | TendermintLightClient | `contracts/deprecated/TendermintLightClient.sol` | `init()`，`onlyNotInit` | 同上 |
+| A2 | `0x1004` | TokenHub | `contracts/TokenHub.sol` | `init()`，`onlyNotInit` | 同上 |
+| A2 | `0x1005` | RelayerIncentivize | `contracts/deprecated/RelayerIncentivize.sol` | `init()`，`onlyNotInit` | 同上 |
+| A2 | `0x1006` | RelayerHub | `contracts/deprecated/RelayerHub.sol` | `init()`，`onlyNotInit` | 同上 |
+| A2 | `0x2000` | CrossChain | `contracts/deprecated/CrossChain.sol` | `init()`，`onlyNotInit` | 同上 |
+| B1 | `0x2002` | StakeHub | `contracts/StakeHub.sol` | `initialize()`，`initializer onlyCoinbase onlyZeroGasPrice` | **协议内 EVM 调用**（`from = coinbase`、`gasPrice = 0` 天然满足修饰器） |
+| B1 | `0x2004` | BSCGovernor | `contracts/BSCGovernor.sol` | `initialize()` | 同上 |
+| B1 | `0x2005` | GovToken | `contracts/GovToken.sol` | `initialize()` | 同上 |
+| B1 | `0x2006` | BSCTimelock | `contracts/BSCTimelock.sol` | `initialize()` | 同上 |
+| B1 | `0x3000` | TokenRecoverPortal | `contracts/TokenRecoverPortal.sol` | `initialize()` | 同上 |
+| B2 | `0x1002` | SystemReward | `contracts/SystemReward.sol` | 无一次性初始化入口 | 只 `SetCode` |
+| B2 | `0x1007` | GovHub | `contracts/GovHub.sol` | 无一次性初始化入口 | 只 `SetCode` |
+| B2 | `0x1008` | TokenManager | `contracts/deprecated/TokenManager.sol` | 无一次性初始化入口 | 只 `SetCode` |
+| B2 | `0x2001` | Staking | `contracts/deprecated/Staking.sol` | 无一次性初始化入口 | 只 `SetCode` |
+| C | `0x2003` | StakeCredit | `contracts/StakeCredit.sol` | `initialize(address,string)`，`onlyStakeHub` | **不在此列**——由 StakeHub 按验证人逐个创建/初始化 |
+| — | `0x2007` | PaymentLane | **无源码**（`bsc-genesis-contract@041881a` 的 `contracts/` 与 `out/` 均无） | — | **不部署**（见 §6.2）：不在本轮镜像里，部署代码必须把它当作「不在清单」处理 |
 
 **结论：v1 §7 的「类 B 手种存储 + 写 `alreadyInit=1`」整段删除。** 理由（评审 F-2/F-3，已复核）：
 
@@ -217,17 +231,26 @@ if !chainConfig.IsLuban(header.Number) { /* 走 pre-Luban ABI */ }
 1. 槽位由编译产物 `storageLayout` 解析生成，**禁止手打十六进制槽位**；
 2. `imageHash` 钉子（编码方式见 §7.4）；
 3. 语义探针测试：应用后调只读 getter 断言业务合理（不能是「读回来等于写进去」的同义反复）；
-4. 离线 `pgpcheck`：指定高度 dump 18 个账户 `(codeHash, slotCount, keccak(sorted dump))` 与清单 diff。
+4. 离线 `pgpcheck`：指定高度 dump 17 个账户 `(codeHash, slotCount, keccak(sorted dump))` 与清单 diff。
 
 ### 7.4 `imageHash` 的规范序列化（v1 未定义）
 
-v1 只写「规范序列化」，跨语言会飘。定死：
+v1 只写「规范序列化」，跨语言会飘。定死为**标准紧凑 JSON**：
 
-- 键按字典序排序、UTF-8、无空格；
-- 数字一律十进制字符串（禁用浮点，`codeLen`/`nonce` 也转字符串）；
+- 键按字典序排序、UTF-8、紧凑（`,` 与 `:` 两侧无空格）；
+- **整数原样输出、不加引号**（`"codeLen":28458`）；布尔用 `true`/`false` 字面量；本镜像不涉及浮点，**禁止出现浮点**；
 - 数组保持声明顺序（顺序本身是语义）；
-- `imageHash = keccak256(UTF8(canonicalJSON))`；
-- 测试提供 **canonical 编码器**，并用两个不同语言的实现交叉验证一次。
+- **只对 `entries` 数组做 canonical**；provenance（`sourceCommit` / `dirtyDiffSha256` / `foundry`）**不参与**——否则同一份镜像在不同 git 状态会得到不同 hash；
+- `imageHash = keccak256(UTF8(canonicalJSON(entries)))`；
+- **规范形态由钉子测试保证**：`core/systemcontracts/pgp/image_test.go` 硬编码期望的 `imageHash` 字面量，生成脚本或重算实现的任何编码漂移都会立刻变红。散文描述永远可以被误读，钉子不会。
+
+当前值（17 个账户、`bsc-genesis-contract@041881a` + 56 个未提交改动）：
+
+```
+0xf2e29a3c51531a2a32a9a98e94e101bc929d199e770738b62973f2f9c3978a6a
+```
+
+> 为什么是「整数原样」而不是「数字转字符串」：数字原样就是标准紧凑 JSON，任何语言的 stdlib 都能复现；而「数字转字符串」是自定义子集，第三方实现更容易写错——本轮实现就曾照着错误的注释写偏过一次，钉子的存在正是为了避免同一类事故重演。
 
 ### 7.5 StakeHub 经济闭环（评审 F-4，Go/No-Go 项）
 
@@ -342,7 +365,7 @@ BSC 的时间型门控要求非 optional fork 连续启用，想只开 `jenner` 
 
 | 编号 | 测试 | 断言 |
 |---|---|---|
-| T1 | `TestImageCodeHashes` | 18 个 `CodeHash` == `keccak(hexDecode(embedVar))` |
+| T1 | `TestImageCodeHashes` | 17 个 `CodeHash` == `keccak(hexDecode(embedVar))` |
 | **T1b** | **`TestValidatorCodeHasInitBytesSelector`** | `0x1000` 的 embed 字节码包含 `631663df00`（直接回归 F-1） |
 | T2 | `TestImageHash` | `imageHash` == canonical 编码的 keccak |
 | T3 | `TestImageSlotNames` | 若存在手种槽位，名字能被 `storageLayout` 解析 |
@@ -376,7 +399,7 @@ BSC 的时间型门控要求非 optional fork 连续启用，想只开 `jenner` 
 
 ## 14. 实施顺序
 
-1. 定案字节码来源，重编 18 个合约，产出新 embed 包 + `CodeHash` 清单 + 生成脚本（**未完成不得进实施**）；
+1. 定案字节码来源，重编 17 个合约，产出新 embed 包 + `CodeHash` 清单 + 生成脚本（**未完成不得进实施**）；
 2. 解决 `IsLuban` / ABI 路径不一致（§5.3）；
 3. 定 StakeHub 经济方案（§7.5）；
 4. 扩 `TryUpdateBuildInSystemContract` 签名 + `seedPGPSystemContracts`（SetCode + 协议内初始化），20 处调用点逐个核对，跑 T7/T15；
