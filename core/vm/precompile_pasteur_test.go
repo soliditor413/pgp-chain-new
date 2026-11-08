@@ -6,12 +6,14 @@ import (
 	"github.com/ethereum/go-ethereum/common"
 )
 
-// 0x64/0x65 are deprecated from Pasteur; 0x67 switches to a per-byte-priced variant.
+// 0x64/0x65 are deprecated from Pasteur; 0x67 switches to a per-byte-priced
+// variant. On this chain the two tendermint precompiles sit at 0x264/0x265,
+// because 0x64/0x65 hold ELAMINTER/ELATOKEN (see contracts.go).
 func TestPasteurSuspendsLegacyTendermintPrecompiles(t *testing.T) {
-	addr64 := common.BytesToAddress([]byte{0x64})
-	addr65 := common.BytesToAddress([]byte{0x65})
+	addr64 := common.BytesToAddress([]byte{0x2, 0x64})
+	addr65 := common.BytesToAddress([]byte{0x2, 0x65})
 
-	// Under Pasteur, 0x64/0x65 return "deprecated" for any input.
+	// Under Pasteur, 0x264/0x265 return "deprecated" for any input.
 	for _, addr := range []common.Address{addr64, addr65} {
 		p := PrecompiledContractsPasteur[addr]
 		if p == nil {
@@ -26,10 +28,10 @@ func TestPasteurSuspendsLegacyTendermintPrecompiles(t *testing.T) {
 	// tendermint precompiles live only in the BSC set (…ForBSC); the standard
 	// PrecompiledContractsOsaka has them stripped for non-BSC chains.
 	if _, ok := PrecompiledContractsOsakaForBSC[addr64].(*tmHeaderValidate); !ok {
-		t.Fatalf("0x64 must remain active (tmHeaderValidate) pre-Pasteur")
+		t.Fatalf("0x264 must remain active (tmHeaderValidate) pre-Pasteur")
 	}
 	if _, ok := PrecompiledContractsOsakaForBSC[addr65].(*iavlMerkleProofValidatePlato); !ok {
-		t.Fatalf("0x65 must remain active (iavlMerkleProofValidatePlato) pre-Pasteur")
+		t.Fatalf("0x265 must remain active (iavlMerkleProofValidatePlato) pre-Pasteur")
 	}
 
 	// 0x67 stays active but switches to the per-byte-priced Pasteur variant

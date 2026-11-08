@@ -99,6 +99,20 @@ var PrecompiledContractsByzantium = PrecompiledContracts{
 // BSC (Parlia). By convention the "…ForBSC" maps carry BSC's cross-chain /
 // consensus precompiles; the standard same-named map is derived from it via
 // stripBSCPrecompiles and used for non-BSC chains.
+//
+// NOTE (pgp): the two BSC tendermint precompiles are NOT at 0x64/0x65 on this
+// chain. Those two addresses hold ELAMINTER (the ELA bridge gateway) and
+// ELATOKEN (bridged ELA) in the pgp genesis, and a precompile always wins over
+// account code in EVM dispatch -- so scheduling any BSC fork here would have
+// shadowed both contracts, leaving the bridge unroutable and every bridged ELA
+// balance permanently immovable (0x65 held 1,145,643.82 ELA when this was
+// changed). They now live at 0x264/0x265 instead: same implementations, no
+// collision, and 0x64/0x65 dispatch to their own code at every height.
+//
+// This is why every "…ForBSC" map below keys them as {0x2, 0x64}/{0x2, 0x65}.
+// When upstream adds a precompile set, relocate these two in the new map as
+// well, and keep stripBSCPrecompiles in sync -- it has to drop the relocated
+// addresses too, or non-BSC chains inherit a BSC-only precompile.
 var PrecompiledContractsIstanbulForBSC = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x1}): &ecrecover{},
 	common.BytesToAddress([]byte{0x2}): &sha256hash{},
@@ -110,8 +124,8 @@ var PrecompiledContractsIstanbulForBSC = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x8}): &bn256PairingIstanbul{},
 	common.BytesToAddress([]byte{0x9}): &blake2F{},
 
-	common.BytesToAddress([]byte{0x64}): &tmHeaderValidate{},
-	common.BytesToAddress([]byte{0x65}): &iavlMerkleProofValidate{},
+	common.BytesToAddress([]byte{0x2, 0x64}): &tmHeaderValidate{},
+	common.BytesToAddress([]byte{0x2, 0x65}): &iavlMerkleProofValidate{},
 }
 
 var PrecompiledContractsNano = PrecompiledContracts{
@@ -125,8 +139,8 @@ var PrecompiledContractsNano = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x8}): &bn256PairingIstanbul{},
 	common.BytesToAddress([]byte{0x9}): &blake2F{},
 
-	common.BytesToAddress([]byte{0x64}): &tmHeaderValidateDeprecated{},
-	common.BytesToAddress([]byte{0x65}): &iavlMerkleProofValidateDeprecated{},
+	common.BytesToAddress([]byte{0x2, 0x64}): &tmHeaderValidateDeprecated{},
+	common.BytesToAddress([]byte{0x2, 0x65}): &iavlMerkleProofValidateDeprecated{},
 }
 
 var PrecompiledContractsMoran = PrecompiledContracts{
@@ -140,8 +154,8 @@ var PrecompiledContractsMoran = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x8}): &bn256PairingIstanbul{},
 	common.BytesToAddress([]byte{0x9}): &blake2F{},
 
-	common.BytesToAddress([]byte{0x64}): &tmHeaderValidate{},
-	common.BytesToAddress([]byte{0x65}): &iavlMerkleProofValidateMoran{},
+	common.BytesToAddress([]byte{0x2, 0x64}): &tmHeaderValidate{},
+	common.BytesToAddress([]byte{0x2, 0x65}): &iavlMerkleProofValidateMoran{},
 }
 
 var PrecompiledContractsPlanck = PrecompiledContracts{
@@ -155,8 +169,8 @@ var PrecompiledContractsPlanck = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x8}): &bn256PairingIstanbul{},
 	common.BytesToAddress([]byte{0x9}): &blake2F{},
 
-	common.BytesToAddress([]byte{0x64}): &tmHeaderValidate{},
-	common.BytesToAddress([]byte{0x65}): &iavlMerkleProofValidatePlanck{},
+	common.BytesToAddress([]byte{0x2, 0x64}): &tmHeaderValidate{},
+	common.BytesToAddress([]byte{0x2, 0x65}): &iavlMerkleProofValidatePlanck{},
 }
 
 // PrecompiledContractsLuban contains the default set of pre-compiled Ethereum
@@ -172,10 +186,10 @@ var PrecompiledContractsLuban = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x8}): &bn256PairingIstanbul{},
 	common.BytesToAddress([]byte{0x9}): &blake2F{},
 
-	common.BytesToAddress([]byte{0x64}): &tmHeaderValidate{},
-	common.BytesToAddress([]byte{0x65}): &iavlMerkleProofValidatePlanck{},
-	common.BytesToAddress([]byte{0x66}): &blsSignatureVerify{},
-	common.BytesToAddress([]byte{0x67}): &cometBFTLightBlockValidate{},
+	common.BytesToAddress([]byte{0x2, 0x64}): &tmHeaderValidate{},
+	common.BytesToAddress([]byte{0x2, 0x65}): &iavlMerkleProofValidatePlanck{},
+	common.BytesToAddress([]byte{0x66}):      &blsSignatureVerify{},
+	common.BytesToAddress([]byte{0x67}):      &cometBFTLightBlockValidate{},
 }
 
 // PrecompiledContractsPlato contains the default set of pre-compiled Ethereum
@@ -191,10 +205,10 @@ var PrecompiledContractsPlato = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x8}): &bn256PairingIstanbul{},
 	common.BytesToAddress([]byte{0x9}): &blake2F{},
 
-	common.BytesToAddress([]byte{0x64}): &tmHeaderValidate{},
-	common.BytesToAddress([]byte{0x65}): &iavlMerkleProofValidatePlato{},
-	common.BytesToAddress([]byte{0x66}): &blsSignatureVerify{},
-	common.BytesToAddress([]byte{0x67}): &cometBFTLightBlockValidate{},
+	common.BytesToAddress([]byte{0x2, 0x64}): &tmHeaderValidate{},
+	common.BytesToAddress([]byte{0x2, 0x65}): &iavlMerkleProofValidatePlato{},
+	common.BytesToAddress([]byte{0x66}):      &blsSignatureVerify{},
+	common.BytesToAddress([]byte{0x67}):      &cometBFTLightBlockValidate{},
 }
 
 // PrecompiledContractsBerlin contains the default set of pre-compiled Ethereum
@@ -224,10 +238,10 @@ var PrecompiledContractsHertz = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x8}): &bn256PairingIstanbul{},
 	common.BytesToAddress([]byte{0x9}): &blake2F{},
 
-	common.BytesToAddress([]byte{0x64}): &tmHeaderValidate{},
-	common.BytesToAddress([]byte{0x65}): &iavlMerkleProofValidatePlato{},
-	common.BytesToAddress([]byte{0x66}): &blsSignatureVerify{},
-	common.BytesToAddress([]byte{0x67}): &cometBFTLightBlockValidateHertz{},
+	common.BytesToAddress([]byte{0x2, 0x64}): &tmHeaderValidate{},
+	common.BytesToAddress([]byte{0x2, 0x65}): &iavlMerkleProofValidatePlato{},
+	common.BytesToAddress([]byte{0x66}):      &blsSignatureVerify{},
+	common.BytesToAddress([]byte{0x67}):      &cometBFTLightBlockValidateHertz{},
 }
 
 // PrecompiledContractsFeynman contains the default set of pre-compiled Ethereum
@@ -243,12 +257,12 @@ var PrecompiledContractsFeynman = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x8}): &bn256PairingIstanbul{},
 	common.BytesToAddress([]byte{0x9}): &blake2F{},
 
-	common.BytesToAddress([]byte{0x64}): &tmHeaderValidate{},
-	common.BytesToAddress([]byte{0x65}): &iavlMerkleProofValidatePlato{},
-	common.BytesToAddress([]byte{0x66}): &blsSignatureVerify{},
-	common.BytesToAddress([]byte{0x67}): &cometBFTLightBlockValidateHertz{},
-	common.BytesToAddress([]byte{0x68}): &verifyDoubleSignEvidence{},
-	common.BytesToAddress([]byte{0x69}): &secp256k1SignatureRecover{},
+	common.BytesToAddress([]byte{0x2, 0x64}): &tmHeaderValidate{},
+	common.BytesToAddress([]byte{0x2, 0x65}): &iavlMerkleProofValidatePlato{},
+	common.BytesToAddress([]byte{0x66}):      &blsSignatureVerify{},
+	common.BytesToAddress([]byte{0x67}):      &cometBFTLightBlockValidateHertz{},
+	common.BytesToAddress([]byte{0x68}):      &verifyDoubleSignEvidence{},
+	common.BytesToAddress([]byte{0x69}):      &secp256k1SignatureRecover{},
 }
 
 // PrecompiledContractsCancunForBSC is the Cancun precompile set as active on BSC
@@ -265,12 +279,12 @@ var PrecompiledContractsCancunForBSC = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x9}):  &blake2F{},
 	common.BytesToAddress([]byte{0x0a}): &kzgPointEvaluation{},
 
-	common.BytesToAddress([]byte{0x64}): &tmHeaderValidate{},
-	common.BytesToAddress([]byte{0x65}): &iavlMerkleProofValidatePlato{},
-	common.BytesToAddress([]byte{0x66}): &blsSignatureVerify{},
-	common.BytesToAddress([]byte{0x67}): &cometBFTLightBlockValidateHertz{},
-	common.BytesToAddress([]byte{0x68}): &verifyDoubleSignEvidence{},
-	common.BytesToAddress([]byte{0x69}): &secp256k1SignatureRecover{},
+	common.BytesToAddress([]byte{0x2, 0x64}): &tmHeaderValidate{},
+	common.BytesToAddress([]byte{0x2, 0x65}): &iavlMerkleProofValidatePlato{},
+	common.BytesToAddress([]byte{0x66}):      &blsSignatureVerify{},
+	common.BytesToAddress([]byte{0x67}):      &cometBFTLightBlockValidateHertz{},
+	common.BytesToAddress([]byte{0x68}):      &verifyDoubleSignEvidence{},
+	common.BytesToAddress([]byte{0x69}):      &secp256k1SignatureRecover{},
 }
 
 // PrecompiledContractsHaber contains the default set of pre-compiled Ethereum
@@ -287,12 +301,12 @@ var PrecompiledContractsHaber = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x9}):  &blake2F{},
 	common.BytesToAddress([]byte{0x0a}): &kzgPointEvaluation{},
 
-	common.BytesToAddress([]byte{0x64}): &tmHeaderValidate{},
-	common.BytesToAddress([]byte{0x65}): &iavlMerkleProofValidatePlato{},
-	common.BytesToAddress([]byte{0x66}): &blsSignatureVerify{},
-	common.BytesToAddress([]byte{0x67}): &cometBFTLightBlockValidateHertz{},
-	common.BytesToAddress([]byte{0x68}): &verifyDoubleSignEvidence{},
-	common.BytesToAddress([]byte{0x69}): &secp256k1SignatureRecover{},
+	common.BytesToAddress([]byte{0x2, 0x64}): &tmHeaderValidate{},
+	common.BytesToAddress([]byte{0x2, 0x65}): &iavlMerkleProofValidatePlato{},
+	common.BytesToAddress([]byte{0x66}):      &blsSignatureVerify{},
+	common.BytesToAddress([]byte{0x67}):      &cometBFTLightBlockValidateHertz{},
+	common.BytesToAddress([]byte{0x68}):      &verifyDoubleSignEvidence{},
+	common.BytesToAddress([]byte{0x69}):      &secp256k1SignatureRecover{},
 
 	common.BytesToAddress([]byte{0x1, 0x00}): &p256Verify{},
 }
@@ -318,12 +332,12 @@ var PrecompiledContractsPragueForBSC = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x10}): &bls12381MapG1{},
 	common.BytesToAddress([]byte{0x11}): &bls12381MapG2{},
 
-	common.BytesToAddress([]byte{0x64}): &tmHeaderValidate{},
-	common.BytesToAddress([]byte{0x65}): &iavlMerkleProofValidatePlato{},
-	common.BytesToAddress([]byte{0x66}): &blsSignatureVerify{},
-	common.BytesToAddress([]byte{0x67}): &cometBFTLightBlockValidateHertz{},
-	common.BytesToAddress([]byte{0x68}): &verifyDoubleSignEvidence{},
-	common.BytesToAddress([]byte{0x69}): &secp256k1SignatureRecover{},
+	common.BytesToAddress([]byte{0x2, 0x64}): &tmHeaderValidate{},
+	common.BytesToAddress([]byte{0x2, 0x65}): &iavlMerkleProofValidatePlato{},
+	common.BytesToAddress([]byte{0x66}):      &blsSignatureVerify{},
+	common.BytesToAddress([]byte{0x67}):      &cometBFTLightBlockValidateHertz{},
+	common.BytesToAddress([]byte{0x68}):      &verifyDoubleSignEvidence{},
+	common.BytesToAddress([]byte{0x69}):      &secp256k1SignatureRecover{},
 
 	common.BytesToAddress([]byte{0x1, 0x00}): &p256Verify{},
 }
@@ -353,12 +367,12 @@ var PrecompiledContractsOsakaForBSC = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x10}): &bls12381MapG1{},
 	common.BytesToAddress([]byte{0x11}): &bls12381MapG2{},
 
-	common.BytesToAddress([]byte{0x64}): &tmHeaderValidate{},
-	common.BytesToAddress([]byte{0x65}): &iavlMerkleProofValidatePlato{},
-	common.BytesToAddress([]byte{0x66}): &blsSignatureVerify{},
-	common.BytesToAddress([]byte{0x67}): &cometBFTLightBlockValidateHertz{},
-	common.BytesToAddress([]byte{0x68}): &verifyDoubleSignEvidence{},
-	common.BytesToAddress([]byte{0x69}): &secp256k1SignatureRecover{},
+	common.BytesToAddress([]byte{0x2, 0x64}): &tmHeaderValidate{},
+	common.BytesToAddress([]byte{0x2, 0x65}): &iavlMerkleProofValidatePlato{},
+	common.BytesToAddress([]byte{0x66}):      &blsSignatureVerify{},
+	common.BytesToAddress([]byte{0x67}):      &cometBFTLightBlockValidateHertz{},
+	common.BytesToAddress([]byte{0x68}):      &verifyDoubleSignEvidence{},
+	common.BytesToAddress([]byte{0x69}):      &secp256k1SignatureRecover{},
 
 	common.BytesToAddress([]byte{0x1, 0x00}): &p256Verify{eip7951: true},
 }
@@ -373,6 +387,11 @@ func stripBSCPrecompiles(m PrecompiledContracts, extra ...common.Address) Precom
 	for _, a := range []byte{0x64, 0x65, 0x66, 0x67, 0x68, 0x69} {
 		delete(c, common.BytesToAddress([]byte{a}))
 	}
+	// 0x64/0x65 were relocated to 0x264/0x265 on this chain so they stop
+	// colliding with ELAMINTER/ELATOKEN; a standard set must contain neither the
+	// old nor the new address.
+	delete(c, common.BytesToAddress([]byte{0x2, 0x64}))
+	delete(c, common.BytesToAddress([]byte{0x2, 0x65}))
 	for _, a := range extra {
 		delete(c, a)
 	}
@@ -413,12 +432,12 @@ var PrecompiledContractsPasteur = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x10}): &bls12381MapG1{},
 	common.BytesToAddress([]byte{0x11}): &bls12381MapG2{},
 
-	common.BytesToAddress([]byte{0x64}): &tmHeaderValidateDeprecated{},
-	common.BytesToAddress([]byte{0x65}): &iavlMerkleProofValidateDeprecated{},
-	common.BytesToAddress([]byte{0x66}): &blsSignatureVerify{},
-	common.BytesToAddress([]byte{0x67}): &cometBFTLightBlockValidatePasteur{},
-	common.BytesToAddress([]byte{0x68}): &verifyDoubleSignEvidence{},
-	common.BytesToAddress([]byte{0x69}): &secp256k1SignatureRecover{},
+	common.BytesToAddress([]byte{0x2, 0x64}): &tmHeaderValidateDeprecated{},
+	common.BytesToAddress([]byte{0x2, 0x65}): &iavlMerkleProofValidateDeprecated{},
+	common.BytesToAddress([]byte{0x66}):      &blsSignatureVerify{},
+	common.BytesToAddress([]byte{0x67}):      &cometBFTLightBlockValidatePasteur{},
+	common.BytesToAddress([]byte{0x68}):      &verifyDoubleSignEvidence{},
+	common.BytesToAddress([]byte{0x69}):      &secp256k1SignatureRecover{},
 
 	common.BytesToAddress([]byte{0x1, 0x00}): &p256Verify{eip7951: true},
 }
@@ -447,12 +466,12 @@ var PrecompiledContractsJenner = PrecompiledContracts{
 	common.BytesToAddress([]byte{0x10}): &bls12381MapG1{},
 	common.BytesToAddress([]byte{0x11}): &bls12381MapG2{},
 
-	common.BytesToAddress([]byte{0x64}): &tmHeaderValidateDeprecated{},
-	common.BytesToAddress([]byte{0x65}): &iavlMerkleProofValidateDeprecated{},
-	common.BytesToAddress([]byte{0x66}): &blsSignatureVerify{},
-	common.BytesToAddress([]byte{0x67}): &cometBFTLightBlockValidatePasteur{},
-	common.BytesToAddress([]byte{0x68}): &verifyDoubleSignEvidenceJenner{},
-	common.BytesToAddress([]byte{0x69}): &secp256k1SignatureRecover{},
+	common.BytesToAddress([]byte{0x2, 0x64}): &tmHeaderValidateDeprecated{},
+	common.BytesToAddress([]byte{0x2, 0x65}): &iavlMerkleProofValidateDeprecated{},
+	common.BytesToAddress([]byte{0x66}):      &blsSignatureVerify{},
+	common.BytesToAddress([]byte{0x67}):      &cometBFTLightBlockValidatePasteur{},
+	common.BytesToAddress([]byte{0x68}):      &verifyDoubleSignEvidenceJenner{},
+	common.BytesToAddress([]byte{0x69}):      &secp256k1SignatureRecover{},
 
 	// BEP-706: millisecond-precision block timestamp, new in Jenner.
 	common.BytesToAddress([]byte{0x70}): &milliTimestamp{},
