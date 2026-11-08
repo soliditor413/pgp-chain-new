@@ -3,7 +3,7 @@
   "sourceRepo": "github.com/pgprotocol/bsc-genesis-contract",
   "sourceCommit": "041881a02475638b19f3d840871b7621cdebd8f8",
   "sourceDirty": true,
-  "dirtyDiffSha256": "0xa173ccee45afa97842dd1802af0ed3fcb601e8081510f1c65f2342bf4255442e",
+  "dirtyDiffSha256": "0x630dfc514ee3c3cea8f5948a2838bebdb1647142392227a32da9bfc825f1b1a1",
   "foundry": {
     "optimizer": true,
     "optimizerRuns": 200,
@@ -137,7 +137,7 @@
       "source": "contracts/StakeHub.sol",
       "solc": "0.8.17",
       "codeLen": 47087,
-      "codeHash": "0x341e701c8e472ed6db6b48cdb54829c3c5888dbb184338acf523eb0cf9a244ed",
+      "codeHash": "0x4639717c2688a73ff6ec522335c5e14dca892c422bef0b4d67c8b7afd969fac3",
       "initSignature": "initialize()",
       "initSelector": "0x8129fc1c",
       "deployInit": true
@@ -159,7 +159,7 @@
       "source": "contracts/BSCGovernor.sol",
       "solc": "0.8.17",
       "codeLen": 28490,
-      "codeHash": "0x47db0de501988fb2fb6411b7837ee19732c03b7a28a359b022a49ead63d5bee1",
+      "codeHash": "0x603c9ae64a0b519df9b5deb994d2517afb40506e7010916ce496073776206c94",
       "initSignature": "initialize()",
       "initSelector": "0x8129fc1c",
       "deployInit": true
@@ -192,11 +192,11 @@
       "source": "contracts/TokenRecoverPortal.sol",
       "solc": "0.8.17",
       "codeLen": 7542,
-      "codeHash": "0x10d84e2933e3db7c354b31d1cadf2ad1c5fb3de818d8fd12e73954ac292817e2",
+      "codeHash": "0xb8eed1bd45f6ccb71d1578f6402d28e4ebe9c85bc65020a26c65ea88fe9d318c",
       "initSignature": "initialize()",
       "initSelector": "0x8129fc1c",
       "deployInit": true
     }
   ],
-  "imageHash": "0xf2e29a3c51531a2a32a9a98e94e101bc929d199e770738b62973f2f9c3978a6a"
+  "imageHash": "0xa8c971b64963244867be207c1ddebad4c4e6a1a214127c9907be92829a1c3484"
 }
