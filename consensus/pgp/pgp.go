@@ -196,6 +196,16 @@ func (e *Engine) VerifyHeader(chain consensus.ChainHeaderReader, header *types.H
 	return e.verifyHeader(chain, header, nil)
 }
 
+// VerifyHeaderWithParents implements consensus.ParentAwareVerifier.
+//
+// It exists so the router can verify a batch that straddles the fork height:
+// F's parent is a legacy header that sits in the same batch and has not been
+// written to the database yet. Same rules as VerifyHeader, with parents
+// consulted first.
+func (e *Engine) VerifyHeaderWithParents(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
+	return e.verifyHeader(chain, header, parents)
+}
+
 // VerifyHeaders implements consensus.Engine. The implementation follows
 // consensus/clique and consensus/parlia: one worker runs the sequential
 // verifications and streams them into a buffered channel.

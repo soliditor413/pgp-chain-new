@@ -136,6 +136,28 @@ type Engine interface {
 	Close() error
 }
 
+// ParentAwareVerifier is an optional extension of Engine for engines whose
+// per-header rules need the preceding headers of the same batch, which may not
+// have been written to the database yet.
+//
+// It exists for one caller: router.Engine.VerifyHeaders, which has to verify a
+// batch that straddles the fork height. Such a batch carries both F-1 (legacy)
+// and F (Parlia), and F's parent is in the batch, not on disk -- both
+// blockchain.insertChain and HeaderChain.ValidateHeaderChain validate before
+// writing, so "the parent is not in the database" is the normal case there, not
+// a race. Splitting the batch and handing each half to the owning engine's
+// VerifyHeaders does not help, because that method takes no parents either: the
+// F block still cannot see F-1.
+//
+// VerifyHeaderWithParents must behave exactly like VerifyHeader(chain, header),
+// with parents[...] consulted before the database when resolving ancestors --
+// the same contract the engines' own VerifyHeaders loops satisfy by passing
+// headers[:i]. Engines that do not implement this interface still work; the
+// router falls back to VerifyHeader for them.
+type ParentAwareVerifier interface {
+	VerifyHeaderWithParents(chain ChainHeaderReader, header *types.Header, parents []*types.Header) error
+}
+
 type PoSA interface {
 	Engine
 

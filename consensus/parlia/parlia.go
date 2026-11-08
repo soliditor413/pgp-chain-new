@@ -391,6 +391,21 @@ func (p *Parlia) VerifyHeader(chain consensus.ChainHeaderReader, header *types.H
 	return p.verifyHeader(chain, header, nil)
 }
 
+// VerifyHeaderWithParents implements consensus.ParentAwareVerifier.
+//
+// It exists so the router can verify a batch that straddles the fork height:
+// the first Parlia block's parent is a legacy header from the same batch and has
+// not been written to the database yet. Same rules as VerifyHeader, with parents
+// consulted first -- and parents is exactly the slice VerifyHeaders would have
+// built internally (headers[:i]).
+//
+// A legacy header in parents is harmless: the walk back through them stops at
+// the pgp snapshot anchor (ForkHeight-1), which snapshot() checks before it ever
+// consumes a parent. See pgpSnapshotAnchorNumber.
+func (p *Parlia) VerifyHeaderWithParents(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
+	return p.verifyHeader(chain, header, parents)
+}
+
 // VerifyHeaders is similar to VerifyHeader, but verifies a batch of headers. The
 // method returns a quit channel to abort the operations and a results channel to
 // retrieve the async verifications (the order is that of the input slice).

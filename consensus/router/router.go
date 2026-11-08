@@ -179,17 +179,7 @@ func (e *Engine) Author(header *types.Header) (common.Address, error) {
 
 // VerifyHeader implements consensus.Engine.
 func (e *Engine) VerifyHeader(chain consensus.ChainHeaderReader, header *types.Header) error {
-	if header == nil || header.Number == nil {
-		return errors.New("router: header without number")
-	}
-	if e.isForked(header.Number) {
-		engine, err := e.posaEngine()
-		if err != nil {
-			return err
-		}
-		return engine.VerifyHeader(chain, header)
-	}
-	engine, err := e.legacyEngine()
+	engine, err := e.engineFor(header)
 	if err != nil {
 		return err
 	}
@@ -201,6 +191,15 @@ func (e *Engine) VerifyHeader(chain consensus.ChainHeaderReader, header *types.H
 // A batch that straddles the fork height cannot be delegated to a single engine,
 // so it is verified header by header with the same abort/result channel contract
 // the other engines use. Homogeneous batches are delegated as-is.
+//
+// Cross-fork batches get the accumulated prefix of the batch as parents. The
+// split at the fork height is where the two eras meet, not what makes the batch
+// verifiable: handing each half to the owning engine's VerifyHeaders would still
+// fail at F, because that method takes no parents and both callers validate
+// before writing (blockchain.insertChain, HeaderChain.ValidateHeaderChain), so
+// F's parent sits in the batch and is never on disk yet. Threading headers[:i]
+// is exactly what the engines' own loops do internally
+// (`e.verifyHeader(chain, header, headers[:i])`).
 func (e *Engine) VerifyHeaders(chain consensus.ChainHeaderReader, headers []*types.Header) (chan<- struct{}, <-chan error) {
 	if e.homogeneous(headers) {
 		if len(headers) > 0 && e.isForked(headers[0].Number) {
@@ -213,11 +212,14 @@ func (e *Engine) VerifyHeaders(chain consensus.ChainHeaderReader, headers []*typ
 	}
 	// Mixed batch, or the owning engine is missing: verify one by one so the
 	// per-header routing (and the explicit error) still applies.
+	if cut := e.forkBoundary(headers); cut > 0 && cut < len(headers) {
+		log.Debug("Verifying a fork-crossing header batch", "legacy", cut, "posa", len(headers)-cut, "first", headers[cut].Number)
+	}
 	abort := make(chan struct{})
 	results := make(chan error, len(headers))
 	go func() {
-		for _, header := range headers {
-			err := e.VerifyHeader(chain, header)
+		for i, header := range headers {
+			err := e.verifyOne(chain, header, headers[:i])
 			select {
 			case <-abort:
 				return
@@ -226,6 +228,36 @@ func (e *Engine) VerifyHeaders(chain consensus.ChainHeaderReader, headers []*typ
 		}
 	}()
 	return abort, results
+}
+
+// verifyOne applies the rules of the engine that owns the header, offering the
+// already-seen prefix of the batch as parents.
+func (e *Engine) verifyOne(chain consensus.ChainHeaderReader, header *types.Header, parents []*types.Header) error {
+	engine, err := e.engineFor(header)
+	if err != nil {
+		return err
+	}
+	if pv, ok := engine.(consensus.ParentAwareVerifier); ok {
+		return pv.VerifyHeaderWithParents(chain, header, parents)
+	}
+	// An engine that cannot take parents still gets the header; it will fall
+	// back to a database lookup and report ErrUnknownAncestor at the boundary.
+	// Unreachable for the engines this repository wires in.
+	return engine.VerifyHeader(chain, header)
+}
+
+// forkBoundary returns the index of the first Parlia header of the batch, or
+// len(headers) when the batch does not cross the fork. It is diagnostic only:
+// the engine of each header is chosen by that header's own number in verifyOne,
+// so a malformed batch still gets one error per header instead of one error for
+// the whole batch.
+func (e *Engine) forkBoundary(headers []*types.Header) int {
+	for i, header := range headers {
+		if header != nil && header.Number != nil && e.isForked(header.Number) {
+			return i
+		}
+	}
+	return len(headers)
 }
 
 // homogeneous reports whether all headers belong to the same era.
