@@ -74,6 +74,20 @@ func TestRelocatedTendermintPrecompilesExist(t *testing.T) {
 			t.Fatalf("%s: the standard set inherited BSC's 0x265 precompile", name)
 		}
 	}
+	// The legacy set is replay of a live chain: it must be exactly what pgp-chain
+	// ran, so it may contain neither the old nor the new addresses. A single
+	// extra entry here would change historical execution.
+	legacySet := pgpLegacyPrecompiledContracts()
+	for _, addr := range []common.Address{
+		common.BytesToAddress([]byte{0x64}),
+		common.BytesToAddress([]byte{0x65}),
+		addr264,
+		addr265,
+	} {
+		if _, ok := legacySet[addr]; ok {
+			t.Fatalf("%s leaked into the legacy set; historical replay would change", addr.Hex())
+		}
+	}
 }
 
 // TestNoPrecompileTableKeysELAAddresses checks the literals themselves. The
