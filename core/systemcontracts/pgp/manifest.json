@@ -1,9 +1,10 @@
 {
   "version": 1,
   "sourceRepo": "github.com/pgprotocol/bsc-genesis-contract",
-  "sourceCommit": "041881a02475638b19f3d840871b7621cdebd8f8",
-  "sourceDirty": true,
-  "dirtyDiffSha256": "0x630dfc514ee3c3cea8f5948a2838bebdb1647142392227a32da9bfc825f1b1a1",
+  "sourceCommit": "5d2d047ee76f8bafcd9bd95107c89d7a60775b58",
+  "sourceTag": "pgp-fork-v1",
+  "sourceDirty": false,
+  "dirtyDiffSha256": "0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "foundry": {
     "optimizer": true,
     "optimizerRuns": 200,

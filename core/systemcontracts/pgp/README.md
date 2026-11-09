@@ -22,19 +22,23 @@ which address, initialised how".
 ## Provenance: this is NOT upstream v1.2.6
 
 Source: `github.com/pgprotocol/bsc-genesis-contract`, commit
-`041881a02475638b19f3d840871b7621cdebd8f8` (tag v1.2.6), **with 56 uncommitted
-changes** — 8 contracts carry the fork's own work on top of that tag:
+`5d2d047ee76f8bafcd9bd95107c89d7a60775b58`, tag **`pgp-fork-v1`** — the fork's
+own commit on top of upstream v1.2.6 (`041881a`). 8 contracts carry the fork's
+work:
 
 `BSCValidatorSet`, `SlashIndicator`, `System.sol` (`bscChainID = 860621`),
 `StakeHub`, `BSCGovernor`, `GovToken`, `TokenRecoverPortal`,
 `extension/BSCValidatorSetTool`.
 
 So the bytecode here is **byte-for-byte different from the upstream tag**, by
-design. `manifest.json` records that state instead of hiding it:
+design. `manifest.json` records exactly where it came from:
 
-- `sourceCommit` — the commit the tree was at;
-- `sourceDirty` / `dirtyDiffSha256` — the sha256 of `git diff HEAD`, so the exact
-  in-flight state can be told apart from any other dirty state;
+- `sourceCommit` / `sourceTag` — the commit and its tag. `sourceDirty` must be
+  **false**: the bytes are reproducible from that commit, and
+  `TestImageProvenanceIsCommitted` fails if anyone commits an image built from a
+  dirty tree;
+- `dirtyDiffSha256` — the sha256 of `git diff HEAD` at build time. With a clean
+  tree it is the sha256 of the empty string, which is what it is now;
 - per-entry `solc` — the image spans **two solc majors**: 11 contracts built with
   `0.6.4` (evmVersion istanbul) and 6 with `0.8.17` (london), all with
   optimizer enabled / 200 runs, `bytecode_hash = 'none'`.
@@ -44,17 +48,24 @@ The two-major span matters to an auditor asking "was this one build": it was one
 
 ## Regenerating
 
-From the bsc repo root, with `bsc-genesis-contract` checked out next to it and
-built (`forge build` there, HEAD `041881a` + the changes above):
+From the bsc repo root, with `bsc-genesis-contract` checked out at
+`pgp-fork-v1` next to it and built:
 
 ```
+git -C ../bsc-genesis-contract checkout pgp-fork-v1
+forge build --force --root ../bsc-genesis-contract
 python3 scripts/pgp-image-gen.py --artifacts ../bsc-genesis-contract/out
 python3 scripts/pgp-image-gen.py --artifacts ../bsc-genesis-contract/out --check   # exits 0 if identical
 python3 scripts/pgp-image-gen.py --artifacts ../bsc-genesis-contract/out           # idempotence: git status must stay clean
 ```
 
+`node_modules` has to be installed there too (`npm install`): the OpenZeppelin
+imports resolve through it, and it is not vendored.
+
 The output contains no timestamps, absolute paths or hostnames, so the same
-inputs produce byte-identical files.
+inputs produce byte-identical files. This was verified end to end: a clean
+worktree of `pgp-fork-v1`, `forge build --force`, and the regenerated image
+matched all 17 files byte for byte.
 
 ## Gates the generator enforces (G1–G7)
 

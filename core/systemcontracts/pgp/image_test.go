@@ -410,3 +410,29 @@ func decrementCodeLen(t *testing.T, entries []any, idx int) []any {
 	entry["codeLen"] = json.Number(strconv.FormatInt(n-1, 10))
 	return out
 }
+
+// TestImageProvenanceIsCommitted is the F-04 gate.
+//
+// The 17 runtime bytecodes are consensus data: every node installs exactly these
+// bytes at block D. A manifest that says sourceDirty: true is admitting they
+// cannot be rebuilt from any commit, which is what made the image impossible to
+// audit independently -- the manifest could only vouch for itself.
+//
+// If this fails, the workflow is: commit and tag bsc-genesis-contract, check the
+// tag out cleanly, and regenerate from that build:
+//
+//	python3 scripts/pgp-image-gen.py --artifacts <clean-checkout>/out
+func TestImageProvenanceIsCommitted(t *testing.T) {
+	doc := readManifest(t)
+
+	commit, _ := doc["sourceCommit"].(string)
+	if len(commit) != 40 {
+		t.Fatalf("sourceCommit = %q, want a 40-character commit id", commit)
+	}
+	if dirty, _ := doc["sourceDirty"].(bool); dirty {
+		t.Fatal("sourceDirty is true: these bytes came from an uncommitted tree and nobody else can rebuild them")
+	}
+	if tag, _ := doc["sourceTag"].(string); tag == "" {
+		t.Fatal("sourceTag is empty: tag the source commit so the image traces back to a release point")
+	}
+}

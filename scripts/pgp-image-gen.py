@@ -262,11 +262,16 @@ def build(out_dir, contracts_root, bsc_root):
                            capture_output=True, text=True, check=True).stdout
     diff = subprocess.run(["git", "diff", "HEAD"], cwd=contracts_root,
                           capture_output=True, check=True).stdout
+    # An exact tag on HEAD is what a reviewer actually searches for; the commit
+    # alone forces them to run `git describe`. Empty when HEAD is untagged.
+    describe = subprocess.run(["git", "describe", "--tags", "--exact-match", "HEAD"],
+                              cwd=contracts_root, capture_output=True, text=True)
 
     manifest = {
         "version": 1,
         "sourceRepo": "github.com/pgprotocol/bsc-genesis-contract",
         "sourceCommit": head,
+        "sourceTag": describe.stdout.strip() if describe.returncode == 0 else "",
         "sourceDirty": bool(dirty.strip()),
         "dirtyDiffSha256": "0x" + hashlib.sha256(diff).hexdigest(),
         "foundry": {"optimizer": True, "optimizerRuns": 200, "bytecodeHash": "none"},
