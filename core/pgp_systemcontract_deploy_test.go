@@ -10,6 +10,7 @@ package core
 
 import (
 	"math/big"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/accounts/abi"
@@ -189,6 +190,27 @@ func TestDeployFailureReturnsError(t *testing.T) {
 	err := TryDeployPGPSystemContracts(cfg, deployTestHeader(deployTestHeight), chain, statedb, vm.Config{})
 	if err == nil {
 		t.Fatalf("deploy with no validators returned nil, want an error")
+	}
+}
+
+// TestDeployRejectsMismatchedChainID covers F-01. The system contracts carry
+// bscChainID as a compile-time constant and SlashIndicator hands it to the 0x68
+// precompile as the evidence domain. A chain that runs a different id recovers a
+// different signer, so slashing reverts forever with "validator not migrated" --
+// and nothing else notices. Block D is the last moment this can be caught: after
+// it the bytecode is on chain and only a hard fork can fix it.
+func TestDeployRejectsMismatchedChainID(t *testing.T) {
+	cfg := deployTestConfig()
+	cfg.ChainID = big.NewInt(8606211) // a devnet id that drifted from the bytecode
+	chain := &deployTestChain{cfg: cfg}
+	statedb := deployTestState(t)
+
+	err := TryDeployPGPSystemContracts(cfg, deployTestHeader(deployTestHeight), chain, statedb, vm.Config{})
+	if err == nil {
+		t.Fatal("deploy with chain id 8606211 returned nil; the mismatch must stop block D")
+	}
+	if !strings.Contains(err.Error(), "bscChainID") {
+		t.Fatalf("error does not name the mismatch: %v", err)
 	}
 }
 

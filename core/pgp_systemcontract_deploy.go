@@ -171,6 +171,24 @@ func TryDeployPGPSystemContracts(config *params.ChainConfig, header *types.Heade
 		log.Info("pgp system contract initialised", "name", entry.Name, "addr", entry.Address, "block", deployHeight)
 	}
 
+	// F-01: the contracts that inherit System.sol carry bscChainID() as a
+	// compile-time constant, and SlashIndicator feeds it to the 0x68 precompile
+	// as the domain of the double-sign evidence. When the running chain's id
+	// differs, ecrecover still "succeeds" -- it just recovers some other address
+	// -- so the evidence check degrades into a permanent "validator not
+	// migrated" revert and slashing never works. Nothing else in the node can
+	// observe that: the precompile exists, init succeeds, every unit test stays
+	// green, and it only surfaces the day someone tries to slash.
+	//
+	// Block D is the last observable moment. After it the bytecode is on chain
+	// and the only remedy is a hard fork, so refuse to produce a block that
+	// would ship a chain where slashing is dead. devnet and mainnet both run
+	// 860621, so this should never fire; it is here so that a regenerated
+	// genesis with a different --chain-id cannot slip through silently.
+	if err := assertBSCChainID(config, evm, validatorAddr, deployHeight); err != nil {
+		return err
+	}
+
 	// One merge and one Finalise for the whole deployment, not per call: the
 	// twelve initialisers belong to one block-begin step, and Finalise per call
 	// would publish twelve intermediate states.
@@ -242,4 +260,34 @@ func bytesEqual(a, b []byte) bool {
 		}
 	}
 	return true
+}
+
+// bscChainIDSelector is keccak256("bscChainID()")[:4]. The getter comes from
+// System.sol's `uint32 public constant bscChainID`, so it is answered by every
+// contract that inherits it (the validator set among them) and by none of the
+// SystemV2 ones.
+var bscChainIDSelector = [4]byte{0x49, 0x32, 0x79, 0xb1}
+
+// assertBSCChainID compares the chain id compiled into the system contracts with
+// the one this node runs. See the call site for why a mismatch has to stop block
+// D rather than be logged.
+func assertBSCChainID(config *params.ChainConfig, evm *vm.EVM, validatorAddr common.Address, deployHeight uint64) error {
+	if config == nil || config.ChainID == nil {
+		return fmt.Errorf("pgp system contracts: chain config carries no chain id")
+	}
+	ret, _, err := evm.StaticCall(params.SystemAddress, validatorAddr, bscChainIDSelector[:], vm.NewGasBudget(1_000_000))
+	if err != nil {
+		return fmt.Errorf("pgp system contracts: reading bscChainID() from %s: %w", validatorAddr, err)
+	}
+	if len(ret) != 32 {
+		return fmt.Errorf("pgp system contracts: bscChainID() returned %d bytes, want 32", len(ret))
+	}
+	onchain := new(big.Int).SetBytes(ret)
+	if onchain.Cmp(config.ChainID) != 0 {
+		return fmt.Errorf("pgp system contracts: the deployed system contracts carry bscChainID=%s but this chain "+
+			"runs %s; double-sign evidence would be verified against the wrong domain and slashing would never "+
+			"work (F-01). Fix the genesis chain id before block %d",
+			onchain, config.ChainID, deployHeight)
+	}
+	return nil
 }
