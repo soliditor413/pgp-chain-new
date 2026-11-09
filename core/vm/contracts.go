@@ -579,7 +579,61 @@ func init() {
 	}
 }
 
+// lookaheadApplies reports whether the lookahead overlay below may add 0x68/0x69
+// on top of what the fork level provides.
+//
+// pgp retires the PBFT era at ForkHeight but keeps running the BSC system
+// contracts, and two of them need those two precompiles:
+//
+//	SlashIndicator.submitDoubleSignEvidence   staticcall 0x68 -> verifyDoubleSignEvidence
+//	TokenRecoverPortal._verifySecp256k1Sig    staticcall 0x69 -> secp256k1SignatureRecover
+//
+// Upstream only adds them at Feynman, a time-based fork this chain keeps off
+// (FeynmanTime is the MaxUint64 sentinel), so without this overlay both calls hit
+// an empty account: the staticcall still SUCCEEDS, returndata is empty, and the
+// contracts read a zero signer -- double-sign slashing degrades into a permanent
+// "validator not migrated" revert and the recover portal into InvalidProof.
+// Neither is observable any other way than trying to slash.
+//
+// The two legs where the overlay must stay out: IsPGPLegacy (historical replay
+// has to remain byte-exact) and non-BSC chains (they must not inherit a
+// BSC-only precompile at all). Fork levels at or above Feynman already carry
+// both addresses, which the callers detect per entry rather than per fork, so a
+// future set that ships a different implementation is left alone.
+func lookaheadApplies(rules params.Rules) bool {
+	return rules.IsInBSC && !rules.IsPGPLegacy
+}
+
+// lookaheadPrecompiles returns the two addresses and implementations the overlay
+// installs, taken from the Feynman set so there is one definition of each.
+func lookaheadPrecompiles() (common.Address, PrecompiledContract, common.Address, PrecompiledContract) {
+	addr68 := common.BytesToAddress([]byte{0x68})
+	addr69 := common.BytesToAddress([]byte{0x69})
+	return addr68, PrecompiledContractsFeynman[addr68], addr69, PrecompiledContractsFeynman[addr69]
+}
+
 func activePrecompiledContracts(rules params.Rules) PrecompiledContracts {
+	set := selectPrecompiledContracts(rules)
+	if !lookaheadApplies(rules) {
+		return set
+	}
+	addr68, p68, addr69, p69 := lookaheadPrecompiles()
+	_, has68 := set[addr68]
+	_, has69 := set[addr69]
+	if has68 && has69 {
+		return set
+	}
+	out := maps.Clone(set)
+	if !has68 {
+		out[addr68] = p68
+	}
+	if !has69 {
+		out[addr69] = p69
+	}
+	return out
+}
+
+func selectPrecompiledContracts(rules params.Rules) PrecompiledContracts {
 	switch {
 	// pgp-chain legacy rules come first and unconditionally: their set is
 	// neither an Ethereum fork's nor a BSC fork's, it is the nine Ethereum
@@ -649,7 +703,42 @@ func ActivePrecompiledContracts(rules params.Rules) PrecompiledContracts {
 }
 
 // ActivePrecompiles returns the precompile addresses enabled with the current configuration.
+//
+// This slice is the EIP-2929 warm set handed to state.Prepare, so it has to agree
+// key for key with activePrecompiledContracts -- including the lookahead overlay,
+// or 0x68/0x69 would be runnable but cold (2600 gas instead of 100 on first
+// access), and a dispatch/warm mismatch is exactly what that agreement test
+// catches.
 func ActivePrecompiles(rules params.Rules) []common.Address {
+	set := selectPrecompiledAddresses(rules)
+	if !lookaheadApplies(rules) {
+		return set
+	}
+	addr68, _, addr69, _ := lookaheadPrecompiles()
+	has68, has69 := false, false
+	for _, a := range set {
+		if a == addr68 {
+			has68 = true
+		}
+		if a == addr69 {
+			has69 = true
+		}
+	}
+	if has68 && has69 {
+		return set
+	}
+	out := make([]common.Address, 0, len(set)+2)
+	out = append(out, set...)
+	if !has68 {
+		out = append(out, addr68)
+	}
+	if !has69 {
+		out = append(out, addr69)
+	}
+	return out
+}
+
+func selectPrecompiledAddresses(rules params.Rules) []common.Address {
 	switch {
 	// Must stay the first case, for the same reason as in
 	// activePrecompiledContracts above: this slice is the EIP-2929 warm set
