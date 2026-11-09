@@ -244,13 +244,13 @@ v1 只写「规范序列化」，跨语言会飘。定死为**标准紧凑 JSON*
 - `imageHash = keccak256(UTF8(canonicalJSON(entries)))`；
 - **规范形态由钉子测试保证**：`core/systemcontracts/pgp/image_test.go` 硬编码期望的 `imageHash` 字面量，生成脚本或重算实现的任何编码漂移都会立刻变红。散文描述永远可以被误读，钉子不会。
 
-当前值（17 个账户、`bsc-genesis-contract@041881a` + 未提交改动）：
+当前值（17 个账户、`bsc-genesis-contract@5d2d047`，tag `pgp-fork-v1`）：
 
 ```
 0xa8c971b64963244867be207c1ddebad4c4e6a1a214127c9907be92829a1c3484
 ```
 
-> 该值在 F-02 修复（protector 由单一 EOA 换成多签，见 `audit/04-verification.md` §F-02.1）之后重钉：只有 `BSCGovernor` / `StakeHub` / `TokenRecoverPortal` 三份字节码变化，其余 14 份逐字节未动，已用 `cast keccak` 独立复算核对。
+> 该值在 F-02 修复（protector 由单一 EOA 换成多签，见 `audit/04-verification.md` §F-02.2）之后重钉：只有 `BSCGovernor` / `StakeHub` / `TokenRecoverPortal` 三份字节码变化，其余 14 份逐字节未动，已用 `cast keccak` 独立复算核对。新 protector 已在 pgp 主网实测为 **2-of-3 多签**（`required() = 2`、3 个 owner、6,424 B 代码），`pause()` / `_setProtector` 因此真实可达。注意它不是 Gnosis Safe：接口是 `required()` 而非 `getThreshold()`，运维不要拿 Safe 的工具链去操作它。
 
 > 为什么是「整数原样」而不是「数字转字符串」：数字原样就是标准紧凑 JSON，任何语言的 stdlib 都能复现；而「数字转字符串」是自定义子集，第三方实现更容易写错——本轮实现就曾照着错误的注释写偏过一次，钉子的存在正是为了避免同一类事故重演。
 
