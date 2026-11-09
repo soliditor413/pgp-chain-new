@@ -481,6 +481,11 @@ func checkPGPDatabaseMatch(cfg *params.ChainConfig, ghash common.Hash) error {
 	if cfg == nil || cfg.ChainID == nil || ghash == params.PGPGenesisHash {
 		return nil
 	}
+	if cfg.Legacy != nil && cfg.Legacy.AllowForeignGenesis {
+		// A devnet that deliberately reuses pgp mainnet's chain id so the system
+		// contracts' bscChainID matches (see LegacyConfig.AllowForeignGenesis).
+		return nil
+	}
 	if cfg.ChainID.Cmp(params.PGPChainConfig.ChainID) != 0 {
 		return nil
 	}

@@ -351,3 +351,38 @@ func TestBinaryGenesisCommit(t *testing.T) {
 		t.Fatal("could not find node")
 	}
 }
+
+// TestCheckPGPDatabaseMatch pins the safety net and its one sanctioned exception.
+//
+// The net refuses a pgp mainnet chain id on a database whose genesis is not the
+// built-in one -- that is the "mainnet config pointed at a BSC datadir" mistake.
+// AllowForeignGenesis is how a devnet says "yes, I mean to reuse 860621": the
+// system contracts carry bscChainID as a compile-time constant, so a devnet on
+// any other id can never rehearse double-sign slashing (F-01).
+func TestCheckPGPDatabaseMatch(t *testing.T) {
+	foreign := common.HexToHash("0x3ff99d0a00000000000000000000000000000000000000000000000000000000")
+	mainnetID := new(big.Int).Set(params.PGPChainConfig.ChainID)
+
+	for _, tc := range []struct {
+		name    string
+		chainID *big.Int
+		genesis common.Hash
+		allow   bool
+		wantErr bool
+	}{
+		{name: "built-in genesis", chainID: mainnetID, genesis: params.PGPGenesisHash},
+		{name: "foreign genesis, no opt-in", chainID: mainnetID, genesis: foreign, wantErr: true},
+		{name: "foreign genesis, opt-in", chainID: mainnetID, genesis: foreign, allow: true},
+		{name: "other chain id", chainID: big.NewInt(8606211), genesis: foreign},
+		{name: "nil legacy", chainID: mainnetID, genesis: foreign, wantErr: true},
+	} {
+		cfg := &params.ChainConfig{ChainID: tc.chainID}
+		if tc.name != "nil legacy" {
+			cfg.Legacy = &params.LegacyConfig{AllowForeignGenesis: tc.allow}
+		}
+		err := checkPGPDatabaseMatch(cfg, tc.genesis)
+		if (err != nil) != tc.wantErr {
+			t.Errorf("%s: err = %v, wantErr %v", tc.name, err, tc.wantErr)
+		}
+	}
+}

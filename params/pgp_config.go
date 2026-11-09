@@ -66,6 +66,23 @@ type LegacyConfig struct {
 	// launch configuration rather than from the code.
 	PassBalance uint64 `json:"passBalance,omitempty"`
 
+	// AllowForeignGenesis lets a chain keep pgp mainnet's chain id (860621) while
+	// running on a genesis that is not PGPGenesisHash.
+	//
+	// It exists for devnets only. The system contracts carry
+	// `bscChainID = 860621` as a compile-time constant and SlashIndicator hands
+	// it to the 0x68 precompile as the domain of the double-sign evidence, so a
+	// devnet on a different chain id can never rehearse slashing: the recovered
+	// signer is always wrong and the evidence check reverts with "validator not
+	// migrated" (F-01). Reusing 860621 is the only way to exercise that path
+	// before mainnet, and it conflicts with the safety net in
+	// core.checkPGPDatabaseMatch, which otherwise refuses to start a 860621
+	// configuration on a database whose genesis is not the pgp one.
+	//
+	// Leave it false everywhere else: the net it disables is what stops a
+	// mainnet configuration from silently running on top of a BSC datadir.
+	AllowForeignGenesis bool `json:"allowForeignGenesis,omitempty"`
+
 	// VerifySeal enables PBFT confirm signature verification while replaying the
 	// legacy history. It is ON for mainnet: verifying the blocks is the point,
 	// and an implementation that is only reachable by an operator flag verifies

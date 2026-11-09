@@ -146,6 +146,10 @@ def build_config(args, validators):
             "forkHeight": args.fork_height,
             # 0 表示不启用协议注入（旧行为：代码由下面的 alloc 带进来）。
             "systemContractDeployHeight": args.deploy_height,
+            # devnet 复用主网 chainId 860621（系统合约里编死了 bscChainID），
+            # 但 genesis 不是主网的 0xaab1ef44…，所以要显式放行
+            # core.checkPGPDatabaseMatch 那道安全网。
+            "allowForeignGenesis": True,
             "gasFeeRecipient": args.gas_fee_recipient,
             "gasFeeRecipientRatio": args.gas_fee_recipient_ratio,
             "passBalance": 0,
@@ -169,7 +173,10 @@ def main() -> int:
     ap.add_argument("--contracts-out", required=True, help="bsc-genesis-contract/out 目录")
     ap.add_argument("--validators", required=True, help="validators conf（5 列）")
     ap.add_argument("--fork-height", type=int, default=20)
-    ap.add_argument("--chain-id", type=int, default=8606211)
+    ap.add_argument("--chain-id", type=int, default=860621,
+                    help="默认与 pgp 主网一致：系统合约内编译了 bscChainID=860621，"
+                         "双签取证的签名域用它，chainId 不同则罚没永远失败（F-01）。"
+                         "配合 legacy.allowForeignGenesis 规避 genesis 不匹配的启动检查。")
     ap.add_argument("--voting-power", type=int, default=100)
     ap.add_argument("--cabinets", type=int, default=0, help="0 = 取验证人数")
     ap.add_argument("--gas-fee-recipient", default="0x0000000000000000000000000000000000000000")
