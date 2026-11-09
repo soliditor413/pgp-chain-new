@@ -1,8 +1,8 @@
 {
   "version": 1,
   "sourceRepo": "github.com/pgprotocol/bsc-genesis-contract",
-  "sourceCommit": "5d2d047ee76f8bafcd9bd95107c89d7a60775b58",
-  "sourceTag": "pgp-fork-v1",
+  "sourceCommit": "6895b8c0acc944b80a172eec38da3e9fa66ead65",
+  "sourceTag": "pgp-fork-v2",
   "sourceDirty": false,
   "dirtyDiffSha256": "0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "foundry": {
@@ -16,8 +16,8 @@
       "name": "BSCValidatorSet",
       "source": "contracts/BSCValidatorSet.sol",
       "solc": "0.6.4",
-      "codeLen": 28458,
-      "codeHash": "0x5ead5409a4b591204810852025c6e6eaf7fe51be6d9dc404f839408a162437ec",
+      "codeLen": 28612,
+      "codeHash": "0xb1fa0f9033187400ba114db18ad647436c8c683fa366669444a165448a6b9fad",
       "initSignature": "init(bytes,uint256)",
       "initSelector": "0x1663df00",
       "deployInit": true
@@ -27,8 +27,8 @@
       "name": "SlashIndicator",
       "source": "contracts/SlashIndicator.sol",
       "solc": "0.6.4",
-      "codeLen": 13215,
-      "codeHash": "0x8c008541986bb5dc1f025f54655a940f0875b502496331f757c1b6fc14447ee5",
+      "codeLen": 13276,
+      "codeHash": "0xe536b11ade8b37b4295daf3a897ed6859dec85edb4a0e289119e34db6a7de80d",
       "initSignature": "init()",
       "initSelector": "0xe1c7392a",
       "deployInit": true
@@ -49,8 +49,8 @@
       "name": "TendermintLightClient",
       "source": "contracts/deprecated/TendermintLightClient.sol",
       "solc": "0.6.4",
-      "codeLen": 3667,
-      "codeHash": "0x2147bdc726d41e372f681424764fcdf49c5c4b74729cdea6e7aeb030b4931121",
+      "codeLen": 3848,
+      "codeHash": "0x582d2e81ca16dfc1aecb63f07d7e0c2dc6bb76614ec0a5f490bba66135d8fa8c",
       "initSignature": "init()",
       "initSelector": "0xe1c7392a",
       "deployInit": true
@@ -60,8 +60,8 @@
       "name": "TokenHub",
       "source": "contracts/TokenHub.sol",
       "solc": "0.6.4",
-      "codeLen": 8288,
-      "codeHash": "0x6704e507908ddd250c2b8944dbca0edd07f1d477ca18783b3182645eddbfc946",
+      "codeLen": 8469,
+      "codeHash": "0x0bf0edbde884a72e87195126e09589b49966098df97bcf2ccca494fbd973ed00",
       "initSignature": "init()",
       "initSelector": "0xe1c7392a",
       "deployInit": true
@@ -71,8 +71,8 @@
       "name": "RelayerIncentivize",
       "source": "contracts/deprecated/RelayerIncentivize.sol",
       "solc": "0.6.4",
-      "codeLen": 2782,
-      "codeHash": "0xa6f7936c21040c09abe4d023ef23bfb262e6d190f191bdf57c4b3a95c47dbf64",
+      "codeLen": 2963,
+      "codeHash": "0x6fd248798ac1b5bf9277c7b82990ae84da198cb2f2a9d49ce6056c5a755faec4",
       "initSignature": "init()",
       "initSelector": "0xe1c7392a",
       "deployInit": true
@@ -82,8 +82,8 @@
       "name": "RelayerHub",
       "source": "contracts/deprecated/RelayerHub.sol",
       "solc": "0.6.4",
-      "codeLen": 2736,
-      "codeHash": "0x9f81c06fbf3492a3d8e79b337183ac220eb8d14bdd00944a6891d06ccaa2d6b3",
+      "codeLen": 2917,
+      "codeHash": "0xf9bab0f8a883f37491c9ff5de66ae3fc0ed2284f51944b32aa684d58370a6b3d",
       "initSignature": "init()",
       "initSelector": "0xe1c7392a",
       "deployInit": true
@@ -115,8 +115,8 @@
       "name": "CrossChain",
       "source": "contracts/deprecated/CrossChain.sol",
       "solc": "0.6.4",
-      "codeLen": 6074,
-      "codeHash": "0x9b5c61b811d9453d840d42b2eebd092fb860723b59b1786dba490a6ecaa1dffd",
+      "codeLen": 6255,
+      "codeHash": "0x5333293ee6756aabc25207919b52c870811c119bbf7e5fc2ee2b457656283ef9",
       "initSignature": "init()",
       "initSelector": "0xe1c7392a",
       "deployInit": true
@@ -199,5 +199,5 @@
       "deployInit": true
     }
   ],
-  "imageHash": "0xa8c971b64963244867be207c1ddebad4c4e6a1a214127c9907be92829a1c3484"
+  "imageHash": "0x2449787cec9d37da1e5d43f9e07cd69be77caf10f1717238ad8e31342d0235c4"
 }

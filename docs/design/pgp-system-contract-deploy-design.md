@@ -14,6 +14,7 @@
 |---|---|
 | v1 | 初稿。选了 S3（零窗口）方向，但字节码来源、`alreadyInit`、ABI 路径三处判断错误 |
 | **v2** | 按设计评审重写 §5.2 / §6 / §7；新增 §7.5（StakeHub 经济闭环）、R15–R17；修正 D/F 约束矛盾；补充边界情况 |
+| **v3** | 跟进 F-02 / F-03 / F-04 的落地：§3.1 与 §7.1 的「`init` 只受 `onlyNotInit`」改为「另加 `onlyCoinbase onlyZeroGasPrice` + 255 上限」；§7.4 的 `imageHash` 重钉为 `pgp-fork-v2` 的 `0x2449787c…`，并列出前两代钉子 |
 
 **v1 被证伪的三条（均已独立复核）**：
 
@@ -75,8 +76,9 @@ func DefaultPGPGenesisBlock() *Genesis {
 ### 3.1 初始化必须与代码同块完成（S3）
 
 1. **用户交易先于系统交易**。注意 v1 的论据有误：`core/state_processor.go:203-207` 那条「系统交易后不得再有普通交易」的检查被 `IsCancun` 门控，而 `PGPChainConfig` 未启 Cancun → 该检查在 pgp 上**不生效**。但结论不变：系统交易仍在 `Finalize` 阶段执行（`parlia.go:1544`），即在全部用户交易之后。
-2. **`init()` 是外部可调、只受「未初始化」守卫**（`BSCValidatorSet.sol:162` 为 `external onlyNotInit`，`System.sol:41` 的 `require(!alreadyInit)` 无调用者限制）。
-3. 因此若代码在 D 落盘、init 留到 F，**D 到 F 之间**（legacy 段）任何 EOA 都能先调 `init()`：恶意 payload ⇒ 验证人集合被写死；垃圾 payload ⇒ F 块 revert、全网停在 ForkHeight。
+2. **`init()` 是外部可调、只受「未初始化」守卫**（`BSCValidatorSet.sol:162` 为 `external onlyNotInit`，`System.sol:41` 的 `require(!alreadyInit)` 无调用者限制）。**F-03 之后这条不再成立**：7 个 0.6.4 世代的初始化函数都加了 `onlyCoinbase onlyZeroGasPrice`（见 §7.1），普通交易再也够不到它们。
+3. 因此若代码在 D 落盘、init 留到 F，**D 到 F 之间**（legacy 段）任何 EOA 都能先调 `init()`：恶意 payload ⇒ 验证人集合被写死；垃圾 payload ⇒ F 块 revert、全网停在 ForkHeight。（这一条是 S3 的**历史依据**；即便现在有调用者闸门，S3 仍然是对的——它把窗口压到零，而闸门只是第二道防线。）
+
 
 **定案 S3**：代码、初始化调用在 D 块块首、用户交易之前，同一协议步完成；F 块不再做合约动作。
 
@@ -197,13 +199,13 @@ if !chainConfig.IsLuban(header.Number) { /* 走 pre-Luban ABI */ }
 
 | 类 | 地址 | 合约 | source file | 初始化入口 | 做法 |
 |---|---|---|---|---|---|
-| A1 | `0x1000` | BSCValidatorSet | `contracts/BSCValidatorSet.sol` | `init(bytes,uint256)`，`external onlyNotInit`（`BSCValidatorSet.sol:162`） | 协议内 EVM 调用，payload 由 `Legacy.ParliaGenesis*` 编码（selector `0x1663df00`） |
-| A2 | `0x1001` | SlashIndicator | `contracts/SlashIndicator.sol` | `init()`，`onlyNotInit` | 协议内 EVM 调用，selector `0xe1c7392a` |
-| A2 | `0x1003` | TendermintLightClient | `contracts/deprecated/TendermintLightClient.sol` | `init()`，`onlyNotInit` | 同上 |
-| A2 | `0x1004` | TokenHub | `contracts/TokenHub.sol` | `init()`，`onlyNotInit` | 同上 |
-| A2 | `0x1005` | RelayerIncentivize | `contracts/deprecated/RelayerIncentivize.sol` | `init()`，`onlyNotInit` | 同上 |
-| A2 | `0x1006` | RelayerHub | `contracts/deprecated/RelayerHub.sol` | `init()`，`onlyNotInit` | 同上 |
-| A2 | `0x2000` | CrossChain | `contracts/deprecated/CrossChain.sol` | `init()`，`onlyNotInit` | 同上 |
+| A1 | `0x1000` | BSCValidatorSet | `contracts/BSCValidatorSet.sol` | `init(bytes,uint256)`，`external onlyNotInit onlyCoinbase onlyZeroGasPrice`，且 `require(len <= 255)` | 协议内 EVM 调用（`from = coinbase = SystemAddress`、`gasPrice = 0` 满足修饰器），payload 由 `Legacy.ParliaGenesis*` 编码（selector `0x1663df00`） |
+| A2 | `0x1001` | SlashIndicator | `contracts/SlashIndicator.sol` | `init()`，`onlyNotInit onlyCoinbase onlyZeroGasPrice` | 协议内 EVM 调用，selector `0xe1c7392a` |
+| A2 | `0x1003` | TendermintLightClient | `contracts/deprecated/TendermintLightClient.sol` | `init()`，`onlyNotInit onlyCoinbase onlyZeroGasPrice` | 同上 |
+| A2 | `0x1004` | TokenHub | `contracts/TokenHub.sol` | `init()`，`onlyNotInit onlyCoinbase onlyZeroGasPrice` | 同上 |
+| A2 | `0x1005` | RelayerIncentivize | `contracts/deprecated/RelayerIncentivize.sol` | `init()`，`onlyNotInit onlyCoinbase onlyZeroGasPrice` | 同上 |
+| A2 | `0x1006` | RelayerHub | `contracts/deprecated/RelayerHub.sol` | `init()`，`onlyNotInit onlyCoinbase onlyZeroGasPrice` | 同上 |
+| A2 | `0x2000` | CrossChain | `contracts/deprecated/CrossChain.sol` | `init()`，`onlyNotInit onlyCoinbase onlyZeroGasPrice` | 同上 |
 | B1 | `0x2002` | StakeHub | `contracts/StakeHub.sol` | `initialize()`，`initializer onlyCoinbase onlyZeroGasPrice` | **协议内 EVM 调用**（`from = coinbase`、`gasPrice = 0` 天然满足修饰器） |
 | B1 | `0x2004` | BSCGovernor | `contracts/BSCGovernor.sol` | `initialize()` | 同上 |
 | B1 | `0x2005` | GovToken | `contracts/GovToken.sol` | `initialize()` | 同上 |
@@ -244,13 +246,15 @@ v1 只写「规范序列化」，跨语言会飘。定死为**标准紧凑 JSON*
 - `imageHash = keccak256(UTF8(canonicalJSON(entries)))`；
 - **规范形态由钉子测试保证**：`core/systemcontracts/pgp/image_test.go` 硬编码期望的 `imageHash` 字面量，生成脚本或重算实现的任何编码漂移都会立刻变红。散文描述永远可以被误读，钉子不会。
 
-当前值（17 个账户、`bsc-genesis-contract@5d2d047`，tag `pgp-fork-v1`）：
+当前值（17 个账户、`bsc-genesis-contract@6895b8c`，tag `pgp-fork-v2`）：
 
 ```
-0xa8c971b64963244867be207c1ddebad4c4e6a1a214127c9907be92829a1c3484
+0x2449787cec9d37da1e5d43f9e07cd69be77caf10f1717238ad8e31342d0235c4
 ```
 
-> 该值在 F-02 修复（protector 由单一 EOA 换成多签，见 `audit/04-verification.md` §F-02.2）之后重钉：只有 `BSCGovernor` / `StakeHub` / `TokenRecoverPortal` 三份字节码变化，其余 14 份逐字节未动，已用 `cast keccak` 独立复算核对。新 protector 已在 pgp 主网实测为 **2-of-3 多签**（`required() = 2`、3 个 owner、6,424 B 代码），`pause()` / `_setProtector` 因此真实可达。注意它不是 Gnosis Safe：接口是 `required()` 而非 `getThreshold()`，运维不要拿 Safe 的工具链去操作它。
+> 该值目前在 F-03 之后：7 个 0.6.4 世代的 `init()` 加上 `onlyCoinbase onlyZeroGasPrice`，`BSCValidatorSet.init` 另加 `require(length <= 255)`。相对 `pgp-fork-v1` 只有这 7 份字节码变化（其余 10 份逐字节未动），已用 `cast keccak` 对 canonical entries 独立复算核对。
+
+> 前两代钉子，留给需要追溯的人：`0xf2e29a3c…`（`pgp-fork-v1` 之前的脏树）→ `0xa8c971b6…`（`pgp-fork-v1`，含 F-02 换 protector：只有 `BSCGovernor` / `StakeHub` / `TokenRecoverPortal` 三份变化，其余 14 份逐字节未动）→ 现在的 `0x2449787c…`。新 protector `0x1Bb1Fe98…` 已在 pgp 主网实测为 **2-of-3 多签**（`required() = 2`、3 个 owner、6,424 B 代码），`pause()` / `_setProtector` 因此真实可达。注意它不是 Gnosis Safe：接口是 `required()` 而非 `getThreshold()`，运维不要拿 Safe 的工具链去操作它。
 
 > 为什么是「整数原样」而不是「数字转字符串」：数字原样就是标准紧凑 JSON，任何语言的 stdlib 都能复现；而「数字转字符串」是自定义子集，第三方实现更容易写错——本轮实现就曾照着错误的注释写偏过一次，钉子的存在正是为了避免同一类事故重演。
 

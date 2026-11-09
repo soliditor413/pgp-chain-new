@@ -19,6 +19,7 @@ import (
 	"github.com/ethereum/go-ethereum/core/state"
 	"github.com/ethereum/go-ethereum/core/systemcontracts"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/pgp"
+	"github.com/ethereum/go-ethereum/core/tracing"
 	"github.com/ethereum/go-ethereum/core/types"
 	"github.com/ethereum/go-ethereum/core/vm"
 	"github.com/ethereum/go-ethereum/crypto"
@@ -211,6 +212,83 @@ func TestDeployRejectsMismatchedChainID(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "bscChainID") {
 		t.Fatalf("error does not name the mismatch: %v", err)
+	}
+}
+
+// TestLegacyInitRejectsOrdinaryCaller covers F-03.
+//
+// Seven of the twelve initialisers belong to the 0.6.4 generation and used to
+// carry onlyNotInit and nothing else, which made the deploy step's ordering the
+// single thing standing between a user transaction and a one-shot write that
+// cannot be undone. They now carry onlyCoinbase + onlyZeroGasPrice, the pair
+// every 0.8.x initialiser already had.
+//
+// The assertions run against the shipped image, not against the Solidity source:
+// the bytes installed here are exactly the bytes block D installs, so this also
+// catches an image that drifted from the sources it claims to come from.
+func TestLegacyInitRejectsOrdinaryCaller(t *testing.T) {
+	cfg := deployTestConfig()
+	chain := &deployTestChain{cfg: cfg}
+
+	// Code only, no initialisers -- the state an attacker would find if the deploy
+	// step ever ran in a different order, or on a node that skipped it.
+	statedb := deployTestState(t)
+	for _, e := range pgp.Entries() {
+		statedb.SetCode(e.Address, e.Code, tracing.CodeChangeSystemContractUpgrade)
+	}
+	slash := common.HexToAddress(systemcontracts.SlashContract)
+	initData := crypto.Keccak256([]byte("init()"))[:4]
+
+	attempt := func(coinbase, from common.Address, gasPrice int64) (string, error) {
+		ctx := NewEVMBlockContext(deployTestHeader(deployTestHeight), chain, &coinbase)
+		if ctx.BaseFee == nil {
+			ctx.BaseFee = new(big.Int)
+		}
+		evm := vm.NewEVM(ctx, statedb, cfg, vm.Config{})
+		defer evm.Release()
+		msg := &Message{
+			From:      from,
+			GasLimit:  1_000_000,
+			GasPrice:  uint256.NewInt(uint64(gasPrice)),
+			GasFeeCap: uint256.NewInt(uint64(gasPrice)),
+			GasTipCap: uint256.NewInt(0),
+			To:        &slash,
+			Data:      initData,
+		}
+		evm.SetTxContext(NewEVMTxContext(msg))
+		ret, _, err := evm.Call(msg.From, slash, initData, vm.NewGasBudget(1_000_000), common.U2560)
+		if err != nil {
+			// The revert data, not the error, carries the reason: a bare
+			// ErrExecutionReverted would also be produced by a plain require(false).
+			reason, _ := abi.UnpackRevert(ret)
+			return reason, err
+		}
+		return "", nil
+	}
+
+	// A plain transaction from an ordinary account.
+	reason, err := attempt(common.HexToAddress("0x00000000000000000000000000000000000000aa"), common.HexToAddress("0x000000000000000000000000000000000000dead"), 0)
+	if err == nil {
+		t.Fatal("an ordinary caller initialised the contract")
+	}
+	if want := "the message sender must be the block producer"; reason != want {
+		t.Fatalf("ordinary caller: revert reason %q, want %q", reason, want)
+	}
+
+	// The block producer, but inside a priced transaction. onlyCoinbase alone would
+	// let a producer hide the call among user transactions.
+	reason, err = attempt(params.SystemAddress, params.SystemAddress, 1)
+	if err == nil {
+		t.Fatal("the producer initialised the contract inside a priced transaction")
+	}
+	if want := "gasprice is not zero"; reason != want {
+		t.Fatalf("producer with a gas price: revert reason %q, want %q", reason, want)
+	}
+
+	// The legitimate context still initialises, which is what proves neither
+	// rejection consumed the one-shot write.
+	if err := TryDeployPGPSystemContracts(cfg, deployTestHeader(deployTestHeight), chain, statedb, vm.Config{}); err != nil {
+		t.Fatalf("deploy after the rejected attempts: %v", err)
 	}
 }
 

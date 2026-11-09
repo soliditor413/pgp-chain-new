@@ -22,13 +22,16 @@ which address, initialised how".
 ## Provenance: this is NOT upstream v1.2.6
 
 Source: `github.com/pgprotocol/bsc-genesis-contract`, commit
-`5d2d047ee76f8bafcd9bd95107c89d7a60775b58`, tag **`pgp-fork-v1`** — the fork's
-own commit on top of upstream v1.2.6 (`041881a`). 8 contracts carry the fork's
-work:
+`6895b8c0acc944b80a172eec38da3e9fa66ead65`, tag **`pgp-fork-v2`** — the fork's
+own history on top of upstream v1.2.6 (`041881a`). 8 contracts differ from
+upstream, and 7 more differ from the first pinned image (`pgp-fork-v1`,
+`5d2d047`) because their initialisers gained the caller gate described below:
 
 `BSCValidatorSet`, `SlashIndicator`, `System.sol` (`bscChainID = 860621`),
 `StakeHub`, `BSCGovernor`, `GovToken`, `TokenRecoverPortal`,
-`extension/BSCValidatorSetTool`.
+`extension/BSCValidatorSetTool`; plus `TokenHub` and the deprecated
+`TendermintLightClient`, `RelayerIncentivize`, `RelayerHub`, `CrossChain`, whose
+`init()` now requires `onlyCoinbase onlyZeroGasPrice`.
 
 So the bytecode here is **byte-for-byte different from the upstream tag**, by
 design. `manifest.json` records exactly where it came from:
@@ -49,10 +52,10 @@ The two-major span matters to an auditor asking "was this one build": it was one
 ## Regenerating
 
 From the bsc repo root, with `bsc-genesis-contract` checked out at
-`pgp-fork-v1` next to it and built:
+`pgp-fork-v2` next to it and built:
 
 ```
-git -C ../bsc-genesis-contract checkout pgp-fork-v1
+git -C ../bsc-genesis-contract checkout pgp-fork-v2
 forge build --force --root ../bsc-genesis-contract
 python3 scripts/pgp-image-gen.py --artifacts ../bsc-genesis-contract/out
 python3 scripts/pgp-image-gen.py --artifacts ../bsc-genesis-contract/out --check   # exits 0 if identical
@@ -64,7 +67,7 @@ imports resolve through it, and it is not vendored.
 
 The output contains no timestamps, absolute paths or hostnames, so the same
 inputs produce byte-identical files. This was verified end to end: a clean
-worktree of `pgp-fork-v1`, `forge build --force`, and the regenerated image
+worktree of `pgp-fork-v2`, `forge build --force`, and the regenerated image
 matched all 17 files byte for byte.
 
 ## Gates the generator enforces (G1–G7)
