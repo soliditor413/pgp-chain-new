@@ -30,7 +30,9 @@ func TestCheckDeployHeight(t *testing.T) {
 		wantError string // empty means "must be accepted"
 	}{
 		{"no injection on an unforked chain", math.MaxUint64, 0, ""},
-		{"no injection on a forked chain", 100, 0, ""},
+		// F-18: a forked chain without an injection has no initialisation path
+		// left, so it is a config error rather than a silently broken chain.
+		{"no injection on a forked chain", 100, 0, "requires legacy.systemContractDeployHeight"},
 		{"normal", 100, 10, ""},
 		{"tightest legal", 100, 98, ""},
 		{"two blocks below the fork", 4, 2, ""},

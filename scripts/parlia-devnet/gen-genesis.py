@@ -193,10 +193,11 @@ def main() -> int:
     ap.add_argument("--verify-seal", choices=["true", "false"], default=None,
                     help="是否校验 PBFT confirm。默认在有 producers 时为 true，否则 false")
     ap.add_argument("--out", required=True)
-    ap.add_argument("--deploy-height", type=int, default=0,
+    ap.add_argument("--deploy-height", type=int, default=None,
                     help="Legacy.systemContractDeployHeight：协议在这个高度安装并初始化 17 个"
-                         "系统合约。0 表示不启用（沿用 genesis alloc 带代码的旧行为）。"
-                         "启用时必须满足 2 <= D <= ForkHeight-2。")
+                         "系统合约，必须满足 2 <= D <= ForkHeight-2。默认 ForkHeight-2。"
+                         "显式传 0 会生成一个没有初始化路径的 genesis，geth 启动时会拒绝"
+                         "（块 1 初始化那条路已删除，见 F-18）。")
     ap.add_argument("--luban-sentinel", action="store_true",
                     help="把 lubanBlock 钉在哨兵高度，表示 Luban 不启用：引擎全程走 "
                          "pre-Luban 的 extraData 格式（无 validator count 前缀、无 BLS 公钥、"
@@ -209,6 +210,14 @@ def main() -> int:
     validators = parse_validators(args.validators)
     if args.fork_height <= 0:
         sys.exit("--fork-height 必须 > 0；这里是「从哪个高度起切 Parlia」，不是「Parlia 从 0 开始」")
+    # 分叉形态要求 D 存在：块 1 初始化那条路已删除（F-18），没有 D 就没有任何
+    # 初始化路径，Parlia 会在分叉块读到一个空的验证人集合。所以 D 默认 F-2，
+    # 而 F 至少要 4（D >= 2 且 D <= F-2）。
+    if args.deploy_height is None:
+        args.deploy_height = args.fork_height - 2
+    if args.fork_height < 4 and args.deploy_height:
+        sys.exit(f"--fork-height={args.fork_height} 太小：D 必须 >= 2 且 <= F-2，"
+                 "所以 F 至少 4。Parlia 从创世开始的形态已不支持（见 F-18）")
     if args.deploy_height:
         if args.deploy_height < 2:
             sys.exit("--deploy-height 必须 >= 2：12 个初始化调用会把剩余 gas 全部转发给"
@@ -217,8 +226,9 @@ def main() -> int:
             sys.exit(f"--deploy-height={args.deploy_height} 必须 <= fork-height-2="
                      f"{args.fork_height - 2}：ForkHeight 块要读 0x1000 的验证人集合，"
                      "并留一个块给注入失败时补救")
-    elif args.omit_system_contract_alloc:
-        sys.exit("--omit-system-contract-alloc 必须配 --deploy-height，否则 0x1000 永远没有代码")
+    else:
+        sys.exit("--deploy-height=0 生成的 genesis 没有系统合约初始化路径；"
+                 "块 1 初始化已删除（F-18），请给一个 D（默认 F-2）")
     if args.cabinets and args.cabinets != len(validators):
         sys.exit(f"--cabinets={args.cabinets} 与验证人数 {len(validators)} 不一致")
 

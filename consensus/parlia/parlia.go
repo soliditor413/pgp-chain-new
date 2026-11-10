@@ -1555,21 +1555,14 @@ func (p *Parlia) Finalize(chain consensus.ChainHeaderReader, header *types.Heade
 
 	// No block rewards in PoA, so the state remains as is and uncles are dropped
 	//
-	// Upstream initialises the system contracts in block 1, and so does this
-	// chain: block 1 is a legacy block whose alloc carries no code, so the call
-	// is a no-op, and replaying history depends on it staying that way.
-	//
-	// The Parlia-era initialisation does NOT happen here any more. It happens at
-	// Legacy.SystemContractDeployHeight, in the protocol, before the fork block
-	// (core/systemcontracts/deploy_pgp.go). Initialising at ForkHeight as well
-	// would revert every contract: they are already initialised by then, and a
-	// revert here fails the block and halts the chain at the fork.
-	if p.shouldInitContract(header.Number) {
-		err := p.initContract(state, header, cx, txs, receipts, systemTxs, usedGas, systemTxImporting, tracer)
-		if err != nil {
-			return fmt.Errorf("init contract failed: %w", err)
-		}
-	}
+	// Upstream initialises the system contracts here, in block 1. This chain does
+	// not: there is exactly one initialisation path, at
+	// Legacy.SystemContractDeployHeight, run by core/pgp_systemcontract_deploy.go.
+	// Keeping the block-1 call as a second path is what F-18 was -- it sends
+	// init(), and the validator contract only has init(bytes,uint256) -- and it
+	// can only ever be reached by a configuration that runs Parlia from genesis,
+	// which is not the shape this chain is tested or deployed in. A forked chain
+	// without a deploy height is rejected at config load instead.
 	if header.Difficulty.Cmp(diffInTurn) != 0 {
 		snap, err := p.snapshot(chain, header.Number.Uint64()-1, header.ParentHash, nil)
 		if err != nil {
@@ -1672,15 +1665,8 @@ func (p *Parlia) finalizeAndAssemble(chain consensus.ChainHeaderReader, header *
 		}
 	}
 
-	// See Finalize: only block 1 initialises the system contracts here. The
-	// Parlia-era set is installed at Legacy.SystemContractDeployHeight instead,
-	// so re-initialising at ForkHeight would revert and halt the chain.
-	if p.shouldInitContract(header.Number) {
-		err := p.initContract(state, header, cx, &body.Transactions, &receipts, nil, &header.GasUsed, mode, tracer)
-		if err != nil {
-			return nil, nil, errors.New("init contract failed")
-		}
-	}
+	// See Finalize: the system contracts are initialised at
+	// Legacy.SystemContractDeployHeight and nowhere else.
 	if header.Difficulty.Cmp(diffInTurn) != 0 {
 		number := header.Number.Uint64()
 		snap, err := p.snapshot(chain, number-1, header.ParentHash, nil)
@@ -2174,45 +2160,6 @@ func (p *Parlia) slash(spoiledVal common.Address, state vm.StateDB, header *type
 	msg := p.getSystemMessage(header.Coinbase, common.HexToAddress(systemcontracts.SlashContract), data, common.Big0)
 	// apply message
 	return p.applyTransaction(msg, state, header, chain, txs, receipts, receivedTxs, usedGas, mode, tracer)
-}
-
-// init contract
-func (p *Parlia) initContract(state vm.StateDB, header *types.Header, chain core.ChainContext,
-	txs *[]*types.Transaction, receipts *[]*types.Receipt, receivedTxs *[]*types.Transaction, usedGas *uint64, mode systemTxMode, tracer *tracing.Hooks) error {
-	// contracts
-	contracts := []string{
-		systemcontracts.ValidatorContract,
-		systemcontracts.SlashContract,
-		systemcontracts.LightClientContract,
-		systemcontracts.RelayerHubContract,
-		systemcontracts.TokenHubContract,
-		systemcontracts.RelayerIncentivizeContract,
-		systemcontracts.CrossChainContract,
-	}
-	// Every contract receives the bare init() selector.
-	//
-	// The validator contract is no exception any more. Its init(bytes,uint256)
-	// is sent once, at Legacy.SystemContractDeployHeight, by the protocol's own
-	// deployment step (core/systemcontracts/deploy_pgp.go), which is the only
-	// place that has both the validator set and an EVM for that block. Sending
-	// it here as well would revert: by ForkHeight every contract is already
-	// initialised, and a revert fails the block.
-	//
-	// The selector comes from pgpPlainInitSelector rather than from
-	// validatorSetABI, which describes init(bytes,uint256) and has no
-	// no-argument init() left to Pack. It is the same 0xe1c7392a upstream's
-	// no-argument method id produced, so the seven contracts keep receiving
-	// exactly the calldata they always did.
-	for _, c := range contracts {
-		data := pgpPlainInitSelector
-		msg := p.getSystemMessage(header.Coinbase, common.HexToAddress(c), data, common.Big0)
-		// apply message
-		log.Trace("init contract", "block hash", header.Hash(), "contract", c)
-		if err := p.applyTransaction(msg, state, header, chain, txs, receipts, receivedTxs, usedGas, mode, tracer); err != nil {
-			return err
-		}
-	}
-	return nil
 }
 
 func (p *Parlia) distributeToSystem(amount *big.Int, state vm.StateDB, header *types.Header, chain core.ChainContext,

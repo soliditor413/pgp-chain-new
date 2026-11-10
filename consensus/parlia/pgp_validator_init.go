@@ -18,7 +18,6 @@ package parlia
 
 import (
 	"math"
-	"math/big"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/core/systemcontracts/pgpinit"
@@ -78,20 +77,6 @@ func pgpValidatorInitArgs(cfg *params.LegacyConfig) ([]byte, uint64, error) {
 // ForkHeight.
 var pgpValidatorSetInitSelector = crypto.Keccak256([]byte("init(bytes,uint256)"))[:4]
 
-// pgpPlainInitSelector is the 4-byte selector of the no-argument init() that the
-// other six system contracts still expose.
-//
-// initContract() feeds the same calldata to seven addresses. Upstream could pack
-// "init" once from validatorSetABI because all seven took no arguments. Now only
-// the validator contract does, and the ABI no longer describes a no-argument
-// init() at all, so Pack("init") cannot produce these four bytes any more. They
-// are derived here instead.
-//
-// It evaluates to 0xe1c7392a, which is what signer/fourbyte/4byte.json records
-// for init() and what the previous no-argument ABI method id was - so the six
-// non-validator contracts keep receiving exactly the calldata they always did.
-var pgpPlainInitSelector = crypto.Keccak256([]byte("init()"))[:4]
-
 // pgpInitPlan is the pre-computed validator init arguments, built once at
 // engine construction so that a bad validator configuration fails at startup
 // rather than at the block that would consume it. Consumers: the deploy-time
@@ -127,26 +112,6 @@ func newPGPInitPlan(chainConfig *params.ChainConfig) (*pgpInitPlan, error) {
 		return nil, err
 	}
 	return &pgpInitPlan{payload: payload, cabinets: cabinets}, nil
-}
-
-// shouldInitContract reports whether Finalize/FinalizeAndAssemble run the
-// system-contract initialisation for this block.
-//
-// Block 1 only. Upstream initialises there and so does this chain: block 1 is a
-// legacy block whose alloc carries no code, so the call is a no-op, and
-// replaying the history depends on it staying a no-op.
-//
-// The Parlia-era initialisation deliberately does NOT run here any more. It
-// happens at Legacy.SystemContractDeployHeight, before the fork block, in the
-// protocol's own deployment step (core/systemcontracts/deploy_pgp.go), which
-// installs real code and initialises it. Running initContract at ForkHeight as
-// well would send init() to contracts that are already initialised, they would
-// revert, and the revert would fail the fork block and halt the chain.
-func (p *Parlia) shouldInitContract(number *big.Int) bool {
-	if number == nil {
-		return false
-	}
-	return number.Cmp(common.Big1) == 0
 }
 
 // pgpSnapshotAnchorNumber returns the height at which the Parlia snapshot

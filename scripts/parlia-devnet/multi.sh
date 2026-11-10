@@ -389,9 +389,18 @@ if posa_extras:
     epoch_blocks = sorted(n for n, L in posa_extras.items() if L != EC + SS)
     for n in epoch_blocks:
         L = posa_extras[n]
-        seats = (L - EC - SS - 1) // 68
-        print(f"  epoch/变长块 #{n}: extra={L} B  => 解出 {seats} 席"
-              f"（期望 {EC}+1+{seats}x68+{SS} = {EC + 1 + seats * 68 + SS}）")
+        body = L - EC - SS          # 去掉 vanity 与 seal
+        # 两种布局：Luban 之后是 1 字节计数 + 每席 68 B（20 地址 + 48 BLS 公钥）；
+        # Luban 未启用时没有计数前缀，每席只有 20 B 地址。先按 20 B 整除判断，
+        # 否则再试 Luban 布局——用同一个公式套两种布局会报出"解出 1 席"这种假异常。
+        if body % 20 == 0:
+            seats = body // 20
+            print(f"  epoch/变长块 #{n}: extra={L} B  => {seats} 席"
+                  f"（pre-Luban 布局：{EC}+{seats}x20+{SS} = {L}）")
+        else:
+            seats = (body - 1) // 68
+            print(f"  epoch/变长块 #{n}: extra={L} B  => {seats} 席"
+                  f"（Luban 布局：{EC}+1+{seats}x68+{SS} = {EC + 1 + seats * 68 + SS}）")
     if not epoch_blocks:
         print("  （区间内没有 epoch 块；epoch=200，等跑过 200 再看）")
 if legacy_extras:

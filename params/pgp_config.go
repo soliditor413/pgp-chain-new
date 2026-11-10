@@ -360,10 +360,22 @@ func (c *ChainConfig) checkDeployHeight() error {
 		return nil
 	}
 	d := c.Legacy.SystemContractDeployHeight
+	f := c.Legacy.ForkHeight
 	if d == 0 {
+		// There is exactly one initialisation path: the deploy-height injection.
+		// A chain that forks without one would run Parlia against system
+		// contracts that were never initialised -- 0x1000 answers an empty
+		// validator set and the first block after the fork fails with nothing
+		// pointing at the cause. The block-1 initialisation path that used to
+		// cover this is gone (F-18); MaxUint64 means "no fork", which is what
+		// mainnet runs today.
+		if f != 0 && f != math.MaxUint64 {
+			return fmt.Errorf("legacy.forkHeight %d requires legacy.systemContractDeployHeight: the "+
+				"block-1 initialisation path was removed, so a forked chain that does not inject the "+
+				"system contracts has no way to initialise them", f)
+		}
 		return nil
 	}
-	f := c.Legacy.ForkHeight
 	if f == 0 || f == math.MaxUint64 {
 		return fmt.Errorf("legacy.systemContractDeployHeight = %d requires a fixed legacy.forkHeight, got %d", d, f)
 	}
