@@ -187,9 +187,39 @@ print(m["producers"][0])
   echo "下一步     : ./multi.sh start"
 }
 
+# lock_holders 打印仍占用 datadir 锁的节点名（node0 node1 …），空表示都没占用。
+#
+# 为什么要它：`stop` 结束后 pid 文件已被删，如果某次 stop 失败、或进程是被外部
+# 杀掉的，光看 pid 文件会得出「0 个节点」的假结论，而实际上 geth 还在 flush。
+# 这时 start 会撞上 geth 的 datadir LOCK，报
+#   Fatal: Failed to create the protocol stack: datadir already used by another process
+# 然后被脚本翻译成「HTTP 40 s 内没有就绪」，看不出真正原因。
+# 不用 ps/pgrep：本机沙箱里 ps 会被直接拒绝。用 flock 试锁是唯一稳的判据。
+lock_holders() {
+  python3 - "$HOME_DIR" <<'PY'
+import fcntl, glob, os, sys
+held = []
+for p in sorted(glob.glob(os.path.join(sys.argv[1], "node*", "geth", "LOCK"))):
+    try:
+        f = open(p, "a")
+    except OSError:
+        continue
+    try:
+        fcntl.flock(f, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        fcntl.flock(f, fcntl.LOCK_UN)
+    except OSError:
+        held.append(os.path.basename(os.path.dirname(os.path.dirname(p))))
+    f.close()
+print(" ".join(held))
+PY
+}
+
 cmd_start() {
   need_bin
   [ -f "$GENESIS" ] || die "还没有 genesis；先跑 ./multi.sh init [SEATS] [FORK_HEIGHT]"
+  local held
+  held=$(lock_holders)
+  [ -z "$held" ] || die "这些节点的 datadir 还被占用：${held}。先 ./multi.sh stop 并等它输出「所有节点已退出」；不要用 kill -9，强杀会丢 state 导致重启后重封（审计 F-20）"
   local seats
   seats=$(ls -d "$HOME_DIR"/node* 2>/dev/null | wc -l | tr -d ' ')
   [ "$seats" -ge 4 ] || die "只找到 $seats 个 datadir"
@@ -305,15 +335,43 @@ print(len(g.get("config",{}).get("legacy",{}).get("producers") or []))
 }
 
 cmd_stop() {
-  local stopped=0 dir
+  local stopped=0 dir pid alive waited pids=()
   for dir in "$HOME_DIR"/node*; do
     [ -f "$dir/geth.pid" ] || continue
-    if kill "$(cat "$dir/geth.pid")" 2>/dev/null; then stopped=$((stopped + 1)); fi
-    rm -f "$dir/geth.pid"
+    pid=$(cat "$dir/geth.pid")
+    pids+=("$pid")
+    if kill "$pid" 2>/dev/null; then stopped=$((stopped + 1)); fi
   done
+  rm -f "$HOME_DIR"/node*/geth.pid
   echo "已向 $stopped 个节点发送 SIGTERM"
-  sleep 2
-  pkill -f "pgp-parlia-multi/node" 2>/dev/null && echo "已清理残留进程" || true
+
+  # 等进程真正退出，而不是睡固定 2 秒就返回。
+  # 原因很具体：geth 收到 SIGTERM 后要先 flush state 再释放 datadir 的 LOCK。
+  # 实测 stop 后 3 秒就 start，4 个节点里有 2 个直接
+  #   Fatal: Failed to create the protocol stack: datadir already used by another process
+  # 起不来，而脚本只会报「HTTP 40 s 内没有就绪」，看不出真正原因。
+  # 这里用 kill -0 轮询（不依赖 ps/pgrep：本机沙箱里 ps 会被拒）。
+  # 超时后**不**补 SIGKILL：强杀会丢未 flush 的 state，重启后节点回滚并重封，
+  # 被 peer 判为双签（见审计 F-20），比多等几十秒严重得多。
+  waited=0
+  while :; do
+    alive=0
+    for pid in "${pids[@]:-}"; do
+      if kill -0 "$pid" 2>/dev/null; then alive=$((alive + 1)); fi
+    done
+    # 进程退出和锁释放不是同一时刻：/proc 里 pid 没了，flock 可能还挂在
+    # 正在关闭的 fd 上。两个条件都满足才算停干净。
+    if [ "$alive" -eq 0 ] && [ -z "$(lock_holders)" ]; then
+      echo "所有节点已退出，datadir 锁已释放（等待 ${waited}s）"
+      return
+    fi
+    if [ "$waited" -ge 30 ]; then
+      echo "警告：${waited}s 后仍未停干净（存活进程 $alive 个，锁占用: $(lock_holders)），未强杀"
+      return
+    fi
+    sleep 1
+    waited=$((waited + 1))
+  done
 }
 
 cmd_status() {
