@@ -2742,9 +2742,9 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 		log.Info("Using pgp-chain mainnet preset",
 			"networkid", cfg.NetworkId, "genesis", cfg.Genesis.ToBlock().Hash(),
 			"spvArbiterHeight", cfg.Genesis.Config.DynamicArbiterHeight())
-	case ctx.Bool(ChapelFlag.Name) || cfg.NetworkId == 97:
+	case ctx.Bool(ChapelFlag.Name) || cfg.NetworkId == 12345:
 		if !ctx.IsSet(NetworkIdFlag.Name) {
-			cfg.NetworkId = 97
+			cfg.NetworkId = 12345
 		}
 		cfg.Genesis = core.DefaultChapelGenesisBlock()
 		SetDNSDiscoveryDefaults(cfg, params.ChapelGenesisHash)

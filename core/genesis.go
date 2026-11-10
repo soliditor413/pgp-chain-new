@@ -828,18 +828,47 @@ func DefaultBSCGenesisBlock() *Genesis {
 }
 
 // DefaultChapelGenesisBlock returns the BSC mainnet genesis block.
+// DefaultChapelGenesisBlock returns the genesis block of the pgp test network,
+// the chain --chapel selects.
+//
+// The values are pgp-chain's DefaultTestnetGenesisBlock verbatim
+// (pgp-chain/core/genesis.go:400-462): same timestamp, gas limit, difficulty,
+// extra-data layout and alloc, including the funded address 0x134c…848c, which
+// is a different account from mainnet's 0x5d48…0aeb. That is the point - the
+// genesis hash is what separates the two chains, and it is pinned as
+// params.ChapelGenesisHash.
+//
+// What is NOT pgp-chain's: the chain config carries this fork's Legacy/Parlia
+// rules (params.PGPTestnetChainConfig), because pgp-chain's ChainConfig has no
+// such fields. See that config's comment for the ChainID caveat.
 func DefaultChapelGenesisBlock() *Genesis {
-	alloc := decodePrealloc(bscChapelAllocData)
+	initBalance, ok := big.NewInt(0).SetString("200000000000000000000000000", 10)
+	if !ok {
+		panic("invalid pgp testnet genesis balance")
+	}
+	// 32 byte vanity + 12 producer addresses (all zero in the shipped genesis)
+	// + 65 byte seal, exactly the legacy layout.
+	extra := make([]byte, extraVanitySize+producerCount*common.AddressLength+extraSealSize)
+
 	return &Genesis{
-		Config:     params.ChapelChainConfig,
-		Nonce:      0,
-		ExtraData:  hexutil.MustDecode("0x00000000000000000000000000000000000000000000000000000000000000001284214b9b9c85549ab3d2b972df0deef66ac2c9b71b214cb885500844365e95cd9942c7276e7fd8a2959d3f95eae5dc7d70144ce1b73b403b7eb6e0980a75ecd1309ea12fa2ed87a8744fbfc9b863d535552c16704d214347f29fa77f77da6d75d7c752f474cf03cceff28abc65c9cbae594f725c80e12d0000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000000"),
-		GasLimit:   40000000,
+		Config:     params.PGPTestnetChainConfig,
+		Timestamp:  1763695010,
+		GasLimit:   0x2068F7700,
 		Difficulty: big.NewInt(1),
-		Mixhash:    common.Hash(hexutil.MustDecode("0x0000000000000000000000000000000000000000000000000000000000000000")),
-		Coinbase:   common.HexToAddress("0xffffFFFfFFffffffffffffffFfFFFfffFFFfFFfE"),
-		Timestamp:  0x5e9da7ce,
-		Alloc:      alloc,
+		ExtraData:  extra,
+		Alloc: GenesisAlloc{
+			params.ELAMINTER: {
+				Code:    params.ELAMINTER_CODE,
+				Balance: big.NewInt(0),
+			},
+			params.ELATOKEN: {
+				Code:    params.ELATOKEN_CODE,
+				Balance: big.NewInt(0),
+			},
+			common.HexToAddress("0x134c10062bcfC979af4FEFE6657757E61FF2848c"): {
+				Balance: initBalance,
+			},
+		},
 	}
 }
 

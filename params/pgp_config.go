@@ -344,6 +344,80 @@ var (
 			ParliaGenesisCabinets:     21,
 		},
 	}
+
+	// DefaultLegacyTestnetProducers are the ELA test-network CR arbiters, in the
+	// order pgp-chain's TestnetChainConfig lists them
+	// (pgp-chain/params/config.go:162-176).
+	//
+	// They are not interchangeable with the mainnet set. Any note that
+	// verifies the PBFT confirm against these keys (VerifySeal) would reject every
+	// legacy block if the wrong network's arbiters were listed, and the failure
+	// looks like a consensus bug rather than a config error.
+	DefaultLegacyTestnetProducers = []string{
+		"03e435ccd6073813917c2d841a0815d21301ec3286bc1412bb5b099178c68a10b6",
+		"038a1829b4b2bee784a99bebabbfecfec53f33dadeeeff21b460f8b4fc7c2ca771",
+		"02435df9a4728e6250283cfa8215f16b48948d71936c4600b3a5b1c6fde70503ae",
+		"027d44ee7e7a6c6ff13a130d15b18c75a3b47494c3e54fcffe5f4b10e225351e09",
+		"02ad972fbfce4aaa797425138e4f3b22bcfa765ffad88b8a5af0ab515161c0a365",
+		"0373eeae2bac0f5f14373ca603fe2c9caa9c7a79c7793246cec415d005e2fe53c0",
+		"03503011cc4e44b94f73ed2c76c73182a75b4863f23d1e7083025eead945a8e764",
+		"0270b6880e7fab8d02bea7d22639d7b5e07279dd6477baa713dacf99bb1d65de69",
+		"030eed9f9c1d70307beba52ddb72a24a02582c0ee626ec93ee1dcef2eb308852dd",
+		"026bba43feb19ce5859ffcf0ce9dd8b9d625130b686221da8b445fa9b8f978d7b9",
+		"02bf9e37b3db0cbe86acf76a76578c6b17b4146df101ec934a00045f7d201f06dd",
+		"03111f1247c66755d369a8c8b3a736dfd5cf464ca6735b659533cbe1268cd102a9",
+	}
+
+	// PGPTestnetChainConfig is what --chapel selects: the pgp test network,
+	// following the ELA test chain.
+	//
+	// It mirrors PGPChainConfig on purpose. A test network that differs in its
+	// rules cannot be used to predict the mainnet, so every fork height and the
+	// whole Legacy/Parlia wiring are copied rather than re-derived. Three things
+	// do differ, and each has a reason:
+	//
+	//   - ChainID is 12345, matching pgp-chain's TestnetChainConfig. This is only
+	//     safe because ForkHeight is MaxUint64: with no fork scheduled there is no
+	//     D block, so the system-contract gate that asserts
+	//     bscChainID() == ChainID (the F-01 fix; the image hardcodes 860621) never
+	//     runs. A testnet that schedules a Parlia fork must either use 860621 or
+	//     ship a re-imaged contract set - otherwise D is rejected at run time.
+	//   - The producer set is the ELA test network's arbiters. VerifySeal checks
+	//     confirms against it, so the mainnet list would reject every block.
+	//   - DynamicArbiterHeight is left at zero (unset). The accessor still falls
+	//     back to the mainnet constant, which is why startSpv overrides it for
+	//     non-mainnet selections; see cmd/geth/spv_start.go.
+	PGPTestnetChainConfig = &ChainConfig{
+		ChainID:             big.NewInt(12345),
+		HomesteadBlock:      big.NewInt(1),
+		DAOForkBlock:        nil,
+		DAOForkSupport:      true,
+		EIP150Block:         big.NewInt(2),
+		EIP155Block:         big.NewInt(3),
+		EIP158Block:         big.NewInt(3),
+		ByzantiumBlock:      big.NewInt(3),
+		ConstantinopleBlock: big.NewInt(3),
+		PetersburgBlock:     big.NewInt(3),
+		IstanbulBlock:       big.NewInt(3),
+		MuirGlacierBlock:    nil,
+		BerlinBlock:         big.NewInt(3),
+		LondonBlock:         big.NewInt(3),
+		ShanghaiTime:        newUint64(1761657650),
+		LubanBlock:          big.NewInt(math.MaxInt64),
+		Parlia:              &ParliaConfig{},
+		Legacy: &LegacyConfig{
+			ForkHeight:                math.MaxUint64,
+			GasFeeRecipient:           DefaultGasFeeRecipient,
+			GasFeeRecipientRatio:      DefaultGasFeeRecipientRatio,
+			PassBalance:               DefaultPassBalance,
+			DynamicArbiterHeight:      0,
+			Producers:                 DefaultLegacyTestnetProducers,
+			VerifySeal:                true,
+			ParliaGenesisValidators:   []string{},
+			ParliaGenesisVotingPowers: []uint64{},
+			ParliaGenesisCabinets:     21,
+		},
+	}
 )
 
 // IsPGPLegacy reports whether the given block belongs to the pgp-chain history

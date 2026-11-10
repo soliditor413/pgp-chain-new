@@ -19,6 +19,7 @@ package core
 import (
 	"bytes"
 	"encoding/json"
+	"math"
 	"math/big"
 	"reflect"
 	"testing"
@@ -91,7 +92,7 @@ func testSetupGenesis(t *testing.T, scheme string) {
 				return SetupGenesisBlock(db, triedb.NewDatabase(db, newDbConfig(scheme)), nil)
 			},
 			wantHash:   params.ChapelGenesisHash,
-			wantConfig: params.ChapelChainConfig,
+			wantConfig: params.PGPTestnetChainConfig,
 		},
 		{
 			name: "chapel block in DB, genesis == chapel",
@@ -100,7 +101,7 @@ func testSetupGenesis(t *testing.T, scheme string) {
 				return SetupGenesisBlock(db, triedb.NewDatabase(db, newDbConfig(scheme)), DefaultChapelGenesisBlock())
 			},
 			wantHash:   params.ChapelGenesisHash,
-			wantConfig: params.ChapelChainConfig,
+			wantConfig: params.PGPTestnetChainConfig,
 		},
 		{
 			name: "custom block in DB, genesis == nil",
@@ -384,5 +385,71 @@ func TestCheckPGPDatabaseMatch(t *testing.T) {
 		if (err != nil) != tc.wantErr {
 			t.Errorf("%s: err = %v, wantErr %v", tc.name, err, tc.wantErr)
 		}
+	}
+}
+
+// TestPGPTestnetGenesisMatchesPGPChain pins the values --chapel commits to.
+//
+// They are ported from pgp-chain's DefaultTestnetGenesisBlock
+// (pgp-chain/core/genesis.go:400-462), and "ported" is the whole claim: a pgp
+// testnet node has to be on the same chain as a pgp-chain testnet node, which
+// means the same genesis block, which means these fields and nothing else. The
+// hash check at the end is the aggregate of them, but when it fails it says
+// nothing about which field moved, so each one is asserted separately.
+func TestPGPTestnetGenesisMatchesPGPChain(t *testing.T) {
+	g := DefaultChapelGenesisBlock()
+
+	if g.Config != params.PGPTestnetChainConfig {
+		t.Fatalf("genesis config = %p, want params.PGPTestnetChainConfig", g.Config)
+	}
+	if got, want := g.Config.ChainID.Int64(), int64(12345); got != want {
+		t.Errorf("chain ID = %d, want %d (pgp-chain's TestnetChainConfig)", got, want)
+	}
+	// The SPV service only starts when the chain has a legacy era, and the D-block
+	// gate only passes when ChainID matches the bscChainID baked into the image.
+	// MaxUint64 keeps both true: no fork, so no D block, so no mismatch.
+	if g.Config.Legacy == nil {
+		t.Fatal("legacy config is nil; the ELA SPV service would not start at all")
+	}
+	if g.Config.Legacy.ForkHeight != math.MaxUint64 {
+		t.Errorf("legacy fork height = %d, want MaxUint64 (no fork scheduled)", g.Config.Legacy.ForkHeight)
+	}
+	if got := len(g.Config.Legacy.Producers); got != 12 {
+		t.Errorf("legacy producers = %d, want 12 ELA testnet arbiters", got)
+	}
+	if got := g.Config.Legacy.Producers[0]; got != "03e435ccd6073813917c2d841a0815d21301ec3286bc1412bb5b099178c68a10b6" {
+		t.Errorf("first producer = %s, want the ELA testnet arbiter", got)
+	}
+
+	if got, want := g.Timestamp, uint64(1763695010); got != want {
+		t.Errorf("timestamp = %d, want %d", got, want)
+	}
+	if got, want := g.GasLimit, uint64(0x2068F7700); got != want {
+		t.Errorf("gas limit = %d, want %d", got, want)
+	}
+	if g.Difficulty == nil || g.Difficulty.Cmp(big.NewInt(1)) != 0 {
+		t.Errorf("difficulty = %v, want 1", g.Difficulty)
+	}
+	// 32 byte vanity + 12 producer slots + 65 byte seal, all zero in the shipped
+	// genesis. Same layout as mainnet; a different length would be a different
+	// chain even with the same timestamp.
+	if got, want := len(g.ExtraData), 32+12*common.AddressLength+65; got != want {
+		t.Errorf("extra data = %d bytes, want %d", got, want)
+	}
+
+	funded := common.HexToAddress("0x134c10062bcfC979af4FEFE6657757E61FF2848c")
+	if acc, ok := g.Alloc[funded]; !ok {
+		t.Errorf("funded account %s missing from alloc", funded)
+	} else if wantBal, _ := new(big.Int).SetString("200000000000000000000000000", 10); acc.Balance == nil || acc.Balance.Cmp(wantBal) != 0 {
+		t.Errorf("funded balance = %v, want 2e26", acc.Balance)
+	}
+	for _, addr := range []common.Address{params.ELAMINTER, params.ELATOKEN} {
+		if _, ok := g.Alloc[addr]; !ok {
+			t.Errorf("system contract %s missing from alloc", addr)
+		}
+	}
+
+	if h := g.ToBlock().Hash(); h != params.ChapelGenesisHash {
+		t.Fatalf("genesis hash = %s, want %s (pgp-chain's TestnetGenesisHash)", h, params.ChapelGenesisHash)
 	}
 }

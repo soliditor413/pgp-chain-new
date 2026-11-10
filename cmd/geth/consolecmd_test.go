@@ -30,7 +30,11 @@ import (
 )
 
 const (
-	ipcAPIs  = "admin:1.0 debug:1.0 eth:1.0 mev:1.0 miner:1.0 net:1.0 parlia:1.0 rpc:1.0 txpool:1.0 web3:1.0"
+	// --chapel is a legacy (PBFT) chain, so the console also exposes the pbft
+	// namespace - the DPoS connect list lives there. parlia is listed too: the
+	// engine owns it on every forked chain and its APIs are registered even when
+	// the fork has not been scheduled yet.
+	ipcAPIs  = "admin:1.0 debug:1.0 eth:1.0 mev:1.0 miner:1.0 net:1.0 parlia:1.0 pbft:1.0 rpc:1.0 txpool:1.0 web3:1.0"
 	httpAPIs = "eth:1.0 net:1.0 rpc:1.0 web3:1.0"
 )
 
@@ -62,7 +66,11 @@ func TestConsoleWelcome(t *testing.T) {
 	geth.SetTemplateFunc("gover", runtime.Version)
 	geth.SetTemplateFunc("gethver", func() string { return version.WithCommit("", "") })
 	geth.SetTemplateFunc("niltime", func() string {
-		return time.Unix(0x5e9da7ce, 0).Format("Mon Jan 02 2006 15:04:05 GMT-0700 (MST)")
+		// The pgp test network's genesis timestamp, ported from pgp-chain's
+		// DefaultTestnetGenesisBlock. It is a literal rather than a lookup so this
+		// test really does check what the banner prints; the value itself is pinned
+		// by TestPGPTestnetGenesisMatchesPGPChain.
+		return time.Unix(1763695010, 0).Format("Mon Jan 02 2006 15:04:05 GMT-0700 (MST)")
 	})
 	geth.SetTemplateFunc("apis", func() string { return ipcAPIs })
 
@@ -133,7 +141,11 @@ func testAttachWelcome(t *testing.T, geth *testgeth, endpoint, apis string) {
 	attach.SetTemplateFunc("gethver", func() string { return version.WithCommit("", "") })
 	attach.SetTemplateFunc("etherbase", func() string { return geth.Etherbase })
 	attach.SetTemplateFunc("niltime", func() string {
-		return time.Unix(0x5e9da7ce, 0).Format("Mon Jan 02 2006 15:04:05 GMT-0700 (MST)")
+		// The pgp test network's genesis timestamp, ported from pgp-chain's
+		// DefaultTestnetGenesisBlock. It is a literal rather than a lookup so this
+		// test really does check what the banner prints; the value itself is pinned
+		// by TestPGPTestnetGenesisMatchesPGPChain.
+		return time.Unix(1763695010, 0).Format("Mon Jan 02 2006 15:04:05 GMT-0700 (MST)")
 	})
 	attach.SetTemplateFunc("ipc", func() bool { return strings.HasPrefix(endpoint, "ipc") })
 	attach.SetTemplateFunc("datadir", func() string { return geth.Datadir })

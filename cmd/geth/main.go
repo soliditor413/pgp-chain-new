@@ -363,7 +363,7 @@ func prepare(ctx *cli.Context) {
 	// If we're running a known preset, log it for convenience.
 	switch {
 	case ctx.IsSet(utils.ChapelFlag.Name):
-		log.Info("Starting BSC on Chapel testnet...")
+		log.Info("Starting the pgp test network (--chapel): EVM genesis from pgp-chain's testnet, ELA side on the ELA test chain")
 	}
 }
 
@@ -404,7 +404,7 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, isCon
 	// (this function is where the rest of the node reads its context too), and
 	// because --chapel on a chain without a legacy section must be reported rather
 	// than silently ignored - see the gate in startSpv.
-	startSpv(stack, backend, elaLogLevel(ctx), ctx.Bool(utils.ChapelFlag.Name))
+	startSpv(stack, backend, elaLogLevel(ctx), ctx)
 
 	// Start up the node itself
 	utils.StartNode(ctx, stack, isConsole)

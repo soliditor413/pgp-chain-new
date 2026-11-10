@@ -4,6 +4,7 @@ import (
 	"path/filepath"
 	"sync"
 
+	elacom "github.com/elastos/Elastos.ELA/common"
 	elalog "github.com/elastos/Elastos.ELA/utils/elalog"
 	"github.com/urfave/cli/v2"
 
@@ -98,29 +99,30 @@ func elaLogLevel(ctx *cli.Context) elalog.Level {
 // Only a pgp-chain has an ELA side to follow, so a node running any other chain
 // config skips this entirely.
 //
-// testnet comes from --chapel. The mapping is a flag rather than a chain-config
-// field because --chapel already means "this is a test deployment" to every
-// operator here, and a second switch would let the two disagree. It is checked
-// against the chain config below: --chapel on its own selects BSC's chapel
-// genesis, which has no legacy section at all, so there is no ELA side to
-// follow and the flag is reported as unused rather than silently ignored.
-func startSpv(stack *node.Node, backend ethapi.Backend, elaLevel elalog.Level, testnet bool) {
+// testnet comes from --chapel: the pgp test network, whose EVM genesis is
+// pgp-chain's testnet and whose ELA side is the ELA test chain. The mapping is a
+// flag rather than a chain-config field because --chapel already means "this is a
+// test deployment" to every operator here, and a second switch would let the two
+// disagree. It is still checked against the chain config below, so a future chain
+// that has no legacy section reports the flag as unused instead of silently
+// running without an ELA side.
+func startSpv(stack *node.Node, backend ethapi.Backend, elaLevel elalog.Level, ctx *cli.Context) {
 	bc := backend.Chain()
 	if bc == nil {
 		return
 	}
 
 	elaNet := spv.NetMainnet
-	if testnet {
+	if ctx.IsSet(utils.ChapelFlag.Name) {
 		elaNet = spv.NetTestnet
 	}
 
 	if !bc.Config().IsPGPLegacy(nil) {
-		// Reached whenever the chain has no legacy (PBFT) era, which includes the
-		// plain BSC presets. Saying so matters for --chapel: without this line a
-		// testnet node starts, connects, syncs, and simply never has an ELA side,
-		// and the operator's only clue is an absence.
-		if testnet {
+		// Reached whenever the chain has no legacy (PBFT) era. Saying so matters
+		// for --chapel: without this line a testnet node starts, connects, syncs,
+		// and simply never has an ELA side, and the operator's only clue is an
+		// absence.
+		if ctx.IsSet(utils.ChapelFlag.Name) {
 			log.Warn("--chapel given but this chain has no legacy config; the ELA SPV service is not started",
 				"chainID", bc.Config().ChainID)
 		}
@@ -189,10 +191,16 @@ func startSpv(stack *node.Node, backend ethapi.Backend, elaLevel elalog.Level, t
 		dynamicArbiterHeight = 0
 	}
 
+	// calculate ELA mainchain address from the genesis block hash and set the SPV monitor address accordingly
+	genesisU256, err := elacom.Uint256FromBytes(genesis.Hash().Bytes())
+	if err != nil {
+		utils.Fatalf("Blockchain not running: %v", err)
+	}
 	svc, err := spv.NewService(&spv.Config{
 		DataDir:        dir,
 		GenesisAddress: depositAddress,
 		ActiveNet:      elaNet,
+		GenesisHash:    *genesisU256,
 	}, new(event.TypeMux), dynamicArbiterHeight)
 	if err != nil {
 		utils.Fatalf("SPV service init error: %v", err)
