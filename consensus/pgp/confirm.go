@@ -78,6 +78,25 @@ var (
 	// so re-delivering the block once the SPV has caught up imports it normally.
 	ErrSealSPVBehind = errors.New("pgp: ELA SPV is behind the height the confirm needs")
 
+	// ErrProducerSetIncomplete reports an arbiter set that is missing seats the
+	// threshold already counts. It is not the same failure as ErrSealSPVBehind:
+	// there the SPV simply has not reached the height yet and the answer is
+	// "wait", while here the SPV has an answer and that answer can never satisfy
+	// the threshold — some arbiter seats are vacant or unknown, so
+	// floor(total*2/3) signatures cannot be collected no matter how long we wait
+	// (audit F-17).
+	//
+	// Keeping them separate matters because the two send an operator in opposite
+	// directions: "SPV is behind" means check the ELA sync, while "set is
+	// incomplete" means the ELA side itself has vacancies and this height must be
+	// resolved there. Collapsing them into one error - which is what the code did
+	// before - makes a structural problem look like a transient one.
+	//
+	// It is still a "cannot tell yet" outcome rather than "this block is forged":
+	// a node must not ban a peer over it. IsRetryableSealError answers that
+	// question for callers that want to branch.
+	ErrProducerSetIncomplete = errors.New("pgp: the arbiter set for this ELA height is incomplete")
+
 	// errSealProducerConfig reports a producer set that cannot be used at all
 	// because the configuration itself is wrong (not hex, not a public key).
 	// It is kept separate from ErrSealSPVBehind on purpose: an operator who sees
@@ -449,7 +468,47 @@ func (e *Engine) verifyConfirm(confirm *payload.Confirm, elaHeight uint64) error
 			// never look like a passing one.
 			return fmt.Errorf("%w: ela height %d: %v", ErrSealSPVBehind, elaHeight, err)
 		}
+		// The threshold is computed from total, not from len(list), because
+		// vacant seats still count towards it (using the smaller number would
+		// accept a confirm with too few signatures). The consequence is that a
+		// set with enough vacancies can make the threshold unreachable; say so
+		// here instead of letting checkConfirm fail with "need 3 votes, got 2"
+		// forever (F-17).
+		if err := validateProducerSet(elaHeight, len(list), total); err != nil {
+			return err
+		}
 		producers, minSignCount = list, legacyMajorityCount(total)
 	}
 	return checkConfirm(confirm, producers, minSignCount)
+}
+
+// validateProducerSet reports whether a confirm for this ELA height can ever
+// collect enough votes.
+//
+// known is the number of non-vacant arbiters GetProducers returned, total is the
+// seat count the threshold is derived from. When the threshold exceeds the known
+// arbiters, no signature collection will ever succeed and the block is
+// unverifiable for a reason that has nothing to do with the block.
+//
+// This deliberately does not weaken the threshold. Lowering it to len(known)
+// would let a node with a partial view accept a confirm the rest of the network
+// rejects - a state root divergence, which is far worse than a stalled height.
+func validateProducerSet(elaHeight uint64, known, total int) error {
+	need := legacyMajorityCount(total)
+	if need > known {
+		return fmt.Errorf("%w: ela height %d has %d seats on record but only %d arbiters are known, "+
+			"so %d signatures can never be collected", ErrProducerSetIncomplete, elaHeight, total, known, need)
+	}
+	return nil
+}
+
+// IsRetryableSealError reports whether err means "this block cannot be checked
+// yet" rather than "this block is bad".
+//
+// Both ErrSealSPVBehind and ErrProducerSetIncomplete qualify: neither is evidence
+// against the peer that sent the block. Callers that penalise peers should ask
+// this instead of matching one sentinel and letting the other fall through to
+// "bad block".
+func IsRetryableSealError(err error) bool {
+	return errors.Is(err, ErrSealSPVBehind) || errors.Is(err, ErrProducerSetIncomplete)
 }

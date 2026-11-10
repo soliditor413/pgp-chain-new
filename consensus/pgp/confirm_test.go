@@ -10,6 +10,7 @@ import (
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
+	"fmt"
 	"math"
 	"math/big"
 	"strings"
@@ -851,4 +852,73 @@ func decodeConfirmMust(t *testing.T, header *types.Header) *payload.Confirm {
 		t.Fatalf("decodeConfirm rejected the fixture's Extra: %v", err)
 	}
 	return confirm
+}
+
+// TestValidateProducerSet pins F-17: the threshold is derived from the seat
+// count, so an arbiter set with enough vacancies can make it unreachable.
+//
+// The rule under test is the one that must NOT be weakened - lowering the
+// threshold to the number of known arbiters would let a node with a partial view
+// accept a confirm the rest of the network rejects.
+func TestValidateProducerSet(t *testing.T) {
+	cases := []struct {
+		name  string
+		total int
+		known int
+		want  bool // true = threshold reachable
+	}{
+		{"single producer", 1, 1, true},
+		{"all seats filled", 3, 3, true},
+		{"one vacant but reachable", 4, 3, true},
+		{"two vacant and still reachable", 4, 2, true},
+		{"one known of three seats", 3, 1, false},
+		{"two known of five seats", 5, 2, false},
+		{"no arbiter known", 3, 0, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			err := validateProducerSet(1000, c.known, c.total)
+			if c.want && err != nil {
+				t.Fatalf("total=%d known=%d: unexpected error %v", c.total, c.known, err)
+			}
+			if !c.want {
+				if err == nil {
+					t.Fatalf("total=%d known=%d: threshold is unreachable but no error was returned", c.total, c.known)
+				}
+				if !errors.Is(err, ErrProducerSetIncomplete) {
+					t.Fatalf("error = %v, want %v", err, ErrProducerSetIncomplete)
+				}
+				// The message has to carry the numbers: an operator reading a
+				// BAD BLOCK line needs to know whether to look at ELA or at the
+				// block, and "incomplete" alone does not say by how much.
+				if !strings.Contains(err.Error(), "ela height 1000") {
+					t.Fatalf("error does not name the ELA height: %v", err)
+				}
+			}
+		})
+	}
+}
+
+// TestIsRetryableSealError pins the distinction F-17 introduced: "cannot check
+// yet" and "this block is bad" must not be the same bucket, because callers
+// penalise peers over the second and must not over the first.
+func TestIsRetryableSealError(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"spv behind", fmt.Errorf("%w: need 10, have 9", ErrSealSPVBehind), true},
+		{"producer set incomplete", fmt.Errorf("%w: 2 of 5", ErrProducerSetIncomplete), true},
+		{"invalid confirm", fmt.Errorf("%w: bad signature", ErrInvalidConfirm), false},
+		{"unrelated", errors.New("disk on fire"), false},
+		{"nil", nil, false},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := IsRetryableSealError(c.err); got != c.want {
+				t.Fatalf("IsRetryableSealError(%v) = %v, want %v", c.err, got, c.want)
+			}
+		})
+	}
 }
