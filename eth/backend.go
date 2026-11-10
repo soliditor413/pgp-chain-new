@@ -693,11 +693,32 @@ func makeExtraData(extra []byte) []byte {
 
 // APIs return the collection of RPC services the ethereum package offers.
 // NOTE, some of these services probably need to be moved to somewhere else.
+// parliaEngineOf returns the Parlia engine behind e, unwrapping the height
+// router.
+//
+// The router exposes the engine through Parlia(); a direct assertion fails on
+// every forked chain, which is why this exists instead of an inline
+// type switch at each call site.
+func parliaEngineOf(e consensus.Engine) (*parlia.Parlia, bool) {
+	if p, ok := e.(*parlia.Parlia); ok {
+		return p, true
+	}
+	if r, ok := e.(interface{ Parlia() (*parlia.Parlia, bool) }); ok {
+		return r.Parlia()
+	}
+	return nil, false
+}
+
 func (s *Ethereum) APIs() []rpc.API {
 	apis := ethapi.GetAPIs(s.APIBackend)
 
-	// Append any APIs exposed explicitly by the consensus engine
-	if p, ok := s.engine.(*parlia.Parlia); ok {
+	// Append any APIs exposed explicitly by the consensus engine.
+	//
+	// Not a plain type assertion: on a chain that has a legacy era the engine is
+	// consensus/router, which owns the Parlia engine but is not one, so asserting
+	// on *parlia.Parlia dropped the whole parlia_* namespace on exactly the chains
+	// that will use it after the fork. Same failure shape as F-21, one layer up.
+	if p, ok := parliaEngineOf(s.engine); ok {
 		apis = append(apis, p.APIs(s.BlockChain())...)
 	}
 	// The legacy PBFT engine keeps the DPoS connect list, which no other
