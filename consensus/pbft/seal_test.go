@@ -736,8 +736,8 @@ func TestSealExitsWhenTheMinerStops(t *testing.T) {
 // handshake when the producer set is small enough that one vote is a majority.
 //
 // legacyMajorityCount rounds down (consensus/pgp/confirm.go), so a set of one
-// needs zero votes and a set of two needs one. On both, the vote Seal casts for
-// itself already reaches quorum, and the dispatcher builds the confirm and calls
+// and a set of two both need one vote. On both, the vote Seal casts for itself
+// already reaches quorum, and the dispatcher builds the confirm and calls
 // back into onConfirm synchronously, inside ProcessVote, on Seal's own goroutine.
 // The round's confirm is therefore already queued before Seal reaches its select.
 //

@@ -171,8 +171,8 @@ func (e *Engine) Seal(chain consensus.ChainHeaderReader, block *types.Block, res
 	//
 	// WHERE this sits is the whole point, and it is *before* the self-vote below,
 	// not after it. legacyMajorityCount rounds down (consensus/pgp/confirm.go), so
-	// a producer set of one needs zero votes and a set of two needs one: with one
-	// or two producers the vote AcceptProposal casts *is* the majority, and
+	// a producer set of one needs one vote and a set of two also needs one: with
+	// one or two producers the vote AcceptProposal casts *is* the majority, and
 	// ProcessVote builds the confirm and calls onConfirm synchronously on this very
 	// goroutine, before Seal ever reaches its select. Draining after the self-vote
 	// therefore discarded the round's own confirm; the round then timed out, and

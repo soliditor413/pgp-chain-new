@@ -169,11 +169,10 @@ func bindConfirm(t *testing.T, header *types.Header, producers []testProducer, v
 // TestLegacyMajorityCount pins the two-thirds threshold, including the rounding
 // direction and the degenerate case.
 //
-// 12 -> 8 and 36 -> 24 do not distinguish floor from ceiling; 25 -> 16 does, and
-// 1 -> 0 pins the reference behaviour that a one member producer set accepts a
-// vote-less confirm. That last one reads like a bug and is not: it is what
-// int(float64(n)*2/3) does, and "fixing" it would reject confirms upstream
-// accepts.
+// 12 -> 8 and 36 -> 24 do not distinguish floor from ceiling; 25 -> 16 does.
+// 1 -> 1 is the deliberate deviation from pgp-chain, whose expression gives 0
+// (F-14): a zero threshold makes checkConfirm accept a confirm with no votes at
+// all, which is not "one producer is enough" but "no quorum is checked".
 func TestLegacyMajorityCount(t *testing.T) {
 	for _, tc := range []struct {
 		total int
@@ -184,12 +183,46 @@ func TestLegacyMajorityCount(t *testing.T) {
 		{24, 16}, // 24 * 2 / 3
 		{25, 16}, // floor(16.67), NOT 17 -- this is the floor/ceiling discriminator
 		{2, 1},   // floor(1.33)
-		{1, 0},   // degenerate: reference behaviour, not a bug
+		{1, 1},   // F-14: pgp-chain says 0; a devnet that seals alone still needs its own vote
 		{0, 0},
 	} {
 		if got := legacyMajorityCount(tc.total); got != tc.want {
 			t.Errorf("legacyMajorityCount(%d) = %d, want %d", tc.total, got, tc.want)
 		}
+	}
+}
+
+// TestSingleProducerThresholdNeedsOneVote is the F-14 regression, and it is
+// about what the number *does* rather than what it is.
+//
+// With the reference expression a one-member set yielded a threshold of zero,
+// and checkConfirm's only use of that number is `validVotes < minSignCount`. So a
+// confirm carrying the proposal and an empty vote list was accepted: the sealer
+// never had to vote for its own block, and nothing checked the vote signature
+// path at all. That is exactly the shape a single-producer devnet runs in, so the
+// devnet would have "verified" seals it never inspected.
+func TestSingleProducerThresholdNeedsOneVote(t *testing.T) {
+	producers := newTestProducers(t, 1)
+	byBytes := make([][]byte, len(producers))
+	for i := range producers {
+		byBytes[i] = producers[i].pub
+	}
+	threshold := legacyMajorityCount(len(producers))
+	if threshold != 1 {
+		t.Fatalf("threshold for a one-member set is %d, want 1", threshold)
+	}
+
+	blockHash := common.HexToHash("0xf14")
+	viewOffset := uint32(0)
+
+	// No votes: accepted before the fix, rejected now.
+	if err := checkConfirm(buildConfirm(t, producers, blockHash, viewOffset, 0), byBytes, threshold); !errors.Is(err, ErrInvalidConfirm) {
+		t.Fatalf("a vote-less confirm was accepted, want %v", ErrInvalidConfirm)
+	}
+
+	// The sealer's own vote is what a real seal carries, and it has to be enough.
+	if err := checkConfirm(buildConfirm(t, producers, blockHash, viewOffset, 1), byBytes, threshold); err != nil {
+		t.Fatalf("the producer's own vote was rejected: %v", err)
 	}
 }
 

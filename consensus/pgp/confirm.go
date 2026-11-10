@@ -239,11 +239,17 @@ func decodeConfirm(extra []byte) (*payload.Confirm, error) {
 // float64 and the result is truncated on the way back to int.
 //
 // Both the float form and the rounding are load bearing. 12 producers need 8
-// votes and 25 need 16, not 17; and one producer needs zero, which means a
-// one-member producer set accepts a vote-less confirm. That looks like a bug and
-// is the reference behaviour, so it is reproduced rather than fixed: mainnet has
-// twelve producers and never reaches the case, and "fixing" it would reject
-// confirms the chain actually accepted.
+// votes and 25 need 16, not 17.
+//
+// One place deviates from the reference on purpose (F-14): a one-member producer
+// set demands one vote here, where pgp-chain's expression yields zero. Zero is
+// not "one producer is enough", it is "no votes are required at all" --
+// checkConfirm only compares validVotes against this number, so a threshold of 0
+// accepts a confirm with an empty vote list and the only signature left is the
+// proposal's. Mainnet has twelve producers and never reaches the case, so the
+// deviation cannot change any historical block; what it changes is a
+// single-producer devnet, which would otherwise "verify" a seal it never looked
+// at. See TestLegacyMajorityCount and TestSingleProducerThresholdNeedsOneVote.
 //
 // The argument is the *total* signer count, not the number of producers that
 // survived filtering. Upstream reaches this same expression through
@@ -252,7 +258,11 @@ func decodeConfirm(extra []byte) (*payload.Confirm, error) {
 // (dpos/producers.go:18, :38). That equivalence is why the elaHeight == 0 branch
 // can call legacyMajorityCount(len(list)) and still match the reference exactly.
 func legacyMajorityCount(totalSigner int) int {
-	return int(float64(totalSigner) * 2 / 3)
+	n := int(float64(totalSigner) * 2 / 3)
+	if n < 1 && totalSigner > 0 {
+		n = 1
+	}
+	return n
 }
 
 // decodeProducers turns the configured hex public keys into the byte slices the

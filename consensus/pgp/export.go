@@ -59,11 +59,14 @@ func (e *Engine) VerifyConfirmAt(confirm *payload.Confirm, elaHeight uint64) err
 }
 
 // MajorityCount is the DPoS threshold for a producer set of the given size,
-// i.e. floor(totalSigner * 2 / 3).
+// i.e. floor(totalSigner * 2 / 3), with a floor of one whenever the set is
+// non-empty (F-14).
 //
 // It is exported because the producing side has to know how many votes make a
 // confirm final *before* it has one, and computing that number differently on
-// either side would produce confirms the verifier rejects.
+// either side would produce confirms the verifier rejects. The floor of one is
+// what keeps a single-producer devnet honest: without it the producer side needs
+// no votes at all and the verifier checks none.
 func MajorityCount(totalSigner int) int {
 	return legacyMajorityCount(totalSigner)
 }
