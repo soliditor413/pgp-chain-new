@@ -70,6 +70,13 @@ DEPLOY_HEIGHT=${DEPLOY_HEIGHT:-0}
 OMIT_SYSTEM_ALLOC=${OMIT_SYSTEM_ALLOC:-0}
 # 1 = lubanBlock 钉哨兵（Luban 不启用，全程 pre-Luban 的 extraData 格式）。
 LUBAN_SENTINEL=${LUBAN_SENTINEL:-0}
+# 1 = 给每个节点建一个 BLS 钱包与 BLS 账户（fast finality 用），公钥写进 genesis 的
+# legacy.parliaGenesisVoteAddrs，节点启动时用 --vote --blspassword --blswallet 解锁。
+#
+# 为什么默认 0：开启后每个验证人的 RLP 元组从 4 项变 5 项，D 块写入的 state root
+# 随之改变（这是预期的，不是 bug）。默认关闭保证「不关心 finality」的跑法与之前
+# 逐字节一致，也让主网形态（无票地址）成为默认路径而不是特例。
+BLS_VOTE=${BLS_VOTE:-0}
 
 mkdir -p "$LOG_DIR"
 
@@ -119,6 +126,44 @@ cmd_init() {
     addrs+=("$addr")
     echo "$addr" > "$dir/validator.addr"
     echo "$addr,$addr,$addr,100,-" >> "$HOME_DIR/validators.conf"
+
+    if [ "$BLS_VOTE" = "1" ]; then
+      # 这里要写**两个**密码文件，因为同一个 --blspassword 在两个场景下的格式不同：
+      #
+      #   CLI（geth bls wallet create / account new）：utils.GetPassPhraseWithList
+      #   把文件按行切成列表逐个消费，行数不够就退化成交互提示——在非 TTY 里
+      #   不是报错而是挂住。所以 create-password.txt 要写多行相同口令。
+      #
+      #   运行时（core/vote/vote_signer.go:43-52）：os.ReadFile 后直接
+      #   string(content) 当密码，**换行会算进密码**。所以 password.txt 必须
+      #   是单行且没有结尾换行，用 printf '%s' 而不是 echo。
+      #
+      # 用同一个文件同时满足两者是不可能的：多行文件在运行时报
+      # "wrong password for wallet entered: invalid checksum"，
+      # 单行文件在 CLI 阶段会挂住。踩过一次，所以写成两条注释。
+      #
+      # 口令必须 >= 10 字符且是 7-bit 可打印 ASCII（core.ValidatePasswordFormat）。
+      mkdir -p "$dir/bls"
+      printf 'bls-devnet-pw\nbls-devnet-pw\nbls-devnet-pw\nbls-devnet-pw\n' > "$dir/bls/create-password.txt"
+      printf '%s' 'bls-devnet-pw' > "$dir/bls/password.txt"
+      chmod 600 "$dir/bls/create-password.txt" "$dir/bls/password.txt"
+      {
+        "$GETH_BIN" bls wallet create --datadir "$dir" --blspassword "$dir/bls/create-password.txt"
+        "$GETH_BIN" bls account new   --datadir "$dir" --blspassword "$dir/bls/create-password.txt"
+      } > "$dir/bls/create.log" 2>&1 \
+        || { tail -20 "$dir/bls/create.log"; die "节点 $i 的 BLS 钱包/账户创建失败"; }
+      # 直接从 EIP-2335 keystore 里读 pubkey，而不是解析 `bls account list` 的输出：
+      # 后者是给人看的，格式一变脚本就坏；前者是钱包自己写下的、必须存在的字段。
+      python3 - "$dir/bls/keystore" > "$dir/bls/vote.addr" <<'PY' \
+        || die "节点 $i 的 BLS 公钥读不出来"
+import glob, json, os, sys
+files = sorted(glob.glob(os.path.join(sys.argv[1], "*.json")))
+if len(files) != 1:
+    sys.exit("expected exactly one BLS keystore in %s, got %d" % (sys.argv[1], len(files)))
+pub = json.load(open(files[0]))["pubkey"]
+print(pub if pub.startswith("0x") else "0x" + pub)
+PY
+    fi
   done
 
   local balances=()
@@ -161,6 +206,21 @@ print(m["producers"][0])
   [ "$OMIT_SYSTEM_ALLOC" != "0" ] && deploy_args+=(--omit-system-contract-alloc)
   [ "$LUBAN_SENTINEL" != "0" ] && deploy_args+=(--luban-sentinel)
 
+  # BLS 票地址：fast finality 的聚合签名要用它验签，而验证人集合里的票地址在真实
+  # 链上来自 StakeHub 注册。devnet 没有选举，所以这里从 genesis 的 5-tuple 注入。
+  # 空列表 = 不启用 finality（epoch 块的 48 字节票地址全零，见审计 04 §1.2）。
+  local -a vote_args=()
+  if [ "$BLS_VOTE" = "1" ]; then
+    local vote
+    for ((i = 0; i < seats; i++)); do
+      dir=$(node_dir "$i")
+      vote=$(cat "$dir/bls/vote.addr" 2>/dev/null) || die "节点 $i 没有 BLS 票地址；BLS_VOTE=1 时 init 应当已经建好"
+      [ -n "$vote" ] || die "节点 $i 的 BLS 票地址是空的"
+      vote_args+=(--vote-addrs "$vote")
+      echo "BLS 票地址 [$(printf '%d' "$i")] $vote"
+    done
+  fi
+
   python3 "$SELF_DIR/gen-genesis.py" \
     --contracts-out "$CONTRACT_ROOT/out" \
     --validators "$HOME_DIR/validators.conf" \
@@ -169,6 +229,7 @@ print(m["producers"][0])
     --gas-limit "$GAS_LIMIT" \
     "${deploy_args[@]}" \
     "${producer_args[@]}" \
+    "${vote_args[@]}" \
     "${balances[@]}" \
     --out "$GENESIS"
 
@@ -244,6 +305,16 @@ print(len(g.get("config",{}).get("legacy",{}).get("producers") or []))
   for ((i = 0; i < seats; i++)); do
     dir=$(node_dir "$i"); addr=$(cat "$dir/validator.addr")
     local -a pbft_args=(--pbft.enable=false)
+    # finality 投票三件套：--vote 打开 Miner.VoteEnable（eth/backend.go:607 用它决定
+    # 要不要建 VoteManager），--blspassword/--blswallet 告诉它去哪拿 BLS 私钥。
+    # 缺 --vote 时节点照常出块，但从不投票——epoch 块里票地址非零、却永远等不到
+    # attestation，是最难查的一种"看起来配好了"。
+    local -a bls_args=()
+    if [ -f "$dir/bls/vote.addr" ]; then
+      bls_args=(--vote
+                --blspassword "$dir/bls/password.txt"
+                --blswallet "$dir/bls/wallet")
+    fi
     if [ "$fork_mode" = 1 ] && [ "$i" = 0 ]; then
       # --pbft.miner.address 必须与 --miner.etherbase 同址，否则 cmd/utils/flags.go
       # 的 setEtherbase 直接 Fatalf（两者写同一个 header.Coinbase，而它进 PBFT seal hash）。
@@ -277,6 +348,7 @@ print(len(g.get("config",{}).get("legacy",{}).get("producers") or []))
       --http.api eth,net,web3,admin \
       --syncmode full --verbosity "$VERBOSITY" \
       "${pbft_args[@]}" \
+      "${bls_args[@]}" \
       > "$LOG_DIR/node$i.log" 2>&1 &
     echo $! > "$dir/geth.pid"
     if [ "$fork_mode" = 1 ] && [ "$i" = 0 ]; then

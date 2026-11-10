@@ -17,6 +17,7 @@
 package parlia
 
 import (
+	"fmt"
 	"math"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -148,16 +149,35 @@ func (p *Parlia) pgpAnchorSnapshot(number uint64, hash common.Hash) (*Snapshot, 
 		return nil, err
 	}
 
-	// Zero BLS public keys, in the same shape parseValidators produces for a
-	// post-Luban epoch header whose validators have no BLS key registered yet.
+	// Vote addresses come from the same config the anchor set comes from.
 	//
-	// This is not a placeholder that upstream never exercises: verifyValidators
-	// and prepareValidators both substitute a zero key explicitly on the Luban
-	// fork block (parlia.go:1271-1277, :1035-1041), so a set of zero keys is a
-	// state BSC itself passes through. Vote attestation verification cannot be
-	// reached from here, because it returns early when a header carries no
-	// attestation, and a zero key cannot be turned into a signature.
+	// These used to be hardcoded to zero, with the reasoning that attestation
+	// verification could not be reached from the anchor and a zero key cannot be
+	// turned into a signature. That was true while the contract dropped the vote
+	// addresses at init (F-22): a chain had no way to hold them, so there was
+	// nothing to put here. Now that init stores them, a zero anchor is actively
+	// wrong - IsActiveValidatorAt compares the local BLS key against this list,
+	// so a zero anchor makes every node answer "not an active validator", the
+	// vote manager never signs, and no attestation is ever assembled. The symptom
+	// is a chain that produces blocks and never finalises anything, which is
+	// exactly what the first BLS devnet did.
+	//
+	// Empty config stays zero, which is the mainnet path and the behaviour every
+	// earlier release had.
 	voteAddrs := make([]types.BLSPublicKey, len(set.Consensus))
+	if len(set.VoteAddrs) != 0 {
+		if len(set.VoteAddrs) != len(set.Consensus) {
+			return nil, fmt.Errorf("pgp anchor: %d vote addresses for %d validators",
+				len(set.VoteAddrs), len(set.Consensus))
+		}
+		for i, raw := range set.VoteAddrs {
+			if len(raw) != len(voteAddrs[i]) {
+				return nil, fmt.Errorf("pgp anchor: vote address %d is %d bytes, want %d",
+					i, len(raw), len(voteAddrs[i]))
+			}
+			copy(voteAddrs[i][:], raw)
+		}
+	}
 
 	snap := newSnapshot(p.config, p.signatures, number, hash, set.Consensus, voteAddrs, p.ethAPI)
 	snap.BlockInterval = defaultBlockInterval

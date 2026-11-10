@@ -212,6 +212,31 @@ type LegacyConfig struct {
 	// but not before H2: updateParam validates against maxElectedValidators,
 	// which only exists once StakeHub has been initialized.
 	ParliaGenesisCabinets uint64 `json:"parliaGenesisCabinets,omitempty"`
+
+	// ParliaGenesisVoteAddrs is the per-validator BLS vote address (48 bytes,
+	// hex), parallel to ParliaGenesisValidators. Optional.
+	//
+	// This is what makes fast finality possible at all: vote attestations are
+	// BLS aggregate signatures, so the validator set has to know each
+	// validator's BLS public key. On a chain that has gone through StakeHub the
+	// keys arrive by validator registration and this field stays empty. A
+	// devnet has no election, so without this field its validator set carries
+	// zero vote addresses and no attestation can ever verify - which is exactly
+	// what the first Luban run measured (audit 04-verification.md §1.2).
+	//
+	// Empty is byte-neutral, and that is a hard requirement rather than a
+	// coincidence: the RLP tuple gains its fifth element only when this is set,
+	// so a chain that leaves it empty - mainnet - produces the same payload, and
+	// therefore the same state root at ForkHeight, as before this field existed.
+	//
+	// The length is 48 because that is what BLS12-381 public keys are; the value
+	// is the compressed G1 point, i.e. what `geth bls account list` prints.
+	// Whether a populated value is accepted is decided by the contract
+	// (BSCValidatorSet.decodeValidator reads it as an optional fifth field), not
+	// here, but a length other than 48 is rejected at startup because the
+	// contract would store it and every attestation would then fail to verify
+	// for a reason nothing on chain explains.
+	ParliaGenesisVoteAddrs []string `json:"parliaGenesisVoteAddrs,omitempty"`
 }
 
 // DefaultParliaVotingPower is the voting power given to a genesis validator when

@@ -163,6 +163,10 @@ def build_config(args, validators):
             "parliaGenesisValidators": validators,
             "parliaGenesisVotingPowers": [args.voting_power] * len(validators),
             "parliaGenesisCabinets": args.cabinets or len(validators),
+            # 可选：每个验证人的 48 字节 BLS 票地址。留空时 encoding 仍是 4-tuple，
+            # 与主网逐字节相同；给了才编成 5-tuple，验证人集合才带票地址，
+            # finality 的聚合验签才有可能通过。数量必须与验证人一致（节点侧会再校验一次）。
+            **({"parliaGenesisVoteAddrs": args.vote_addrs} if args.vote_addrs else {}),
         },
     }
     return cfg
@@ -179,6 +183,9 @@ def main() -> int:
                          "配合 legacy.allowForeignGenesis 规避 genesis 不匹配的启动检查。")
     ap.add_argument("--voting-power", type=int, default=100)
     ap.add_argument("--cabinets", type=int, default=0, help="0 = 取验证人数")
+    ap.add_argument("--vote-addrs", action="append", default=[], metavar="HEX48",
+                    help="验证人的 48 字节 BLS 票地址，按验证人顺序重复给；留空则不启用 finality。"
+                         "给了就必须与验证人数量一致，否则节点启动时会拒绝。")
     ap.add_argument("--gas-fee-recipient", default="0x0000000000000000000000000000000000000000")
     ap.add_argument("--gas-fee-recipient-ratio", type=int, default=0)
     ap.add_argument("--gas-limit", default="0x2625a00")

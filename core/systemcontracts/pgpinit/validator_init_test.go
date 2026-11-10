@@ -14,6 +14,7 @@ import (
 	"bytes"
 	"encoding/binary"
 	"fmt"
+	"strings"
 	"testing"
 
 	"github.com/ethereum/go-ethereum/common"
@@ -121,6 +122,40 @@ func seatConfig(n int) *params.LegacyConfig {
 			fmt.Sprintf("0x%040x", i))
 	}
 	return cfg
+}
+
+// testVoteKeys are real BLS12-381 public keys, generated once and pinned.
+//
+// They have to be real: parseVoteAddress rejects anything that is not a point on
+// the curve, on the grounds that the contract would store a bogus key verbatim
+// and every aggregate attestation would then fail with no on-chain explanation.
+// Using plausible-looking hex here would only test the rejection path.
+var testVoteKeys = []string{
+	"0x8ad2f8706d49990cffddd1971451ee8b023851e81b3fb226f01224ea4239eb24da26ff1b328177511e636c668b55396b",
+	"0xb3d78d15b2dd2d71c34b5ffedbc815fca8106742ead6a2282a034d9cec4d00e81e5ee5a4c54337e730e003a9792cef3d",
+	"0xb4059dbeb7a55dc9437cb4f989ff7e7d0f2c33cae98b5ef5058e150bcf007b43acc9f4b9ad24f82ff639d43e3300cee8",
+}
+
+// threeSeatConfigWithVotes is threeSeatConfig plus one vote address per seat.
+func threeSeatConfigWithVotes() *params.LegacyConfig {
+	cfg := threeSeatConfig()
+	cfg.ParliaGenesisVoteAddrs = append([]string(nil), testVoteKeys...)
+	return cfg
+}
+
+// encodeByHandWithVotes mirrors encodeByHand for the five-field shape.
+func encodeByHandWithVotes(tuples []validatorTuple, votes [][]byte) []byte {
+	items := make([][]byte, 0, len(tuples))
+	for i, t := range tuples {
+		items = append(items, rlpList(
+			rlpStr(t.Consensus.Bytes()),
+			rlpStr(t.BSCFee.Bytes()),
+			rlpStr(t.Fee.Bytes()),
+			rlpUint(t.Power),
+			rlpStr(votes[i]),
+		))
+	}
+	return rlpList(rlpUint(pgpValidatorPackageType), rlpList(items...))
 }
 
 // ---------------------------------------------------------------------------
@@ -269,6 +304,122 @@ func TestValidatorInitArgsRoundTrip(t *testing.T) {
 			t.Fatal("an empty validator set must be rejected")
 		}
 	})
+}
+
+// TestVoteAddressesAddFifthField covers the finality shape: when vote addresses
+// are configured each validator grows a fifth field, forty-eight bytes of BLS
+// public key plus its own RLP header.
+//
+// The length arithmetic is asserted rather than just "it changed": 49 bytes per
+// seat is the whole difference between a chain that can produce attestations and
+// one that cannot, and an off-by-one in the framing would still round-trip
+// through this package while the contract read a truncated key.
+func TestVoteAddressesAddFifthField(t *testing.T) {
+	withVotes, _, err := ValidatorInitArgs(threeSeatConfigWithVotes())
+	if err != nil {
+		t.Fatalf("ValidatorInitArgs with vote addresses: %v", err)
+	}
+	withoutVotes, _, err := ValidatorInitArgs(threeSeatConfig())
+	if err != nil {
+		t.Fatalf("ValidatorInitArgs without vote addresses: %v", err)
+	}
+	const perSeat = voteAddressLength + 1 // 48 bytes + the 0xb0 string header
+	// The extra 2 is not slack: both list bodies cross 255 bytes when the vote
+	// addresses are added, so both length prefixes widen from one byte to two
+	// (0xf8 NN -> 0xf9 NN NN). A test that only checked "it got bigger" would
+	// still pass if the inner header were left at one byte, which is exactly the
+	// kind of framing error the contract cannot detect and the self-check cannot
+	// see.
+	if want := len(withoutVotes) + 3*perSeat + 2; len(withVotes) != want {
+		t.Fatalf("payload with vote addresses is %d bytes, want %d (%d + 3*%d + 2 for the widened list headers)",
+			len(withVotes), want, len(withoutVotes), perSeat)
+	}
+
+	want := encodeByHandWithVotes([]validatorTuple{
+		{Consensus: common.HexToAddress("0x0000000000000000000000000000000000000001"),
+			BSCFee: common.HexToAddress("0x0000000000000000000000000000000000000001"),
+			Fee:    common.HexToAddress("0x0000000000000000000000000000000000000101"), Power: 7},
+		{Consensus: common.HexToAddress("0x0000000000000000000000000000000000000002"),
+			BSCFee: common.HexToAddress("0x0000000000000000000000000000000000000002"),
+			Fee:    common.HexToAddress("0x0000000000000000000000000000000000000102"), Power: 8},
+		{Consensus: common.HexToAddress("0x0000000000000000000000000000000000000003"),
+			BSCFee: common.HexToAddress("0x0000000000000000000000000000000000000003"),
+			Fee:    common.HexToAddress("0x0000000000000000000000000000000000000103"), Power: 9},
+	}, [][]byte{
+		common.FromHex(testVoteKeys[0]),
+		common.FromHex(testVoteKeys[1]),
+		common.FromHex(testVoteKeys[2]),
+	})
+	if !bytes.Equal(withVotes, want) {
+		t.Fatalf("payload with vote addresses does not match the hand-rolled encoder\n got: %x\nwant: %x", withVotes, want)
+	}
+
+	_, decoded, err := decodeValidatorInitPayload(withVotes)
+	if err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(decoded) != 3 {
+		t.Fatalf("decoded %d validators, want 3", len(decoded))
+	}
+	for i := range decoded {
+		if got, want := "0x"+fmt.Sprintf("%x", decoded[i].Vote), testVoteKeys[i]; got != want {
+			t.Fatalf("validator %d vote address = %s, want %s", i, got, want)
+		}
+	}
+}
+
+// TestVoteAddressConfigValidation covers the ways a vote-address list can be
+// wrong. Each one is a startup error rather than an on-chain surprise.
+func TestVoteAddressConfigValidation(t *testing.T) {
+	cases := []struct {
+		name string
+		vote []string
+		want string
+	}{
+		{
+			"too few entries",
+			testVoteKeys[:2],
+			"must be empty or match exactly",
+		},
+		{
+			"too many entries",
+			append(append([]string(nil), testVoteKeys...), testVoteKeys[0]),
+			"must be empty or match exactly",
+		},
+		{
+			"wrong length",
+			[]string{"0x1234", testVoteKeys[1], testVoteKeys[2]},
+			"expected 96 hex characters",
+		},
+		{
+			"not hex",
+			[]string{"0x" + strings.Repeat("zz", 48), testVoteKeys[1], testVoteKeys[2]},
+			"not hex",
+		},
+		{
+			"zero key",
+			[]string{"0x" + strings.Repeat("00", 48), testVoteKeys[1], testVoteKeys[2]},
+			"zero key",
+		},
+		{
+			"not a curve point",
+			[]string{"0x" + strings.Repeat("11", 48), testVoteKeys[1], testVoteKeys[2]},
+			"not a BLS12-381 public key",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := threeSeatConfig()
+			cfg.ParliaGenesisVoteAddrs = c.vote
+			_, _, err := ValidatorInitArgs(cfg)
+			if err == nil {
+				t.Fatalf("expected an error containing %q, got none", c.want)
+			}
+			if !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("error = %v, want it to contain %q", err, c.want)
+			}
+		})
+	}
 }
 
 // TestValidatorInitArgsGoldenPayload is a tripwire, not an external authority.

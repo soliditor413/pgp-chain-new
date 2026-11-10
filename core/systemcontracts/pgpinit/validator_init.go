@@ -23,6 +23,8 @@ package pgpinit
 // outcome.
 
 import (
+	"bytes"
+	"encoding/hex"
 	"errors"
 	"fmt"
 
@@ -30,6 +32,7 @@ import (
 	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/params"
 	"github.com/ethereum/go-ethereum/rlp"
+	blscrypto "github.com/prysmaticlabs/prysm/v5/crypto/bls"
 )
 
 const (
@@ -45,6 +48,11 @@ const (
 	// and 0 selects decodeValidatorSetSynPackage, which is the 4-tuple-per-
 	// validator layout this encoder produces.
 	pgpValidatorPackageType = 0
+
+	// voteAddressLength is the size of a compressed BLS12-381 public key, which
+	// is what BSCValidatorSet stores as a validator's vote address and what an
+	// aggregate attestation is verified against.
+	voteAddressLength = 48
 )
 
 // ErrNoPGPGenesisValidators is returned when a chain has a Parlia fork height
@@ -81,6 +89,15 @@ type ValidatorSet struct {
 
 	// Voting powers, parallel to Consensus.
 	Powers []uint64
+
+	// VoteAddrs is the per-validator BLS public key (48 bytes), parallel to
+	// Consensus. Empty means "this chain has no vote addresses configured",
+	// which is the mainnet case and keeps the RLP payload at four fields.
+	//
+	// It is a [][]byte rather than [][48]byte so the empty case is unambiguous:
+	// a nil slice means "omit the field", which is different from "48 zero
+	// bytes", and the encoder must be able to tell those apart.
+	VoteAddrs [][]byte
 
 	// Cabinets is the value seeded into BSCValidatorSet.numOfCabinets.
 	Cabinets uint64
@@ -186,7 +203,69 @@ func FromLegacy(cfg *params.LegacyConfig) (*ValidatorSet, error) {
 		return nil, fmt.Errorf("parliaGenesisCabinets is %d but only %d validators are configured", set.Cabinets, n)
 	}
 
+	// Vote addresses are all-or-nothing, exactly like the fee addresses: a list
+	// shorter than the validator set would attach the wrong BLS key to the wrong
+	// validator, and the resulting payload would still be well-formed, so the
+	// mistake would only surface as attestations that never verify.
+	if l := len(cfg.ParliaGenesisVoteAddrs); l != 0 {
+		if l != n {
+			return nil, fmt.Errorf("parliaGenesisVoteAddrs has %d entries but parliaGenesisValidators has %d; must be empty or match exactly", l, n)
+		}
+		set.VoteAddrs = make([][]byte, n)
+		for i, raw := range cfg.ParliaGenesisVoteAddrs {
+			vote, err := parseVoteAddress(raw)
+			if err != nil {
+				return nil, fmt.Errorf("parliaGenesisVoteAddrs[%d] %q: %w", i, raw, err)
+			}
+			set.VoteAddrs[i] = vote
+		}
+	}
+
 	return set, nil
+}
+
+// parseVoteAddress accepts a 48-byte BLS public key in hex, with or without the
+// 0x prefix, and rejects everything else.
+//
+// The all-zero key is rejected on purpose. It is what the contract stores when
+// no vote address is supplied, so accepting it here would let an operator
+// "configure" finality that can never work: the payload would carry 48 zero
+// bytes, the epoch block would look identical to the one measured in
+// 04-verification.md §1.2, and every aggregate attestation would fail to verify
+// with no hint that the keys were the problem.
+func parseVoteAddress(s string) ([]byte, error) {
+	const hexLen = 2 * voteAddressLength
+
+	body := s
+	if len(body) >= 2 && (body[:2] == "0x" || body[:2] == "0X") {
+		body = body[2:]
+	}
+	if len(body) != hexLen {
+		return nil, fmt.Errorf("expected %d hex characters (%d-byte BLS public key), got %d", hexLen, voteAddressLength, len(body))
+	}
+	if _, err := hex.DecodeString(body); err != nil {
+		return nil, fmt.Errorf("not hex: %w", err)
+	}
+	vote := common.FromHex(body)
+	allZero := true
+	for _, b := range vote {
+		if b != 0 {
+			allZero = false
+			break
+		}
+	}
+	if allZero {
+		return nil, errors.New("is the zero key, which is the same as not configuring a vote address at all")
+	}
+	// The curve check is not paranoia. A 96-character hex string that is not a
+	// point on BLS12-381 passes every length check, is stored by the contract
+	// verbatim, and then every aggregate attestation fails to verify - with
+	// nothing on chain explaining why. This is the last point at which that
+	// mistake costs a restart instead of a debugging session.
+	if _, err := blscrypto.PublicKeyFromBytes(vote); err != nil {
+		return nil, fmt.Errorf("not a BLS12-381 public key: %w", err)
+	}
+	return vote, nil
 }
 
 // parseValidatorAddress accepts the address forms that appear in a genesis
@@ -279,12 +358,43 @@ func ValidatorInitArgs(cfg *params.LegacyConfig) (payload []byte, cabinets uint6
 		}
 	}
 
+	// Two shapes, chosen by whether a vote address was configured.
+	//
+	// The four-field shape is not a legacy fallback - it is the mainnet shape,
+	// and it has to stay byte-identical to what previous releases produced,
+	// because its bytes are what block D's state root is computed over. Adding a
+	// fifth field unconditionally (even with an empty value) would change the
+	// payload of every existing chain for no reason. The contract accepts both:
+	// BSCValidatorSet.decodeValidator treats index 4 as an optional vote address
+	// (contracts/BSCValidatorSet.sol:1168-1169).
+	var encodeTarget interface{}
+	if len(set.VoteAddrs) == 0 {
+		encodeTarget = tuples
+	} else {
+		// Vote addresses are what make fast finality work at all: attestations
+		// are BLS aggregate signatures and the validator set has to know the
+		// public keys. An empty list here is "no finality on this chain", not
+		// "an error" - the devnet before this field existed ran exactly that
+		// way, with 48 zero bytes per seat in every epoch block.
+		withVotes := make([]validatorTupleWithVote, len(tuples))
+		for i := range tuples {
+			withVotes[i] = validatorTupleWithVote{
+				Consensus: tuples[i].Consensus,
+				BSCFee:    tuples[i].BSCFee,
+				Fee:       tuples[i].Fee,
+				Power:     tuples[i].Power,
+				Vote:      set.VoteAddrs[i],
+			}
+		}
+		encodeTarget = withVotes
+	}
+
 	// rlp.EncodeToBytes on a struct encodes its fields as a list, which is the
 	// tuple. The outer []interface{} is a list of two elements: the package
 	// type and the validator list.
 	payload, err = rlp.EncodeToBytes([]interface{}{
 		uint8(pgpValidatorPackageType),
-		tuples,
+		encodeTarget,
 	})
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to RLP-encode the parlia genesis validator set: %w", err)
@@ -306,23 +416,77 @@ func ValidatorInitArgs(cfg *params.LegacyConfig) (payload []byte, cabinets uint6
 	// that drifted out of sync. What it cannot catch: a bug that encodes and
 	// decodes symmetrically wrong. That is what the independent encoder in
 	// validator_init_test.go is for.
+	//
+	// The expectation is built here rather than re-encoded, and it is built in
+	// the shape-independent form, so a mistake in *which* shape was chosen (four
+	// fields where five were meant, or the vote addresses attached to the wrong
+	// validators) shows up as a mismatch rather than as an agreement.
+	expected := make([]decodedValidator, len(tuples))
+	for i := range tuples {
+		expected[i] = decodedValidator{
+			Consensus: tuples[i].Consensus,
+			BSCFee:    tuples[i].BSCFee,
+			Fee:       tuples[i].Fee,
+			Power:     tuples[i].Power,
+		}
+		if len(set.VoteAddrs) != 0 {
+			expected[i].Vote = set.VoteAddrs[i]
+		}
+	}
 	decodedPkg, decoded, err := decodeValidatorInitPayload(payload)
 	if err != nil {
 		return nil, 0, fmt.Errorf("internal: validator init payload failed its round-trip self-check: %w", err)
 	}
-	if int(decodedPkg) != pgpValidatorPackageType || len(decoded) != len(tuples) {
+	if int(decodedPkg) != pgpValidatorPackageType || len(decoded) != len(expected) {
 		return nil, 0, fmt.Errorf("internal: validator init payload failed its round-trip self-check: "+
 			"encoded %d validators (package type %d), decoded %d (package type %d)",
-			len(tuples), pgpValidatorPackageType, len(decoded), decodedPkg)
+			len(expected), pgpValidatorPackageType, len(decoded), decodedPkg)
 	}
-	for i := range tuples {
-		if decoded[i] != tuples[i] {
+	for i := range expected {
+		if !sameDecodedValidator(decoded[i], expected[i]) {
 			return nil, 0, fmt.Errorf("internal: validator init payload failed its round-trip self-check: "+
-				"validator %d encoded as %+v, decoded as %+v", i, tuples[i], decoded[i])
+				"validator %d encoded as %+v, decoded as %+v", i, expected[i], decoded[i])
 		}
 	}
 
 	return payload, set.Cabinets, nil
+}
+
+// validatorTupleWithVote is the five-field shape. It is a separate type rather
+// than a nullable field on validatorTuple because RLP has no notion of an absent
+// struct field: adding Vote to the tuple would emit an empty string for it and
+// change the payload of every chain that has no vote addresses.
+//
+// The field order matches validatorTuple plus the vote address, which is what
+// BSCValidatorSet.decodeValidator reads (index 4, optional).
+type validatorTupleWithVote struct {
+	Consensus common.Address
+	BSCFee    common.Address
+	Fee       common.Address
+	Power     uint64
+	Vote      []byte
+}
+
+// decodedValidator is the shape-independent form the self-check compares in.
+//
+// Vote is nil when the payload carried four fields and 48 bytes when it carried
+// five. Keeping "nil" and "48 zero bytes" distinct is deliberate: the whole
+// point of the vote field is that an all-zero key means "finality cannot work
+// here", so the self-check must be able to tell the two apart.
+type decodedValidator struct {
+	Consensus common.Address
+	BSCFee    common.Address
+	Fee       common.Address
+	Power     uint64
+	Vote      []byte
+}
+
+func sameDecodedValidator(a, b decodedValidator) bool {
+	return a.Consensus == b.Consensus &&
+		a.BSCFee == b.BSCFee &&
+		a.Fee == b.Fee &&
+		a.Power == b.Power &&
+		bytes.Equal(a.Vote, b.Vote)
 }
 
 // decodeValidatorInitPayload is the inverse of the encoder above.
@@ -333,9 +497,15 @@ func ValidatorInitArgs(cfg *params.LegacyConfig) (payload []byte, cabinets uint6
 // error - because a lenient decoder here would reproduce exactly the failure the
 // self-check is meant to prevent.
 //
+// It accepts both the four-field and five-field validator shapes, and rejects
+// anything in between: the contract would tolerate a three-field tuple (success
+// flips at index 3, so it would not) but there is no configuration that should
+// ever produce one, and a decoder that quietly accepted it could not be used to
+// prove the count.
+//
 // It is not a second encoder and must not grow into one: the payload is
 // consensus-critical and must have one producer.
-func decodeValidatorInitPayload(payload []byte) (uint8, []validatorTuple, error) {
+func decodeValidatorInitPayload(payload []byte) (uint8, []decodedValidator, error) {
 	var outer []rlp.RawValue
 	if err := rlp.DecodeBytes(payload, &outer); err != nil {
 		return 0, nil, fmt.Errorf("outer list: %w", err)
@@ -347,9 +517,42 @@ func decodeValidatorInitPayload(payload []byte) (uint8, []validatorTuple, error)
 	if err := rlp.DecodeBytes(outer[0], &pkg); err != nil {
 		return 0, nil, fmt.Errorf("package type: %w", err)
 	}
-	var tuples []validatorTuple
-	if err := rlp.DecodeBytes(outer[1], &tuples); err != nil {
+	var items []rlp.RawValue
+	if err := rlp.DecodeBytes(outer[1], &items); err != nil {
 		return 0, nil, fmt.Errorf("validator list: %w", err)
 	}
-	return pkg, tuples, nil
+
+	out := make([]decodedValidator, len(items))
+	for i, item := range items {
+		var fields []rlp.RawValue
+		if err := rlp.DecodeBytes(item, &fields); err != nil {
+			return 0, nil, fmt.Errorf("validator %d: %w", i, err)
+		}
+		if len(fields) != 4 && len(fields) != 5 {
+			return 0, nil, fmt.Errorf("validator %d has %d fields, want 4 or 5", i, len(fields))
+		}
+		var d decodedValidator
+		if err := rlp.DecodeBytes(fields[0], &d.Consensus); err != nil {
+			return 0, nil, fmt.Errorf("validator %d consensus address: %w", i, err)
+		}
+		if err := rlp.DecodeBytes(fields[1], &d.BSCFee); err != nil {
+			return 0, nil, fmt.Errorf("validator %d BBC fee address: %w", i, err)
+		}
+		if err := rlp.DecodeBytes(fields[2], &d.Fee); err != nil {
+			return 0, nil, fmt.Errorf("validator %d fee address: %w", i, err)
+		}
+		if err := rlp.DecodeBytes(fields[3], &d.Power); err != nil {
+			return 0, nil, fmt.Errorf("validator %d voting power: %w", i, err)
+		}
+		if len(fields) == 5 {
+			if err := rlp.DecodeBytes(fields[4], &d.Vote); err != nil {
+				return 0, nil, fmt.Errorf("validator %d vote address: %w", i, err)
+			}
+			if len(d.Vote) != voteAddressLength {
+				return 0, nil, fmt.Errorf("validator %d vote address is %d bytes, want %d", i, len(d.Vote), voteAddressLength)
+			}
+		}
+		out[i] = d
+	}
+	return pkg, out, nil
 }

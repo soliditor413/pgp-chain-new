@@ -416,3 +416,49 @@ func TestPGPAnchorSnapshotShape(t *testing.T) {
 		t.Errorf("BlockInterval = %d, want %d", snap.BlockInterval, defaultBlockInterval)
 	}
 }
+
+// TestPGPAnchorSnapshotCarriesVoteAddresses pins the second half of the F-22
+// fix: the anchor used to hardcode zero BLS keys.
+//
+// Zero keys are not a harmless placeholder. IsActiveValidatorAt compares the
+// local BLS public key against this list, so a zero anchor makes every node
+// answer "not an active validator", the vote manager never signs, and no
+// attestation is ever assembled - a chain that produces blocks and never
+// finalises anything, with no error anywhere. That is exactly what the first
+// BLS devnet did, and it took a debug-level log line to see it.
+func TestPGPAnchorSnapshotCarriesVoteAddresses(t *testing.T) {
+	// One validator is enough: the point is that the key reaches the snapshot
+	// intact, not how many keys there are. A real BLS12-381 public key, because
+	// FromLegacy rejects anything that is not a curve point.
+	const vote = "0x8ad2f8706d49990cffddd1971451ee8b023851e81b3fb226f01224ea4239eb24da26ff1b328177511e636c668b55396b"
+
+	legacy := &params.LegacyConfig{
+		ForkHeight:                1100,
+		ParliaGenesisValidators:   []string{devnetValidators[0]},
+		ParliaGenesisVotingPowers: []uint64{100},
+		ParliaGenesisCabinets:     1,
+		ParliaGenesisVoteAddrs:    []string{vote},
+	}
+	cfg := &params.ChainConfig{ChainID: big.NewInt(1), Legacy: legacy}
+	plan, err := newPGPInitPlan(cfg)
+	if err != nil {
+		t.Fatalf("newPGPInitPlan: %v", err)
+	}
+	p := &Parlia{
+		chainConfig: cfg,
+		pgpInit:     plan,
+		signatures:  lru.NewCache[common.Hash, common.Address](inMemorySignatures),
+	}
+	snap, err := p.pgpAnchorSnapshot(1099, common.HexToHash("0xdead"))
+	if err != nil {
+		t.Fatalf("pgpAnchorSnapshot: %v", err)
+	}
+	info, ok := snap.Validators[common.HexToAddress(devnetValidators[0])]
+	if !ok {
+		t.Fatalf("validator %s missing from the anchor snapshot", devnetValidators[0])
+	}
+	want := types.BLSPublicKey(common.FromHex(vote))
+	if info.VoteAddress != want {
+		t.Fatalf("anchor vote address = %x, want %x", info.VoteAddress, want)
+	}
+}
