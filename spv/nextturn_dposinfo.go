@@ -2,6 +2,7 @@ package spv
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"sort"
 	"sync"
@@ -11,6 +12,8 @@ import (
 	"github.com/elastos/Elastos.ELA/core/types/payload"
 
 	"github.com/ethereum/go-ethereum/common"
+	"github.com/ethereum/go-ethereum/common/hexutil"
+	"github.com/ethereum/go-ethereum/crypto"
 	"github.com/ethereum/go-ethereum/log"
 )
 
@@ -214,6 +217,39 @@ func GetProducers(elaHeight uint64) ([][]byte, int, error) {
 		return bytes.Compare(producers[i], producers[j]) < 0
 	})
 	return producers, totalCount, nil
+}
+
+// ProducersFingerprint returns a short digest of the producer set that legacy
+// header verification would use at elaHeight.
+//
+// It exists because of audit F-16. Whether a legacy block is valid depends on
+// data that is *not* in the block: the local SPV database. Two nodes whose SPV
+// views differ therefore disagree about the validity of the same block, and
+// neither can prove from the chain alone which one is right - so the disagreement
+// surfaces as mutually rejected blocks instead of as a diagnosable fact.
+// Printing a digest at a fixed ELA height turns that into a log line two
+// operators can compare before the fork.
+//
+// The seat count is hashed together with the addresses on purpose: the signature
+// threshold comes from the total, not from len(producers), so two nodes can agree
+// on every address and still disagree about validity when their vacancy counts
+// differ (F-17).
+//
+// Truncated to 8 bytes: this is a comparison token in a log line, not a
+// commitment. 64 bits is enough to make an accidental match absurd, and the
+// alternative - comparing 33-byte compressed public keys by eye - is worse.
+func ProducersFingerprint(elaHeight uint64) (string, error) {
+	producers, total, err := GetProducers(elaHeight)
+	if err != nil {
+		return "", err
+	}
+	buf := make([]byte, 8, 8+len(producers)*33)
+	binary.BigEndian.PutUint64(buf, uint64(total))
+	for _, p := range producers {
+		buf = append(buf, p...)
+	}
+	sum := crypto.Keccak256(buf)
+	return hexutil.Encode(sum[:8]), nil
 }
 
 // consensusModeAt returns the ELA consensus algorithm that was in force at the

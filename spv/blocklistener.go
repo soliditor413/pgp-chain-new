@@ -182,9 +182,23 @@ func (l *BlockListener) NotifyBlock(block *util.Block, isCurrent bool) {
 			// txs/crossChainTxs are cumulative. If txs stays at 0 while
 			// elaHeight climbs, the bloom filter has no address (see
 			// transactionListener) and every recharge record is missing.
+			//
+			// producers is the F-16 comparison token: a digest of the arbiter
+			// set legacy verification would use at this ELA height. Two nodes
+			// that print the same digest at the same height agree about which
+			// blocks are valid; two that print different ones will reject each
+			// other's blocks, and this line says so before the fork rather than
+			// during it. It is computed here, once per 10k blocks, because this
+			// is the only place that already has both the height and an operator
+			// reading the output.
+			fingerprint, fpErr := ProducersFingerprint(uint64(block.Height))
+			if fpErr != nil {
+				fingerprint = "unavailable: " + fpErr.Error()
+			}
 			log.Info("ELA main chain sync progress", "elaHeight", block.Height,
 				"txs", txsSoFar, "crossChainTxs", crossChainTxsSoFar,
-				"indexing", GetRechargeStore() != nil, "current", isCurrent)
+				"indexing", GetRechargeStore() != nil, "current", isCurrent,
+				"producers", fingerprint)
 		}
 	}
 

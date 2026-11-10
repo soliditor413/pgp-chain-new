@@ -60,6 +60,22 @@ func (s fakeSPVService) HeaderStore() store.HeaderStore { return s.headerStore }
 // running" and would report 0 instead of the head height without it.
 func (s fakeSPVService) GetBlockListener() spv.BlockListener { return &BlockListener{} }
 
+// GetConsensusAlgorithm and GetArbiters are here because the progress line now
+// carries a fingerprint of the producer set (F-16), and that digest walks the
+// same path legacy header verification does. Before, the fake only had to serve
+// a head; the panic in the embedded nil interface was the signal that the log
+// line reaches further into the service than the fixture did.
+//
+// The values are deliberately boring: these tests assert that blocks get
+// indexed and that the progress line is emitted, not what the digest is.
+func (s fakeSPVService) GetConsensusAlgorithm(height uint32) (spv.ConsensusAlgorithm, error) {
+	return spv.DPOS, nil
+}
+
+func (s fakeSPVService) GetArbiters(height uint32) (crcArbiters [][]byte, normalArbiters [][]byte, err error) {
+	return nil, nil, nil
+}
+
 // installFakeSPV points the package level service at a head with the given hash
 // and height for the duration of the test.
 func installFakeSPV(t *testing.T, best *util.Header) {

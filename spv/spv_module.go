@@ -115,9 +115,19 @@ const (
 	blockDiff    = 6
 )
 
-var (
-	IsOnlyCRConsensus = true
-)
+// IsOnlyCRConsensus selects which half of GetArbiters' answer counts as the
+// producer set: the CR (convenor) arbiters when true, the normal arbiters when
+// false.
+//
+// It is a const, not a var, and that is the whole point (audit F-16). Whether a
+// legacy block is valid must not depend on a package-level variable that some
+// future caller can flip: two nodes that disagree about this flag would disagree
+// about the validity of every legacy block after the ELA height where the two
+// arbiter sets differ, and nothing in the block records which convention was
+// meant. It was a var until now and had no assignment outside this declaration,
+// so making it const costs nothing and removes the ability to introduce exactly
+// that divergence.
+const IsOnlyCRConsensus = true
 
 const (
 	ChainState_DPOS = iota
