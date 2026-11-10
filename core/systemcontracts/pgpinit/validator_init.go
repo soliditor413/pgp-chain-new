@@ -289,5 +289,67 @@ func ValidatorInitArgs(cfg *params.LegacyConfig) (payload []byte, cabinets uint6
 	if err != nil {
 		return nil, 0, fmt.Errorf("failed to RLP-encode the parlia genesis validator set: %w", err)
 	}
+
+	// Round-trip self-check (audit F-05). Read-only: the bytes above are the
+	// bytes that get injected, and nothing below changes them.
+	//
+	// The reason this exists is narrower than "defensive coding". The contract's
+	// decodeValidatorSet walks the RLP list and trusts its length, so a payload
+	// that is well-formed but one validator short decodes cleanly and installs a
+	// smaller set. init() is one-shot: after it, alreadyInit is true and there is
+	// no governance path to correct the set (see F-02) - only a hard fork. The
+	// failure therefore has to happen here, before block D is produced, and it
+	// has to be loud.
+	//
+	// What this catches: framing errors (a length prefix that describes fewer
+	// elements than were written), field-order slips, and a tuple/address list
+	// that drifted out of sync. What it cannot catch: a bug that encodes and
+	// decodes symmetrically wrong. That is what the independent encoder in
+	// validator_init_test.go is for.
+	decodedPkg, decoded, err := decodeValidatorInitPayload(payload)
+	if err != nil {
+		return nil, 0, fmt.Errorf("internal: validator init payload failed its round-trip self-check: %w", err)
+	}
+	if int(decodedPkg) != pgpValidatorPackageType || len(decoded) != len(tuples) {
+		return nil, 0, fmt.Errorf("internal: validator init payload failed its round-trip self-check: "+
+			"encoded %d validators (package type %d), decoded %d (package type %d)",
+			len(tuples), pgpValidatorPackageType, len(decoded), decodedPkg)
+	}
+	for i := range tuples {
+		if decoded[i] != tuples[i] {
+			return nil, 0, fmt.Errorf("internal: validator init payload failed its round-trip self-check: "+
+				"validator %d encoded as %+v, decoded as %+v", i, tuples[i], decoded[i])
+		}
+	}
+
 	return payload, set.Cabinets, nil
+}
+
+// decodeValidatorInitPayload is the inverse of the encoder above.
+//
+// It exists for one caller: the round-trip self-check in ValidatorInitArgs. It
+// is deliberately strict about the outer framing - decoding into []rlp.RawValue
+// forces the top level to be a two-element list and turns trailing bytes into an
+// error - because a lenient decoder here would reproduce exactly the failure the
+// self-check is meant to prevent.
+//
+// It is not a second encoder and must not grow into one: the payload is
+// consensus-critical and must have one producer.
+func decodeValidatorInitPayload(payload []byte) (uint8, []validatorTuple, error) {
+	var outer []rlp.RawValue
+	if err := rlp.DecodeBytes(payload, &outer); err != nil {
+		return 0, nil, fmt.Errorf("outer list: %w", err)
+	}
+	if len(outer) != 2 {
+		return 0, nil, fmt.Errorf("outer list has %d elements, want 2 (package type, validators)", len(outer))
+	}
+	var pkg uint8
+	if err := rlp.DecodeBytes(outer[0], &pkg); err != nil {
+		return 0, nil, fmt.Errorf("package type: %w", err)
+	}
+	var tuples []validatorTuple
+	if err := rlp.DecodeBytes(outer[1], &tuples); err != nil {
+		return 0, nil, fmt.Errorf("validator list: %w", err)
+	}
+	return pkg, tuples, nil
 }
