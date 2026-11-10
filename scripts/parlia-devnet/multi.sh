@@ -128,9 +128,9 @@ cmd_init() {
   # 是 Elastos P-256 公钥，不是 EVM 的 secp256k1。所以 fork 模式下额外生成一个
   # arbiter keystore，公钥写进 genesis 的 legacy.producers，私钥交给 node 0。
   #
-  # 只要 1 席：legacyMajorityCount(1) = int(2*1/3) = 0，即单生产者集合下一个零投票的
-  # confirm 就是合法的（consensus/pgp/confirm.go 的注释写明了这是上游行为，不是 bug）。
-  # 多席则需要多把私钥同时在线投票，单机做不到。
+  # 只要 1 席：F-14 之后 legacyMajorityCount(1) = 1，封块人自己的那一票就够；在那之前
+  # 它是 0，单生产者集合下一个零投票的 confirm 也算合法，等于根本不验票（见
+  # consensus/pgp/confirm.go 的注释）。多席需要多把私钥同时在线投票，单机做不到。
   #
   # 这一步也把「自派生密钥」这件事说清楚了：这些 key 与 pgp 主网那 12 个生产者无关，
   # 只用于本地验证分叉逻辑。
@@ -227,11 +227,18 @@ print(len(g.get("config",{}).get("legacy",{}).get("producers") or []))
                  --pbft.keystore.password "$ARBITER_PASSWORD_FILE"
                  --pbft.miner.address "$addr")
     fi
+    # --nat extip:127.0.0.1：admin_nodeInfo 的 enode 默认 advertise 本机 LAN 地址
+    # （如 192.168.1.4），同机多实例互相 addPeer 时拨的是那个地址；一旦环境不允许
+    # 走 LAN，四个节点 peers 恒为 0，Parlia 段就会在 F 块之后卡在
+    # "Signed recently, must wait for others"（见 F-19）。钉成 127.0.0.1 之后
+    # enode 里的 host 与本机监听一致，组网不再依赖 LAN 路由。
+    #
     # --nodiscover + --maxpeers：不靠 discovery，靠下面的 admin.addPeer 显式组网，
     # 避免同机多实例通过 UDP 探测互相发现出非确定拓扑。
     "$GETH_BIN" \
       --datadir "$dir" --networkid "$NETWORK_ID" \
       --port "$(node_p2p "$i")" \
+      --nat extip:127.0.0.1 \
       --nodiscover --maxpeers "$seats" \
       --mine --miner.etherbase "$addr" \
       --unlock "$addr" --password "$dir/password.txt" --allow-insecure-unlock \
