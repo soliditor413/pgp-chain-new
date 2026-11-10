@@ -22,16 +22,15 @@ which address, initialised how".
 ## Provenance: this is NOT upstream v1.2.6
 
 Source: `github.com/pgprotocol/bsc-genesis-contract`, commit
-`6895b8c0acc944b80a172eec38da3e9fa66ead65`, tag **`pgp-fork-v2`** — the fork's
-own history on top of upstream v1.2.6 (`041881a`). 8 contracts differ from
-upstream, and 7 more differ from the first pinned image (`pgp-fork-v1`,
-`5d2d047`) because their initialisers gained the caller gate described below:
+`b6071a1762a4dc97d6fdc745532fd3807c679d56`, tag **`pgp-fork-v3`** — the fork's
+own history on top of upstream v1.2.6 (`041881a`). Successive pins, so a reader
+can tell what came from where:
 
-`BSCValidatorSet`, `SlashIndicator`, `System.sol` (`bscChainID = 860621`),
-`StakeHub`, `BSCGovernor`, `GovToken`, `TokenRecoverPortal`,
-`extension/BSCValidatorSetTool`; plus `TokenHub` and the deprecated
-`TendermintLightClient`, `RelayerIncentivize`, `RelayerHub`, `CrossChain`, whose
-`init()` now requires `onlyCoinbase onlyZeroGasPrice`.
+| Tag | Commit | What it added | Contracts that moved |
+|---|---|---|---|
+| `pgp-fork-v1` | `5d2d047` | the fork's work committed (F-04) | 8 vs upstream |
+| `pgp-fork-v2` | `6895b8c` | `onlyCoinbase onlyZeroGasPrice` on the 0.6.4 initialisers, 255-seat cap (F-03) | 7 |
+| `pgp-fork-v3` | `b6071a1` | `not initialized` on the consensus read paths (F-08); `returndatasize` checks on both precompile calls (F-11b) | 3 |
 
 So the bytecode here is **byte-for-byte different from the upstream tag**, by
 design. `manifest.json` records exactly where it came from:
@@ -52,10 +51,10 @@ The two-major span matters to an auditor asking "was this one build": it was one
 ## Regenerating
 
 From the bsc repo root, with `bsc-genesis-contract` checked out at
-`pgp-fork-v2` next to it and built:
+`pgp-fork-v3` next to it and built:
 
 ```
-git -C ../bsc-genesis-contract checkout pgp-fork-v2
+git -C ../bsc-genesis-contract checkout pgp-fork-v3
 forge build --force --root ../bsc-genesis-contract
 python3 scripts/pgp-image-gen.py --artifacts ../bsc-genesis-contract/out
 python3 scripts/pgp-image-gen.py --artifacts ../bsc-genesis-contract/out --check   # exits 0 if identical
@@ -67,7 +66,7 @@ imports resolve through it, and it is not vendored.
 
 The output contains no timestamps, absolute paths or hostnames, so the same
 inputs produce byte-identical files. This was verified end to end: a clean
-worktree of `pgp-fork-v2`, `forge build --force`, and the regenerated image
+worktree of `pgp-fork-v3`, `forge build --force`, and the regenerated image
 matched all 17 files byte for byte.
 
 ## Gates the generator enforces (G1–G7)

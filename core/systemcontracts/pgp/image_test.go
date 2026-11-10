@@ -332,7 +332,7 @@ func TestEntriesAreSorted(t *testing.T) {
 // landed and independently cross-checked with `cast keccak`. Any drift -- in the
 // generator's rules, in this encoder, or in the entries themselves -- turns red
 // here, which is what design doc §7.4 means by "规范形态由钉子测试保证".
-const wantImageHash = "0x2449787cec9d37da1e5d43f9e07cd69be77caf10f1717238ad8e31342d0235c4"
+const wantImageHash = "0xb058daf849b4673d1139bf5c2889c7c4d7443013a553dea2234b7ad30037b7cd"
 
 // TestImageHashIsPinned breaks the circularity: encoder-vs-manifest, encoder-vs-
 // literal, and a negative control proving the literal is not satisfied by

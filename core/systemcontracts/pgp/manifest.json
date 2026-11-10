@@ -1,8 +1,8 @@
 {
   "version": 1,
   "sourceRepo": "github.com/pgprotocol/bsc-genesis-contract",
-  "sourceCommit": "6895b8c0acc944b80a172eec38da3e9fa66ead65",
-  "sourceTag": "pgp-fork-v2",
+  "sourceCommit": "b6071a1762a4dc97d6fdc745532fd3807c679d56",
+  "sourceTag": "pgp-fork-v3",
   "sourceDirty": false,
   "dirtyDiffSha256": "0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "foundry": {
@@ -16,8 +16,8 @@
       "name": "BSCValidatorSet",
       "source": "contracts/BSCValidatorSet.sol",
       "solc": "0.6.4",
-      "codeLen": 28612,
-      "codeHash": "0xb1fa0f9033187400ba114db18ad647436c8c683fa366669444a165448a6b9fad",
+      "codeLen": 28712,
+      "codeHash": "0x3a531e0a2548eb974e01d956530f252a96628f2ad19e7128eb41ef39aeaeccec",
       "initSignature": "init(bytes,uint256)",
       "initSelector": "0x1663df00",
       "deployInit": true
@@ -27,8 +27,8 @@
       "name": "SlashIndicator",
       "source": "contracts/SlashIndicator.sol",
       "solc": "0.6.4",
-      "codeLen": 13276,
-      "codeHash": "0xe536b11ade8b37b4295daf3a897ed6859dec85edb4a0e289119e34db6a7de80d",
+      "codeLen": 13386,
+      "codeHash": "0x21db11fa45333557fe3e2673992e20a4fb702dcbe246c142f9018cad9b4ae839",
       "initSignature": "init()",
       "initSelector": "0xe1c7392a",
       "deployInit": true
@@ -192,12 +192,12 @@
       "name": "TokenRecoverPortal",
       "source": "contracts/TokenRecoverPortal.sol",
       "solc": "0.8.17",
-      "codeLen": 7542,
-      "codeHash": "0xb8eed1bd45f6ccb71d1578f6402d28e4ebe9c85bc65020a26c65ea88fe9d318c",
+      "codeLen": 7628,
+      "codeHash": "0xa628efcfffc1304d060e9cc7f5e4bee234d1acfc5c52c764b9e93dbb9118e12f",
       "initSignature": "initialize()",
       "initSelector": "0x8129fc1c",
       "deployInit": true
     }
   ],
-  "imageHash": "0x2449787cec9d37da1e5d43f9e07cd69be77caf10f1717238ad8e31342d0235c4"
+  "imageHash": "0xb058daf849b4673d1139bf5c2889c7c4d7443013a553dea2234b7ad30037b7cd"
 }
