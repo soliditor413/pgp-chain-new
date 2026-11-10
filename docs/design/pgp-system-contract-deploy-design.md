@@ -16,6 +16,7 @@
 | **v2** | 按设计评审重写 §5.2 / §6 / §7；新增 §7.5（StakeHub 经济闭环）、R15–R17；修正 D/F 约束矛盾；补充边界情况 |
 | **v3** | 跟进 F-02 / F-03 / F-04 的落地：§3.1 与 §7.1 的「`init` 只受 `onlyNotInit`」改为「另加 `onlyCoinbase onlyZeroGasPrice` + 255 上限」；§7.4 的 `imageHash` 重钉为 `pgp-fork-v2` 的 `0x2449787c…`，并列出前两代钉子 |
 | **v4** | 跟进 F-08 + F-11b(2)：§7.4 的 `imageHash` 重钉为 `pgp-fork-v3` 的 `0xb058daf8…`（3 份字节码变化） |
+| **v5** | 跟进 F-22：`init` 把 BLS 票地址写进 `validatorExtraSet`（此前只解析不落盘，finality 结构上不可能）。§7.4 重钉为 `pgp-fork-v4` 的 `0x3187f8c4…`（1 份字节码变化） |
 
 **v1 被证伪的三条（均已独立复核）**：
 
@@ -247,15 +248,17 @@ v1 只写「规范序列化」，跨语言会飘。定死为**标准紧凑 JSON*
 - `imageHash = keccak256(UTF8(canonicalJSON(entries)))`；
 - **规范形态由钉子测试保证**：`core/systemcontracts/pgp/image_test.go` 硬编码期望的 `imageHash` 字面量，生成脚本或重算实现的任何编码漂移都会立刻变红。散文描述永远可以被误读，钉子不会。
 
-当前值（17 个账户、`bsc-genesis-contract@b6071a1`，tag `pgp-fork-v3`）：
+当前值（17 个账户、`bsc-genesis-contract@24c7f2b`，tag `pgp-fork-v4`）：
 
 ```
-0xb058daf849b4673d1139bf5c2889c7c4d7443013a553dea2234b7ad30037b7cd
+0x3187f8c460adfa7acddab5df6ab31bfe985f98ad8e9a9cd239c4d8087fbddf6c
 ```
 
-> 当前这版在 F-08 + F-11b(2) 之后：`getMiningValidators()` / `getWorkingValidatorCount()` 加 `require(numOfCabinets > 0, "not initialized")`；`SlashIndicator` 与 `TokenRecoverPortal` 的预编译 `staticcall` 加 `returndatasize` 校验。相对 `pgp-fork-v2` 只有 3 份字节码变化（`BSCValidatorSet`、`SlashIndicator`、`TokenRecoverPortal`），其余 14 份逐字节未动，已用 `cast keccak` 对 canonical entries 独立复算核对。
+> 当前这版在 F-22 之后：`BSCValidatorSet.init` 额外把 payload 里的 48 字节 BLS 票地址写进 `validatorExtraSet`，并刷新两个派生票地址集合——此前它只写 `currentValidatorSet`，解析出的 `voteAddrs` 被直接丢弃，`getLivingValidators()` 恒返回空票地址。相对 `pgp-fork-v3` 只有 `BSCValidatorSet` 一份字节码变化，其余 16 份逐字节未动。
+>
+> 上一版（F-08 + F-11b(2)）的变化是：`getMiningValidators()` / `getWorkingValidatorCount()` 加 `require(numOfCabinets > 0, "not initialized")`；`SlashIndicator` 与 `TokenRecoverPortal` 的预编译 `staticcall` 加 `returndatasize` 校验。相对 `pgp-fork-v2` 只有 3 份字节码变化（`BSCValidatorSet`、`SlashIndicator`、`TokenRecoverPortal`），其余 14 份逐字节未动，已用 `cast keccak` 对 canonical entries 独立复算核对。
 
-> 前几代钉子，留给需要追溯的人：`0xf2e29a3c…`（`pgp-fork-v1` 之前的脏树）→ `0xa8c971b6…`（`pgp-fork-v1`，含 F-02 换 protector：只有 `BSCGovernor` / `StakeHub` / `TokenRecoverPortal` 三份变化，其余 14 份逐字节未动）→ `0x2449787c…`（`pgp-fork-v2`，F-03 的 7 个初始化闸门）→ 现在的 `0xb058daf8…`。新 protector `0x1Bb1Fe98…` 已在 pgp 主网实测为 **2-of-3 多签**（`required() = 2`、3 个 owner、6,424 B 代码），`pause()` / `_setProtector` 因此真实可达。注意它不是 Gnosis Safe：接口是 `required()` 而非 `getThreshold()`，运维不要拿 Safe 的工具链去操作它。
+> 前几代钉子，留给需要追溯的人：`0xf2e29a3c…`（`pgp-fork-v1` 之前的脏树）→ `0xa8c971b6…`（`pgp-fork-v1`，含 F-02 换 protector：只有 `BSCGovernor` / `StakeHub` / `TokenRecoverPortal` 三份变化，其余 14 份逐字节未动）→ `0x2449787c…`（`pgp-fork-v2`，F-03 的 7 个初始化闸门）→ `0xb058daf8…`（`pgp-fork-v3`，F-08 + F-11b(2)）→ 现在的 `0x3187f8c4…`（`pgp-fork-v4`，F-22 票地址落盘）。新 protector `0x1Bb1Fe98…` 已在 pgp 主网实测为 **2-of-3 多签**（`required() = 2`、3 个 owner、6,424 B 代码），`pause()` / `_setProtector` 因此真实可达。注意它不是 Gnosis Safe：接口是 `required()` 而非 `getThreshold()`，运维不要拿 Safe 的工具链去操作它。
 
 > 为什么是「整数原样」而不是「数字转字符串」：数字原样就是标准紧凑 JSON，任何语言的 stdlib 都能复现；而「数字转字符串」是自定义子集，第三方实现更容易写错——本轮实现就曾照着错误的注释写偏过一次，钉子的存在正是为了避免同一类事故重演。
 
