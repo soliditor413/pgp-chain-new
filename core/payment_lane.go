@@ -66,7 +66,7 @@ func ResolveLaneState(config *params.ChainConfig, engine consensus.Engine, paren
 }
 
 func systemTxOracle(engine consensus.Engine, header *types.Header) paymentlane.SystemTxOracle {
-	posa, ok := engine.(consensus.PoSA)
+	posa, ok := consensus.PoSAOf(engine)
 	if !ok {
 		return paymentlane.NoSystemTxs
 	}

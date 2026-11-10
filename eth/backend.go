@@ -585,11 +585,22 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 	eth.miner.SetPrioAddresses(config.TxPool.Locals)
 
 	// Create voteManager instance
-	if posa, ok := eth.engine.(consensus.PoSA); ok {
+	//
+	// PoSAOf, not a type assertion: on a forked chain eth.engine is the height
+	// router, which owns Parlia but is not itself a PoSA engine. Asserting
+	// directly made this whole block dead code on exactly the chains that have
+	// finality - --vote was accepted, nothing was created, and the only trace was
+	// the absence of a log line (F-21).
+	if posa, ok := consensus.PoSAOf(eth.engine); ok {
 		// Create votePool instance
 		votePool := vote.NewVotePool(eth.blockchain, posa)
 		eth.votePool = votePool
-		if parlia, ok := eth.engine.(*parlia.Parlia); ok {
+		// Assert on the unwrapped engine, not on eth.engine. Parlia.VotePool is
+		// what assembleVoteAttestation checks first (parlia.go:1147), so with the
+		// router asserting false here the vote pool would exist and never be
+		// consulted - attestations would silently never be assembled even though
+		// every log line said the pool had been created.
+		if parlia, ok := posa.(*parlia.Parlia); ok {
 			if !config.Miner.DisableVoteAttestation {
 				// if there is no VotePool in Parlia Engine, the miner can't get votes for assembling
 				parlia.VotePool = votePool

@@ -801,7 +801,7 @@ func (bc *BlockChain) empty() bool {
 
 // GetJustifiedNumber returns the highest justified blockNumber on the branch including and before `header`.
 func (bc *BlockChain) GetJustifiedNumber(header *types.Header) uint64 {
-	if p, ok := bc.engine.(consensus.PoSA); ok {
+	if p, ok := consensus.PoSAOf(bc.engine); ok {
 		justifiedBlockNumber, _, err := p.GetJustifiedNumberAndHash(bc, []*types.Header{header})
 		if err == nil {
 			return justifiedBlockNumber
@@ -814,7 +814,7 @@ func (bc *BlockChain) GetJustifiedNumber(header *types.Header) uint64 {
 
 // GetFinalizedNumber returns the highest finalized number before the specific block.
 func (bc *BlockChain) GetFinalizedNumber(header *types.Header) uint64 {
-	if p, ok := bc.engine.(consensus.PoSA); ok {
+	if p, ok := consensus.PoSAOf(bc.engine); ok {
 		if finalizedHeader := p.GetFinalizedHeader(bc, header); finalizedHeader != nil {
 			return finalizedHeader.Number.Uint64()
 		}
@@ -929,7 +929,7 @@ func (bc *BlockChain) loadLastState() error {
 		snapTd := bc.GetTd(currentSnapBlock.Hash(), currentSnapBlock.Number.Uint64())
 		log.Info("Loaded most recent local snap block", "number", currentSnapBlock.Number, "hash", currentSnapBlock.Hash(), "root", currentSnapBlock.Root, "td", snapTd, "age", common.PrettyAge(time.Unix(int64(currentSnapBlock.Time), 0)))
 	}
-	if posa, ok := bc.engine.(consensus.PoSA); ok {
+	if posa, ok := consensus.PoSAOf(bc.engine); ok {
 		if currentFinalizedHeader := posa.GetFinalizedHeader(bc, headHeader); currentFinalizedHeader != nil {
 			bc.currentFinalBlock.Store(currentFinalizedHeader)
 			if currentFinalizedBlock := bc.GetBlockByHash(currentFinalizedHeader.Hash()); currentFinalizedBlock != nil {
@@ -2117,7 +2117,7 @@ func (bc *BlockChain) writeBlockWithState(block *types.Block, receipts []*types.
 	// If we exceeded out time allowance, flush an entire trie to disk
 	if bc.gcproc > flushInterval {
 		canWrite := true
-		if posa, ok := bc.engine.(consensus.PoSA); ok {
+		if posa, ok := consensus.PoSAOf(bc.engine); ok {
 			if !posa.EnoughDistance(bc, block.Header()) {
 				canWrite = false
 			}

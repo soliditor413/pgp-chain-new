@@ -105,6 +105,17 @@ func (e *Engine) Parlia() (*parlia.Parlia, bool) {
 	return p, ok
 }
 
+// PoSAEngine returns the PoSA engine this router dispatches to after the fork, or
+// nil when none is wired in.
+//
+// It is what consensus.PoSAOf unwraps. The reason this is an accessor rather than
+// an implementation of consensus.PoSA on the router is the same reason Authorize
+// above is not part of consensus.Engine: asking a height router what "justified"
+// means at a pre-fork height has no correct answer, and pretending otherwise
+// makes the pre-fork half of every finality method a guess. The router is not a
+// PoSA engine; it owns one.
+func (e *Engine) PoSAEngine() consensus.PoSA { return e.posa }
+
 // Authorize injects the local signing key into the PoSA engine.
 //
 // This is not part of consensus.Engine: eth/backend.go calls it once from

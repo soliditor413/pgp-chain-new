@@ -326,7 +326,8 @@ func TestNewRequiresLegacyEngine(t *testing.T) {
 // block without re-executing. Only a second node -- or a restart that reprocesses
 // a block -- sees it.
 func TestRouterSatisfiesSystemTxDetector(t *testing.T) {
-	var engine consensus.Engine = New(&fakeEngine{name: "legacy"}, &fakeEngine{name: "posa"}, 10)
+	posa := &fakeEngine{name: "posa"}
+	var engine consensus.Engine = New(&fakeEngine{name: "legacy"}, posa, 10)
 
 	if _, ok := engine.(systemTxDetector); !ok {
 		t.Fatal("router must satisfy systemTxDetector, or core.Process classifies " +
@@ -338,6 +339,26 @@ func TestRouterSatisfiesSystemTxDetector(t *testing.T) {
 	if _, ok := engine.(consensus.PoSA); ok {
 		t.Fatal("router must NOT satisfy consensus.PoSA; that turns on PoSA-only " +
 			"features for pre-fork blocks")
+	}
+
+	// But it must hand its PoSA half to anything that asks properly. Every site
+	// that asserted engine.(consensus.PoSA) directly - the vote pool, the vote
+	// manager, justified/finalized numbers, fast-finality reorg protection -
+	// guards on that assertion and degrades silently when it fails, which on a
+	// forked chain is all of them (F-21).
+	got, ok := consensus.PoSAOf(engine)
+	if !ok {
+		t.Fatal("consensus.PoSAOf must unwrap the router to its PoSA engine")
+	}
+	if got != consensus.PoSA(posa) {
+		t.Fatalf("consensus.PoSAOf returned %v, want the posa engine", got)
+	}
+
+	// A legacy-only router has no PoSA half, and asking must say so rather than
+	// panic or return a zero interface.
+	legacyOnly := New(&fakeEngine{name: "legacy"}, nil, 10)
+	if p, ok := consensus.PoSAOf(legacyOnly); ok || p != nil {
+		t.Fatalf("consensus.PoSAOf on a legacy-only router = (%v, %v), want (nil, false)", p, ok)
 	}
 }
 

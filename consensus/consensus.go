@@ -172,3 +172,37 @@ type PoSA interface {
 	IsActiveValidatorAt(chain ChainHeaderReader, header *types.Header, checkVoteKeyFn func(bLSPublicKey *types.BLSPublicKey) bool) bool
 	NextProposalBlock(chain ChainHeaderReader, header *types.Header, proposer common.Address) (uint64, uint64, error)
 }
+
+// posaCarrier is implemented by engines that own a PoSA engine without being one
+// themselves. consensus/router is the only such engine: it dispatches by height
+// and holds the Parlia engine for post-fork blocks.
+type posaCarrier interface {
+	PoSAEngine() PoSA
+}
+
+// PoSAOf returns the PoSA half of e, if it has one.
+//
+// The obvious `e.(PoSA)` assertion is wrong on a forked chain. There the Engine
+// is a height router which owns the Parlia engine but is deliberately not one
+// itself (see the package comment in consensus/router), so every site that
+// asserted `engine.(consensus.PoSA)` got false on exactly the chains where
+// finality exists. The degradation was silent by construction: no vote pool, no
+// vote manager despite --vote, justified and finalized numbers pinned at 0, and
+// reorg protection back to plain TD. eth/backend.go logged "Create votePool
+// successfully" only for unforked chains, which is why nobody noticed (F-21).
+//
+// Unwrapping is the fix rather than making the router satisfy PoSA: a router
+// asked what "justified" means at a pre-fork height would have to invent an
+// answer, and the honest one is that the question does not apply. Callers that
+// ask for the PoSA half are asking about Parlia, and they get Parlia.
+func PoSAOf(e Engine) (PoSA, bool) {
+	if p, ok := e.(PoSA); ok {
+		return p, true
+	}
+	if carrier, ok := e.(posaCarrier); ok {
+		if p := carrier.PoSAEngine(); p != nil {
+			return p, true
+		}
+	}
+	return nil, false
+}
