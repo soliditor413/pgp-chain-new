@@ -399,7 +399,12 @@ func startNode(ctx *cli.Context, stack *node.Node, backend ethapi.Backend, isCon
 	// "spv: recharge store is not initialised" — a state that has nothing to do
 	// with the block, only with the race. The syncer's cooldown makes such a
 	// refusal recoverable, but not causing it is better.
-	startSpv(stack, backend, elaLogLevel(ctx))
+	// --chapel is what tells the SPV module to follow the ELA test network. It is
+	// read here rather than inside startSpv so the flag surface stays in one place
+	// (this function is where the rest of the node reads its context too), and
+	// because --chapel on a chain without a legacy section must be reported rather
+	// than silently ignored - see the gate in startSpv.
+	startSpv(stack, backend, elaLogLevel(ctx), ctx.Bool(utils.ChapelFlag.Name))
 
 	// Start up the node itself
 	utils.StartNode(ctx, stack, isConsole)

@@ -135,6 +135,50 @@ const (
 	ChainState_Error
 )
 
+// The ELA main chains this node can follow. These are the canonical spellings;
+// NormalizeActiveNet maps the accepted aliases onto them.
+const (
+	NetMainnet = "mainnet"
+	NetTestnet = "testnet"
+	NetRegnet  = "regnet"
+)
+
+// NormalizeActiveNet maps a user-supplied network name onto one of the three
+// canonical names. The empty string means mainnet, because that is what a node
+// with no flag ran before this existed and changing it would resync every
+// existing datadir.
+//
+// Unknown names are an error, deliberately. The switch this replaces ended in
+// `default: &config.DefaultParams`, i.e. anything it did not recognise - a typo,
+// "chapel", a new network - silently followed the ELA main chain. A node that
+// syncs the wrong chain looks healthy from the outside: it connects, it downloads
+// headers, it just never agrees with the network about the arbiter set. Refusing
+// to start is the cheap version of that discovery.
+func NormalizeActiveNet(name string) (string, error) {
+	switch strings.ToLower(strings.TrimSpace(name)) {
+	case "", "mainnet", "main", "m":
+		return NetMainnet, nil
+	case "testnet", "test", "t":
+		return NetTestnet, nil
+	case "regnet", "reg", "r":
+		return NetRegnet, nil
+	// Legacy aliases. pgp-chain mapped --goerli to RegNet ("g") and this fork
+	// carried a misspelled "goreli" arm; both still work so an existing start
+	// script does not break, but they mean regnet, not some fourth network.
+	case "goerli", "goreli", "g":
+		return NetRegnet, nil
+	default:
+		return "", fmt.Errorf("spv: unknown ELA network %q; want mainnet, testnet or regnet", name)
+	}
+}
+
+// activeNet is the normalised network the running service follows. Written once
+// by NewService, read by callers that want to log or assert it.
+var activeNet = NetMainnet
+
+// ActiveNetName returns the normalised ELA network this process follows.
+func ActiveNetName() string { return activeNet }
+
 type Config struct {
 	// DataDir is the data path to store db files peer addresses etc.
 	DataDir string
@@ -217,18 +261,38 @@ func initElaTransactionFunctions() {
 func NewService(cfg *Config, tmux *event.TypeMux, dynamicArbiterHeight uint64) (*Service, error) {
 	initElaTransactionFunctions()
 
+	// Resolve the network before touching any params. An unknown name must not
+	// reach the switch below, where the old default arm turned it into mainnet.
+	net, err := NormalizeActiveNet(cfg.ActiveNet)
+	if err != nil {
+		return nil, err
+	}
+	activeNet = net
+
 	var chainParams *config.Configuration
-	switch strings.ToLower(cfg.ActiveNet) {
-	case "testnet", "test", "t":
+	switch net {
+	case NetTestnet:
 		chainParams = config.DefaultParams.TestNet()
-	case "regnet", "reg", "r":
-		chainParams = config.DefaultParams.RegNet()
-	case "goreli", "g":
+	case NetRegnet:
 		chainParams = config.DefaultParams.RegNet()
 	default:
 		chainParams = &config.DefaultParams
-
 	}
+
+	// Note what the three arms above do: TestNet() and RegNet() write into their
+	// receiver and return it, and the receiver here is the package-level
+	// config.DefaultParams. That mutation is intentional and matches upstream
+	// (pgp-chain/cmd/pgp/main.go:419-431 did the same through SetConfig).
+	//
+	// It is also load-bearing: ELA's own transaction checks read
+	// config.DefaultParams.CheckAddressHeight (core/transaction/
+	// transactionchecker.go:682, blockchain/txvalidator.go:534), so leaving the
+	// global on mainnet while the service runs testnet params would make the
+	// library disagree with itself. A process follows exactly one ELA network.
+	//
+	// initElaTransactionFunctions() resets the global at the top of every call,
+	// so a second NewService does not compound the first one's Sterilize (it
+	// multiplies SignTolerance by time.Second in place).
 	spvCfg := &spv.Config{
 		DataDir:             cfg.DataDir,
 		FilterType:          filter.FTReturnSidechainDepositCoinFilter,

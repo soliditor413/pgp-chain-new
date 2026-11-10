@@ -97,9 +97,33 @@ func elaLogLevel(ctx *cli.Context) elalog.Level {
 //
 // Only a pgp-chain has an ELA side to follow, so a node running any other chain
 // config skips this entirely.
-func startSpv(stack *node.Node, backend ethapi.Backend, elaLevel elalog.Level) {
+//
+// testnet comes from --chapel. The mapping is a flag rather than a chain-config
+// field because --chapel already means "this is a test deployment" to every
+// operator here, and a second switch would let the two disagree. It is checked
+// against the chain config below: --chapel on its own selects BSC's chapel
+// genesis, which has no legacy section at all, so there is no ELA side to
+// follow and the flag is reported as unused rather than silently ignored.
+func startSpv(stack *node.Node, backend ethapi.Backend, elaLevel elalog.Level, testnet bool) {
 	bc := backend.Chain()
-	if bc == nil || !bc.Config().IsPGPLegacy(nil) {
+	if bc == nil {
+		return
+	}
+
+	elaNet := spv.NetMainnet
+	if testnet {
+		elaNet = spv.NetTestnet
+	}
+
+	if !bc.Config().IsPGPLegacy(nil) {
+		// Reached whenever the chain has no legacy (PBFT) era, which includes the
+		// plain BSC presets. Saying so matters for --chapel: without this line a
+		// testnet node starts, connects, syncs, and simply never has an ELA side,
+		// and the operator's only clue is an absence.
+		if testnet {
+			log.Warn("--chapel given but this chain has no legacy config; the ELA SPV service is not started",
+				"chainID", bc.Config().ChainID)
+		}
 		return
 	}
 
@@ -115,8 +139,18 @@ func startSpv(stack *node.Node, backend ethapi.Backend, elaLevel elalog.Level) {
 	// The ELA stores live next to the chain data so --datadir and the network
 	// subdirectory apply to them too.
 	dir := filepath.Join(stack.InstanceDir(), "spv")
+
+	// Stamp the directory with the ELA network before anything opens a database
+	// in it. Two networks' headers in one store is not a clean failure: the store
+	// is keyed by hash and records no chain identity, so the mixture surfaces as
+	// forks and arbiter sets that make no sense.
+	if err := spv.EnsureNetworkDir(dir, elaNet); err != nil {
+		utils.Fatalf("Cannot use the ELA SPV data directory: %v", err)
+	}
+
 	log.Info("Starting the ELA SPV service",
-		"dataDir", dir, "genesis", genesis.Hash(), "elaDepositAddress", depositAddress)
+		"dataDir", dir, "genesis", genesis.Hash(),
+		"elaNet", elaNet, "elaDepositAddress", depositAddress)
 
 	// The ELA sub-packages log nothing until a logger is attached, and the level
 	// is what decides whether a refused block explains itself; see
@@ -141,9 +175,24 @@ func startSpv(stack *node.Node, backend ethapi.Backend, elaLevel elalog.Level) {
 	// balance, not in the start-up path.
 	dynamicArbiterHeight := bc.Config().DynamicArbiterHeight()
 
+	// The 2075778 default is an ELA *mainnet* height. On a network whose chain is
+	// shorter than that, waiting for it means the next-turn bookkeeping never
+	// starts - and the only symptom is an ELA height that stops being useful, not
+	// an error. Zero means "track from the beginning", which is the right answer
+	// for a test network and is why the override is keyed on the chain config
+	// having left the field unset rather than on the network alone: a testnet that
+	// genuinely wants a specific height can still say so.
+	if elaNet != spv.NetMainnet && bc.Config().Legacy.DynamicArbiterHeight == 0 {
+		log.Warn("ELA testnet: overriding the mainnet next-turn DPOS height",
+			"mainnetHeight", dynamicArbiterHeight, "using", 0,
+			"reason", "the mainnet constant does not exist on this network")
+		dynamicArbiterHeight = 0
+	}
+
 	svc, err := spv.NewService(&spv.Config{
 		DataDir:        dir,
 		GenesisAddress: depositAddress,
+		ActiveNet:      elaNet,
 	}, new(event.TypeMux), dynamicArbiterHeight)
 	if err != nil {
 		utils.Fatalf("SPV service init error: %v", err)
