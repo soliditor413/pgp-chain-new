@@ -5,9 +5,10 @@
 
 # Parlia multi-node devnet: N 个进程、N 席验证人、全互联。
 #
-#   ./multi.sh init [SEATS] [FORK_HEIGHT]   # N 个 datadir（各带 1 个 keystore）+ genesis + geth init
-#   ./multi.sh start                        # 后台起 N 个节点，然后 admin.addPeer 组全网状
-#   ./multi.sh status                       # 每个节点的高度 / 验证人集合 / 出块者分布
+#   ./multi.sh init [SEATS] [FORK_HEIGHT]   # datadir + arbiter 密钥 + genesis + geth init
+#   ./multi.sh start                        # 后台起 N 个节点（--bootnodes 全互联 + DPoS 预置）
+#   ./multi.sh start-node I / stop-node I   # 单节点启停（掉线测试用）
+#   ./multi.sh status                       # 高度 / 验证人集合 / 出块者分布
 #   ./multi.sh wait N                       # 等到所有节点都到高度 N
 #   ./multi.sh stop
 #   ./multi.sh clean
@@ -78,13 +79,40 @@ LUBAN_SENTINEL=${LUBAN_SENTINEL:-0}
 # 逐字节一致，也让主网形态（无票地址）成为默认路径而不是特例。
 BLS_VOTE=${BLS_VOTE:-0}
 
+# ---- 质押/选举测试用的开关（默认值保持既有 devnet 行为） -------------------
+# 出块席位。0 = 取 SEATS；>0 时必须 <= SEATS（多出的候选人只参与选举）。
+CABINETS=${CABINETS:-0}
+# 每个验证人的 genesis 余额（hex wei）。默认 100 ETH；质押测试至少要 2100 ETH。
+BALANCE_WEI=${BALANCE_WEI:-0x56bc75e2d63100000}
+# genesis 时间戳（hex 字符串，或十进制数）。留空则用 gen-genesis 的默认值。
+GENESIS_TIMESTAMP=${GENESIS_TIMESTAMP:-}
+# 1 = genesis 里写 keplerTime=0 + feynmanTime=0（选举路径从创世就活）。
+# 代价：分叉后第一个 breathe 块就会按 StakeHub 重算集合。若那时还没人注册，
+# BSCValidatorSet 会保留原集合继续出块（长度保护，见 contracts/BSCValidatorSet.sol），
+# 但质押与选举等于没上线——用 staking-devnet 的 `run.sh check` 断言 election.total > 0。
+FEYNMAN=${FEYNMAN:-1}
+# 覆盖 breathe block 间隔（秒）。留空 = 不传 flag（内核默认 86400）。
+BREATHE_INTERVAL=${BREATHE_INTERVAL:-}
+# legacy 生产者数量。0 = 取 SEATS；1 = 回退单仲裁人（组网不收敛时用）。
+LEGACY_PRODUCERS=${LEGACY_PRODUCERS:-0}
+# DPoS 直连端口基址（--pbft.net.port）。
+DPOS_BASE=${DPOS_BASE:-20679}
+# JSON-RPC 暴露的 API 列表。
+HTTP_API=${HTTP_API:-eth,net,web3,admin}
+# --bootnodes 需要的 enode id 由 bootnode 从 nodekey 推出，不手搓 secp256k1。
+BOOTNODE_BIN=${BOOTNODE_BIN:-$REPO_ROOT/build/bin/bootnode}
+# DPoS 地址簿预置脚本（DPoS 传输层没有 bootnode 参数，只能 gossip 或预置）。
+SEED_PEERS_PY=${SEED_PEERS_PY:-$REPO_ROOT/scripts/pbft-devnet/seed-peers.py}
+
 mkdir -p "$LOG_DIR"
 
 die() { echo "错误: $*" >&2; exit 1; }
 need_bin() { [ -x "$GETH_BIN" ] || die "找不到 ${GETH_BIN}；先跑 go build -o build/bin/geth ./cmd/geth"; }
+need_bootnode() { [ -x "$BOOTNODE_BIN" ] || die "找不到 ${BOOTNODE_BIN}；先跑 go build -o build/bin/bootnode ./cmd/bootnode"; }
 node_dir() { echo "$HOME_DIR/node$1"; }
 node_http() { echo $((HTTP_BASE + $1)); }
 node_p2p() { echo $((P2P_BASE + $1)); }
+node_dpos() { echo $((DPOS_BASE + $1)); }
 
 # JSON-RPC 一行调用。macOS 的系统代理会把 127.0.0.1 也送到上游，所以显式绕过。
 rpc() {
@@ -110,6 +138,44 @@ cmd_init() {
   case "$seats" in ''|*[!0-9]*) die "SEATS 必须是正整数，收到 '$seats'" ;; esac
   [ "$seats" -ge 4 ] || die "SEATS 必须 >= 4；recents 窗口是 N/2+1，少于 4 个签名者无法越过 block 1"
 
+  # 角色划分（默认沿用旧行为：所有节点既是 legacy 生产者又是 POSA 验证人）：
+  #   node 0 .. producers_n-1           legacy PBFT 生产者（P-256 arbiter）
+  #   node posa_first .. posa_first+M-1 POSA 验证人（EVM 地址进 genesis 验证人集合）
+  # 设了 POSA_VALIDATORS 时两批人完全不相交，用来验证「分叉时换一批出块人」。
+  local posa_n=${POSA_VALIDATORS:-0}
+  local producers_n=${LEGACY_PRODUCERS:-0}
+  local posa_first=0
+  if [ "$posa_n" -gt 0 ]; then
+    [ "$producers_n" -gt 0 ] || die "设了 POSA_VALIDATORS 就必须同时给 LEGACY_PRODUCERS"
+    [ $((producers_n + posa_n)) -eq "$seats" ] || \
+      die "LEGACY_PRODUCERS($producers_n) + POSA_VALIDATORS($posa_n) 必须等于 SEATS($seats)"
+    posa_first=$producers_n
+  else
+    posa_n=$seats
+    [ "$producers_n" = 0 ] && producers_n=$seats
+  fi
+  [ "$producers_n" -ge 1 ] || die "legacy 生产者至少 1 席"
+  [ "$producers_n" -le "$seats" ] || die "LEGACY_PRODUCERS=$producers_n 不能大于节点数 $seats"
+  [ "$posa_n" -ge 4 ] || die "POSA 验证人至少 4 席（recents 窗口 N/2+1），收到 $posa_n"
+
+  # init 会 rm -rf 掉 node*，所以在节点还活着时跑 init 等于把 datadir 从运行中的
+  # 进程脚下抽走：进程继续持有已删除的 inode 出块，端口也还占着，随后 start 又因为
+  # 端口被占用而只起来一半节点，读到的却是旧链（实测踩过一次：init 之后查 head
+  # 拿到 80，而新创世的 T0 还在两分钟后 —— 一条根本不存在的链）。
+  # 这里用和 start 一样的锁探测 + pid 探测挡住它。
+  local running=""
+  running=$(lock_holders)
+  if [ -z "$running" ]; then
+    local pf
+    for pf in "$HOME_DIR"/node*/geth.pid; do
+      [ -f "$pf" ] || continue
+      if kill -0 "$(cat "$pf")" 2>/dev/null; then running="$running ${pf%/geth.pid}"; fi
+    done
+  fi
+  if [ -n "$running" ]; then
+    die "还有节点在跑（${running}），init 会删掉它们的 datadir。先 ./multi.sh stop 并等它输出「所有节点已退出」"
+  fi
+
   rm -rf "$HOME_DIR"/node*
   mkdir -p "$HOME_DIR" "$LOG_DIR"
   : > "$HOME_DIR/validators.conf"
@@ -125,9 +191,11 @@ cmd_init() {
     addr=$(echo "$addr" | tr 'A-Z' 'a-z')
     addrs+=("$addr")
     echo "$addr" > "$dir/validator.addr"
-    echo "$addr,$addr,$addr,100,-" >> "$HOME_DIR/validators.conf"
+    if [ "$i" -ge "$posa_first" ] && [ "$i" -lt $((posa_first + posa_n)) ]; then
+      echo "$addr,$addr,$addr,100,-" >> "$HOME_DIR/validators.conf"
+    fi
 
-    if [ "$BLS_VOTE" = "1" ]; then
+    if [ "$BLS_VOTE" = "1" ] && [ "$i" -ge "$posa_first" ] && [ "$i" -lt $((posa_first + posa_n)) ]; then
       # 这里要写**两个**密码文件，因为同一个 --blspassword 在两个场景下的格式不同：
       #
       #   CLI（geth bls wallet create / account new）：utils.GetPassPhraseWithList
@@ -167,7 +235,7 @@ PY
   done
 
   local balances=()
-  for addr in "${addrs[@]}"; do balances+=(--balance "$addr=0x56bc75e2d63100000"); done
+  for addr in "${addrs[@]}"; do balances+=(--balance "$addr=$BALANCE_WEI"); done
 
   # legacy 段需要自己的生产者：block 1..ForkHeight-1 由 PBFT 出，而 PBFT 的生产者
   # 是 Elastos P-256 公钥，不是 EVM 的 secp256k1。所以 fork 模式下额外生成一个
@@ -179,26 +247,29 @@ PY
   #
   # 这一步也把「自派生密钥」这件事说清楚了：这些 key 与 pgp 主网那 12 个生产者无关，
   # 只用于本地验证分叉逻辑。
+  # 变量已在函数开头算好（producers_n / posa_n / posa_first）。
   local -a producer_args=()
   if [ "$fork_height" -gt 1 ]; then
     rm -rf "$ARBITER_DIR"
     # go run 的包路径是相对仓库根解析的，所以必须切到 REPO_ROOT 再跑；
     # 脚本本身可以在任意目录被调用。
     ( cd "$REPO_ROOT" && PGP_DEVNET_PASSWORD="$ARBITER_PASSWORD" \
-        go run ./scripts/pbft-devnet/keygen -out "$ARBITER_DIR" -n 1 ) \
+        go run ./scripts/pbft-devnet/keygen -out "$ARBITER_DIR" -n "$producers_n" ) \
       > "$LOG_DIR/keygen.log" 2>&1 \
       || { tail -20 "$LOG_DIR/keygen.log"; die "生成 legacy arbiter 密钥失败"; }
     # 0600：这个文件里就是 keystore 的解密口令。
     printf '%s' "$ARBITER_PASSWORD" > "$ARBITER_PASSWORD_FILE"
     chmod 600 "$ARBITER_PASSWORD_FILE"
     local prod
-    prod=$(python3 -c '
+    while IFS= read -r prod; do
+      [ -n "$prod" ] || continue
+      producer_args+=(--producers "$prod")
+    done < <(python3 -c '
 import json,sys
 m=json.load(open(sys.argv[1]))
-print(m["producers"][0])
+print("\n".join(m["producers"]))
 ' "$ARBITER_MANIFEST") || die "读不出 $ARBITER_MANIFEST 里的公钥"
-    producer_args+=(--producers "$prod")
-    echo "legacy 生产者（自派生 P-256，与主网无关）: $prod"
+    echo "legacy 生产者（自派生 P-256，与主网无关）: $producers_n 席"
   fi
 
   local -a deploy_args=()
@@ -211,26 +282,37 @@ print(m["producers"][0])
   # 空列表 = 不启用 finality（epoch 块的 48 字节票地址全零，见审计 04 §1.2）。
   local -a vote_args=()
   if [ "$BLS_VOTE" = "1" ]; then
-    local vote
-    for ((i = 0; i < seats; i++)); do
+    local vote k
+    for ((k = 0; k < posa_n; k++)); do
+      i=$((posa_first + k))
       dir=$(node_dir "$i")
       vote=$(cat "$dir/bls/vote.addr" 2>/dev/null) || die "节点 $i 没有 BLS 票地址；BLS_VOTE=1 时 init 应当已经建好"
       [ -n "$vote" ] || die "节点 $i 的 BLS 票地址是空的"
       vote_args+=(--vote-addrs "$vote")
-      echo "BLS 票地址 [$(printf '%d' "$i")] $vote"
+      echo "BLS 票地址 [node$i] $vote"
     done
+  fi
+
+  local cabinets=${CABINETS:-0}
+  [ "$cabinets" = 0 ] && cabinets=$seats
+  local -a time_args=()
+  [ -n "$GENESIS_TIMESTAMP" ] && time_args+=(--timestamp "$GENESIS_TIMESTAMP")
+  if [ "$FEYNMAN" = "1" ]; then
+    # 只允许 0：非 0 会在激活块再次 initialize() 已经初始化过的 5 个合约。
+    time_args+=(--feynman-time 0 --kepler-time 0)
   fi
 
   python3 "$SELF_DIR/gen-genesis.py" \
     --contracts-out "$CONTRACT_ROOT/out" \
     --validators "$HOME_DIR/validators.conf" \
     --fork-height "$fork_height" \
-    --cabinets "$seats" \
+    --cabinets "$cabinets" \
     --gas-limit "$GAS_LIMIT" \
-    "${deploy_args[@]}" \
-    "${producer_args[@]}" \
-    "${vote_args[@]}" \
-    "${balances[@]}" \
+    "${deploy_args[@]+"${deploy_args[@]}"}" \
+    "${time_args[@]+"${time_args[@]}"}" \
+    "${producer_args[@]+"${producer_args[@]}"}" \
+    "${vote_args[@]+"${vote_args[@]}"}" \
+    "${balances[@]+"${balances[@]}"}" \
     --out "$GENESIS"
 
   for ((i = 0; i < seats; i++)); do
@@ -238,6 +320,54 @@ print(m["producers"][0])
     "$GETH_BIN" --datadir "$dir" init "$GENESIS" > "$LOG_DIR/init$i.log" 2>&1 \
       || { tail -10 "$LOG_DIR/init$i.log"; die "节点 $i geth init 失败"; }
   done
+
+  # devp2p nodekey 预生成：--bootnodes 需要每个节点的 enode id，而 id 只能从
+  # nodekey 推出来。放在 start 之前，peering 从进程启动就开始，不依赖 admin API
+  # 的 addPeer（那条路仍保留为启动后的幂等兜底）。
+  need_bootnode
+  local -a enodes=()
+  for ((i = 0; i < seats; i++)); do
+    dir=$(node_dir "$i")
+    [ -f "$dir/geth/nodekey" ] || "$BOOTNODE_BIN" -genkey "$dir/geth/nodekey" >/dev/null 2>&1 \
+      || die "节点 $i 的 devp2p nodekey 生成失败"
+    local id
+    id=$("$BOOTNODE_BIN" -nodekey "$dir/geth/nodekey" -writeaddress) \
+      || die "节点 $i 的 enode id 推导失败"
+    enodes+=("enode://$id@127.0.0.1:$((P2P_BASE + i))")
+  done
+  local BOOTNODES
+  BOOTNODES=$(IFS=,; echo "${enodes[*]}")
+
+  # DPoS 地址簿预置：DPoS 传输层没有 bootnode 参数，地址只有两条来路——devp2p 上的
+  # ELAMSG gossip，或这个文件。预置之后 producer 在启动瞬间就连上，块时间才能严格
+  # 等于 T0+3n（否则 gossip 收敛的 ~40s 会把相位顶前）。
+  if [ "$producers_n" -ge 2 ] && [ -f "$ARBITER_MANIFEST" ] && [ -f "$SEED_PEERS_PY" ]; then
+    local -a seed_args=()
+    for ((i = 0; i < producers_n; i++)); do
+      seed_args+=(--node "127.0.0.1:$((DPOS_BASE + i)):$(node_dir "$i")")
+    done
+    python3 "$SEED_PEERS_PY" --manifest "$ARBITER_MANIFEST" --force \
+      "${seed_args[@]}" > "$LOG_DIR/seed-peers.log" 2>&1 \
+      || { tail -20 "$LOG_DIR/seed-peers.log"; die "DPoS 地址簿预置失败"; }
+  fi
+
+  # start / start-node 只读这份文件：breathe 间隔、端口基址、bootnodes 一旦在
+  # 不同节点上不一致，就会直接变成状态根分叉。
+  cat > "$HOME_DIR/devnet.env" <<EOF
+# Generated by multi.sh init. start/start-node 只读它。
+SEATS=$seats
+FORK=$fork_height
+CABINETS=$cabinets
+GENESIS_TIMESTAMP='${GENESIS_TIMESTAMP:-}'
+BREATHE_INTERVAL='${BREATHE_INTERVAL:-}'
+DPOS_BASE=$DPOS_BASE
+LEGACY_PRODUCERS=$producers_n
+POSA_FIRST=$posa_first
+POSA_COUNT=$posa_n
+NETWORK_ID=$NETWORK_ID
+HTTP_API='$HTTP_API'
+BOOTNODES='$BOOTNODES'
+EOF
 
   echo
   echo "节点 / 验证人（共 $seats 席，各自持钥）："
@@ -275,88 +405,118 @@ print(" ".join(held))
 PY
 }
 
+# launch_node 启动一个节点。所有可变参数都来自 devnet.env（init 落盘），这样
+# start / start-node 不会出现「某个节点漏传 breathe 间隔」这种分叉级差异。
+# 这一整段（以及 init 里给 gen-genesis.py 拼参数的地方）都在 set -u 下展开可选
+# 参数数组，因此统一用 "${arr[@]+"${arr[@]}"}" 而不是 "${arr[@]}"。
+#
+# 原因是 macOS 自带的 bash 是 3.2，而 3.2 在 set -u 下把**空数组**的 "${a[@]}"
+# 当成未定义变量："bls_args[@]: unbound variable"。Bash 4.4 才修掉这个行为。
+# 后果极其隐蔽：整条 geth 命令在 fork 之前就失败，节点根本没起来，可脚本紧接着
+# 已经执行了 `echo $! > geth.pid` 并打印「节点 N 已启动」—— pid 文件里是上一条
+# 后台任务的 pid，进程表里根本没有这个节点。实测跑 Run E 时 8 个节点里 4 个
+# PBFT 生产者就是这么静默死掉的（它们没有 BLS 钱包，bls_args 为空），链路一段
+# 都不出块。cmd_start 里的存活校验就是为此加的。
+launch_node() {
+  local i=$1 dir addr
+  dir=$(node_dir "$i"); addr=$(cat "$dir/validator.addr")
+  local -a pbft_args=(--pbft.enable=false)
+  if [ "$i" -lt "${PRODUCERS_N:-0}" ]; then
+    # 每个生产者都有自己的 arbiter keystore（arbiter-$i.dat）。--pbft.miner.address
+    # 必须与 --miner.etherbase 同址，否则 cmd/utils/flags.go 的 setEtherbase 直接
+    # Fatalf（两者写同一个 header.Coinbase，而它进 PBFT seal hash）。这里统一用
+    # 节点自己的 EVM 地址：Parlia 段要求 coinbase == 出块验证人，legacy 段只把它
+    # 当作 seal hash 的一部分，一个值同时满足两段。
+    # --pbft.keystore.password 收的是**文件路径**，不是密码本身。
+    pbft_args=(--pbft.enable
+               --pbft.keystore "$ARBITER_DIR/arbiter-$i.dat"
+               --pbft.keystore.password "$ARBITER_PASSWORD_FILE"
+               --pbft.miner.address "$addr"
+               --pbft.net.address 127.0.0.1
+               --pbft.net.port "$(node_dpos "$i")"
+               --pbft.net.maxnodeperhost "${SEATS_N:-$i}")
+  fi
+  # finality 投票三件套：--vote 打开 Miner.VoteEnable，--blspassword/--blswallet
+  # 告诉它去哪拿 BLS 私钥。缺 --vote 时节点照常出块但从不投票。
+  local -a bls_args=()
+  if [ -f "$dir/bls/vote.addr" ]; then
+    bls_args=(--vote
+              --blspassword "$dir/bls/password.txt"
+              --blswallet "$dir/bls/wallet")
+  fi
+  # bootnodes 只负责播种 discovery，所以给了它就不能再给 --nodiscover。
+  local -a net_args=()
+  if [ -n "${BOOTNODES:-}" ]; then
+    net_args=(--bootnodes "$BOOTNODES")
+  else
+    net_args=(--nodiscover)
+  fi
+  local -a breathe_args=()
+  [ -n "${BREATHE_INTERVAL:-}" ] && breathe_args=(--override.breatheblockinterval "$BREATHE_INTERVAL")
+  "$GETH_BIN" \
+    --datadir "$dir" --networkid "$NETWORK_ID" \
+    --port "$(node_p2p "$i")" \
+    --nat extip:127.0.0.1 \
+    "${net_args[@]}" --maxpeers "${SEATS_N:-$i}" \
+    --mine --miner.etherbase "$addr" \
+    --unlock "$addr" --password "$dir/password.txt" --allow-insecure-unlock \
+    --miner.gaslimit "$MINER_GAS_LIMIT" \
+    --http --http.addr 127.0.0.1 --http.port "$(node_http "$i")" \
+    --http.api "${HTTP_API:-eth,net,web3,admin}" \
+    --syncmode full --verbosity "$VERBOSITY" \
+    "${breathe_args[@]+"${breathe_args[@]}"}" \
+    "${pbft_args[@]}" \
+    "${bls_args[@]+"${bls_args[@]}"}" \
+    > "$LOG_DIR/node$i.log" 2>&1 &
+  echo $! > "$dir/geth.pid"
+  if [ "$i" -lt "${PRODUCERS_N:-0}" ]; then
+    echo "节点 $i 已启动 pid=$! （legacy 段 PBFT 生产者）p2p=$(node_p2p "$i") dpos=$(node_dpos "$i") http=$(node_http "$i")"
+  else
+    echo "节点 $i 已启动 pid=$! p2p=$(node_p2p "$i") http=$(node_http "$i")"
+  fi
+}
+
 cmd_start() {
   need_bin
   [ -f "$GENESIS" ] || die "还没有 genesis；先跑 ./multi.sh init [SEATS] [FORK_HEIGHT]"
+  [ -f "$HOME_DIR/devnet.env" ] || die "缺少 $HOME_DIR/devnet.env；先跑 ./multi.sh init"
   local held
   held=$(lock_holders)
   [ -z "$held" ] || die "这些节点的 datadir 还被占用：${held}。先 ./multi.sh stop 并等它输出「所有节点已退出」；不要用 kill -9，强杀会丢 state 导致重启后重封（审计 F-20）"
-  local seats
-  seats=$(ls -d "$HOME_DIR"/node* 2>/dev/null | wc -l | tr -d ' ')
-  [ "$seats" -ge 4 ] || die "只找到 $seats 个 datadir"
 
-  local i dir addr
-  # fork 模式（genesis 里 legacy.producers 非空）下，block 1..ForkHeight-1 要由
-  # PBFT 出块。只有 node 0 拿到 arbiter 私钥，所以只有它加 --pbft.enable；其余节点
-  # 显式 --pbft.enable=false，在 legacy 段是纯 follower，到 ForkHeight 之后才靠
-  # Parlia 出块。
-  #
-  # 为什么要显式给 false 而不是不给：不给（默认）也是 false，但显式写出来能让日志和
-  # 进程命令行直接回答「这个节点在 legacy 段该不该出块」。
-  local fork_producers
-  fork_producers=$(python3 -c '
-import json,sys
-g=json.load(open(sys.argv[1]))
-print(len(g.get("config",{}).get("legacy",{}).get("producers") or []))
-' "$GENESIS") || die "读不出 $GENESIS 的 legacy.producers"
-  local fork_mode=0
-  [ "$fork_producers" -gt 0 ] && fork_mode=1
+  # devnet.env 是 init 落盘的唯一真相：breathe 间隔、bootnodes、DPoS 端口基址
+  # 在节点之间不一致会直接变成状态根分叉。
+  # shellcheck disable=SC1090
+  . "$HOME_DIR/devnet.env"
+  local seats=${SEATS:-0}
+  [ "$seats" -ge 4 ] || die "devnet.env 里的 SEATS=$seats 不合法"
+  SEATS_N=$seats
+  PRODUCERS_N=${LEGACY_PRODUCERS:-$seats}
 
+  local i
   for ((i = 0; i < seats; i++)); do
-    dir=$(node_dir "$i"); addr=$(cat "$dir/validator.addr")
-    local -a pbft_args=(--pbft.enable=false)
-    # finality 投票三件套：--vote 打开 Miner.VoteEnable（eth/backend.go:607 用它决定
-    # 要不要建 VoteManager），--blspassword/--blswallet 告诉它去哪拿 BLS 私钥。
-    # 缺 --vote 时节点照常出块，但从不投票——epoch 块里票地址非零、却永远等不到
-    # attestation，是最难查的一种"看起来配好了"。
-    local -a bls_args=()
-    if [ -f "$dir/bls/vote.addr" ]; then
-      bls_args=(--vote
-                --blspassword "$dir/bls/password.txt"
-                --blswallet "$dir/bls/wallet")
-    fi
-    if [ "$fork_mode" = 1 ] && [ "$i" = 0 ]; then
-      # --pbft.miner.address 必须与 --miner.etherbase 同址，否则 cmd/utils/flags.go
-      # 的 setEtherbase 直接 Fatalf（两者写同一个 header.Coinbase，而它进 PBFT seal hash）。
-      # 这里统一用 node 0 自己的验证人地址：Parlia 段要求 coinbase == 出块验证人，
-      # legacy 段不在乎 coinbase（空块、零手续费），一个值同时满足两段。
-      # --pbft.keystore.password 收的是**文件路径**，不是密码本身
-      # （cmd/utils 的 MakePbftPassword 会去读那个文件；直接传密码会 Fatal，
-      # 而且错误信息刻意不回声参数内容，免得把密码写进日志）。
-      pbft_args=(--pbft.enable
-                 --pbft.keystore "$ARBITER_DIR/arbiter-0.dat"
-                 --pbft.keystore.password "$ARBITER_PASSWORD_FILE"
-                 --pbft.miner.address "$addr")
-    fi
-    # --nat extip:127.0.0.1：admin_nodeInfo 的 enode 默认 advertise 本机 LAN 地址
-    # （如 192.168.1.4），同机多实例互相 addPeer 时拨的是那个地址；一旦环境不允许
-    # 走 LAN，四个节点 peers 恒为 0，Parlia 段就会在 F 块之后卡在
-    # "Signed recently, must wait for others"（见 F-19）。钉成 127.0.0.1 之后
-    # enode 里的 host 与本机监听一致，组网不再依赖 LAN 路由。
-    #
-    # --nodiscover + --maxpeers：不靠 discovery，靠下面的 admin.addPeer 显式组网，
-    # 避免同机多实例通过 UDP 探测互相发现出非确定拓扑。
-    "$GETH_BIN" \
-      --datadir "$dir" --networkid "$NETWORK_ID" \
-      --port "$(node_p2p "$i")" \
-      --nat extip:127.0.0.1 \
-      --nodiscover --maxpeers "$seats" \
-      --mine --miner.etherbase "$addr" \
-      --unlock "$addr" --password "$dir/password.txt" --allow-insecure-unlock \
-      --miner.gaslimit "$MINER_GAS_LIMIT" \
-      --http --http.addr 127.0.0.1 --http.port "$(node_http "$i")" \
-      --http.api eth,net,web3,admin \
-      --syncmode full --verbosity "$VERBOSITY" \
-      "${pbft_args[@]}" \
-      "${bls_args[@]}" \
-      > "$LOG_DIR/node$i.log" 2>&1 &
-    echo $! > "$dir/geth.pid"
-    if [ "$fork_mode" = 1 ] && [ "$i" = 0 ]; then
-      echo "节点 0 已启动 pid=$! （legacy 段 PBFT 生产者）p2p=$(node_p2p "$i") http=$(node_http "$i")"
-    else
-      echo "节点 $i 已启动 pid=$! p2p=$(node_p2p "$i") http=$(node_http "$i")"
+    launch_node "$i"
+  done
+
+  # 立刻校验每个 pid 真的对应一个活着的 geth，而不是相信「已启动」这句话。
+  # 空数组展开失败会让 geth 在 fork 前就退出，pid 文件里写着上一条后台任务的
+  # pid；不查的话要等 40 s 才在 HTTP 就绪循环里报一句「看 nodeN.log」，把
+  # 「拼参数写错」误报成「启动慢」。
+  sleep 1
+  local dead=()
+  for ((i = 0; i < seats; i++)); do
+    if ! kill -0 "$(cat "$(node_dir "$i")/geth.pid" 2>/dev/null)" 2>/dev/null; then
+      dead+=("$i")
     fi
   done
+  if [ "${#dead[@]}" -gt 0 ]; then
+    for i in "${dead[@]}"; do
+      echo "---- node$i 启动即退出，日志尾部 ----" >&2
+      tail -n 20 "$LOG_DIR/node$i.log" >&2 || true
+    done
+    die "节点 ${dead[*]} 启动失败（见上面的日志）"
+  fi
+  echo "全部 $seats 个节点进程存活"
 
   # 等 HTTP 就绪
   local tries=0
@@ -571,6 +731,69 @@ while True:
 PY
 }
 
+cmd_start_node() {
+  local i=${1:?用法: ./multi.sh start-node <index>}
+  need_bin
+  [ -f "$HOME_DIR/devnet.env" ] || die "缺少 $HOME_DIR/devnet.env；先跑 ./multi.sh init"
+  local dir
+  dir=$(node_dir "$i")
+  [ -f "$dir/validator.addr" ] || die "节点 $i 不存在（$dir）"
+  case " $(lock_holders) " in *" node$i "*) die "节点 $i 的 datadir 还被占用" ;; esac
+  # shellcheck disable=SC1090
+  . "$HOME_DIR/devnet.env"
+  SEATS_N=${SEATS:-0}
+  PRODUCERS_N=${LEGACY_PRODUCERS:-$SEATS_N}
+
+  launch_node "$i"
+
+  local tries=0
+  until rpc "$(node_http "$i")" web3_clientVersion '[]' 2>/dev/null | grep -q '"result"'; do
+    tries=$((tries + 1))
+    [ "$tries" -gt 300 ] && die "节点 $i 的 HTTP 60 s 内没有就绪，看 $LOG_DIR/node$i.log"
+    sleep 0.2
+  done
+  echo "节点 $i HTTP 就绪"
+
+  # 重新接回全网：bootnodes 只在启动时播种 discovery，重启后要等 discovery 重新
+  # 收敛；这里用 admin.addPeer 直接补齐，避免停机测试后网络要几十秒才恢复。
+  local j enode_i enode_j
+  enode_i=$(rpc "$(node_http "$i")" admin_nodeInfo '[]' \
+    | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["result"]["enode"] if "result" in d else "")')
+  for ((j = 0; j < SEATS_N; j++)); do
+    [ "$j" = "$i" ] && continue
+    enode_j=$(rpc "$(node_http "$j")" admin_nodeInfo '[]' \
+      | python3 -c 'import json,sys; d=json.load(sys.stdin); print(d["result"]["enode"] if "result" in d else "")')
+    [ -n "$enode_j" ] || continue
+    rpc "$(node_http "$i")" admin_addPeer "[\"$enode_j\"]" > /dev/null
+    [ -n "$enode_i" ] && rpc "$(node_http "$j")" admin_addPeer "[\"$enode_i\"]" > /dev/null
+  done
+  echo "节点 $i 已重新接入全网"
+}
+
+cmd_stop_node() {
+  local i=${1:?用法: ./multi.sh stop-node <index>}
+  local dir pid waited=0
+  dir=$(node_dir "$i")
+  [ -f "$dir/geth.pid" ] || die "节点 $i 没有 pid 文件（可能已经停了）"
+  pid=$(cat "$dir/geth.pid")
+  kill "$pid" 2>/dev/null || true
+  rm -f "$dir/geth.pid"
+  while kill -0 "$pid" 2>/dev/null; do
+    [ "$waited" -ge 60 ] && { echo "警告：节点 $i 60 s 内未退出，未强杀"; return; }
+    sleep 1; waited=$((waited + 1))
+  done
+  # 进程退出和锁释放不是同一时刻，两个条件都满足才算停干净。
+  while :; do
+    case " $(lock_holders) " in
+      *" node$i "*) ;;
+      *) break ;;
+    esac
+    [ "$waited" -ge 90 ] && { echo "警告：node$i 的 datadir 锁 90 s 未释放，未强杀"; return; }
+    sleep 1; waited=$((waited + 1))
+  done
+  echo "节点 $i 已停止（等待 ${waited}s）"
+}
+
 cmd_clean() {
   [ -d "$HOME_DIR" ] || { echo "没有 $HOME_DIR"; return; }
   echo "将删除 ${HOME_DIR}（含 $HOME_DIR 下所有 keystore 与链数据）"
@@ -584,11 +807,13 @@ case "${1:-}" in
   init)   shift; cmd_init "$@" ;;
   start)  shift; cmd_start "$@" ;;
   stop)   shift; cmd_stop "$@" ;;
+  start-node) shift; cmd_start_node "$@" ;;
+  stop-node)  shift; cmd_stop_node "$@" ;;
   status) shift; cmd_status "$@" ;;
   wait)   shift; cmd_wait "$@" ;;
   clean)  shift; cmd_clean "$@" ;;
   *)
-    sed -n '6,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    sed -n '6,17p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
     exit 1
     ;;
 esac
