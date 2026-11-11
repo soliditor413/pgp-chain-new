@@ -77,10 +77,15 @@ func TestApplyPGPForkHeightIsIdempotent(t *testing.T) {
 }
 
 // The built-in pgp config is what every mainnet node starts from, so it has to
-// survive the same fork-order validation a genesis file does. The time-based
-// forks stay nil: gatherForks counts any non-nil value -- MaxUint64 included --
-// into the EIP-2124 checksum, and this config's checksum has to keep matching
-// pgp-chain's own client.
+// survive the same fork-order validation a genesis file does.
+//
+// On the fork checksum: this config does carry time forks now, and that does not
+// move it. core/forkid drops every time fork at or before genesis
+// (forkid.go:315-317), which is exactly the 0-valued group, and the block forks
+// pinned at MaxInt64 short-circuit NewID before it ever looks at time forks. So
+// the checksum stays crc32(genesis) and Next stays the MaxInt64 sentinel - what
+// this test pins instead is the *shape* of the schedule, because the shape is
+// what CheckConfigForkOrder enforces and what is easy to break by hand.
 func TestPGPChainConfigPassesForkOrder(t *testing.T) {
 	// The production path applies ApplyPGPForkHeight before validating
 	// (core/genesis.go), so validating the bare literal checks a configuration
@@ -91,8 +96,42 @@ func TestPGPChainConfigPassesForkOrder(t *testing.T) {
 	if err := cfg.CheckConfigForkOrder(); err != nil {
 		t.Fatalf("PGPChainConfig fails fork-order validation: %v", err)
 	}
-	if PGPChainConfig.FeynmanTime != nil {
-		t.Fatal("FeynmanTime must stay nil until launch, or the fork checksum changes")
+
+	// The 0-valued group is a prefix of the fork order: the order check compares
+	// timestamps, so any fork pinned at 0 *after* one pinned at MaxInt64 reads as
+	// a rewind. Haber sits after Cancun in that order and shares its activation
+	// time on BSC mainnet, which is why it belongs to the deferred group even
+	// though its own effect (the 0x100 precompile) is execution-layer.
+	for _, f := range []struct {
+		name string
+		got  *uint64
+	}{
+		{"keplerTime", cfg.KeplerTime},
+		{"feynmanTime", cfg.FeynmanTime},
+		{"feynmanFixTime", cfg.FeynmanFixTime},
+	} {
+		if f.got == nil || *f.got != 0 {
+			t.Errorf("%s = %v, want 0 (execution-layer fork active since genesis)", f.name, f.got)
+		}
+	}
+	for _, f := range []struct {
+		name string
+		got  *uint64
+	}{
+		{"cancunTime", cfg.CancunTime},
+		{"haberTime", cfg.HaberTime},
+		{"bohrTime", cfg.BohrTime},
+		{"pragueTime", cfg.PragueTime},
+		{"lorentzTime", cfg.LorentzTime},
+		{"jennerTime", cfg.JennerTime},
+	} {
+		if f.got == nil || *f.got != math.MaxInt64 {
+			t.Errorf("%s = %v, want the MaxInt64 sentinel (deferred until the fork height is pinned)", f.name, f.got)
+		}
+	}
+	// Blob schedule entries are mandatory once a blob fork is configured.
+	if cfg.BlobScheduleConfig == nil || cfg.BlobScheduleConfig.Cancun == nil {
+		t.Fatal("CancunTime is set, so BlobScheduleConfig must carry a Cancun entry")
 	}
 }
 

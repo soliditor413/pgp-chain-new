@@ -283,14 +283,22 @@ func gatherForks(config *params.ChainConfig, genesis uint64) ([]uint64, []uint64
 			continue
 		}
 
-		// Extract the fork rule block number or timestamp and aggregate it
+		// Extract the fork rule block number or timestamp and aggregate it.
+		//
+		// A fork pinned at the sentinel (>= MaxInt64) means "explicitly not
+		// scheduled", the same convention CheckConfigForkOrder applies to block
+		// forks. Collecting it here would announce a fork at year 292 million as
+		// this node's Next and change what peers see, even though no block will
+		// ever reach it. The pgp chain relies on this: its block forks sit at the
+		// sentinel while the fork height is undecided, and its EIP-2124 checksum
+		// has to keep matching pgp-chain's own client.
 		if field.Type == reflect.TypeFor[*uint64]() {
-			if rule := conf.Field(i).Interface().(*uint64); rule != nil {
+			if rule := conf.Field(i).Interface().(*uint64); rule != nil && *rule < math.MaxInt64 {
 				forksByTime = append(forksByTime, *rule)
 			}
 		}
 		if field.Type == reflect.TypeFor[*big.Int]() {
-			if rule := conf.Field(i).Interface().(*big.Int); rule != nil {
+			if rule := conf.Field(i).Interface().(*big.Int); rule != nil && rule.IsInt64() && rule.Int64() < math.MaxInt64 {
 				forksByBlock = append(forksByBlock, rule.Uint64())
 			}
 		}

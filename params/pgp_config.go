@@ -329,19 +329,114 @@ var (
 		BerlinBlock:         big.NewInt(3),
 		LondonBlock:         big.NewInt(3),
 		ShanghaiTime:        newUint64(1761657650),
-		LubanBlock:          big.NewInt(math.MaxInt64),
-		Parlia:              &ParliaConfig{},
+
+		// BSC block-number forks. All of them are pinned at the "not scheduled"
+		// sentinel instead of being left nil, and the difference matters:
+		// CheckConfigForkOrder reads a nil block fork as "not configured" and
+		// rejects a chain that goes on to enable any later timestamp fork, while
+		// a value >= MaxInt64 is read as "explicitly not scheduled" and skipped
+		// (params/config.go:1646-1661).
+		//
+		// The real heights are not known yet: they are derived from
+		// Legacy.ForkHeight, which mainnet has not pinned. When it is pinned,
+		// THESE MUST BE SET BACK TO nil. ApplyPGPForkHeight only fills fields
+		// that are still nil (params/pgp_forks.go:62-66), so a leftover MaxInt64
+		// keeps Luban and Hertz off forever - no fast finality, no BSC
+		// precompiles - and the configuration would look perfectly fine.
+		RamanujanBlock:  big.NewInt(math.MaxInt64),
+		NielsBlock:      big.NewInt(math.MaxInt64),
+		MirrorSyncBlock: big.NewInt(math.MaxInt64),
+		BrunoBlock:      big.NewInt(math.MaxInt64),
+		EulerBlock:      big.NewInt(math.MaxInt64),
+		GibbsBlock:      big.NewInt(math.MaxInt64),
+		PlanckBlock:     big.NewInt(math.MaxInt64),
+		MoranBlock:      big.NewInt(math.MaxInt64), // not in forkOrder, but it gates PrecompiledContractsMoran
+		LubanBlock:      big.NewInt(math.MaxInt64),
+		PlatoBlock:      big.NewInt(math.MaxInt64),
+		HertzBlock:      big.NewInt(math.MaxInt64),
+		HertzfixBlock:   big.NewInt(math.MaxInt64),
+		NanoBlock:       big.NewInt(math.MaxInt64), // block blacklist account in blacklist.go and PrecompiledAddressesNano
+
+		// BSC timestamp forks, in two groups.
+		//
+		// Zero means "active since genesis". These are execution-layer rules whose
+		// legacy-segment carve-outs (core/vm/contracts.go's `case rules.IsPGPLegacy`,
+		// the legacy jump table, the legacy fee path) already keep historical
+		// blocks byte-identical, so enabling them cannot rewrite the past.
+		//
+		// The zero group is a prefix of the fork order and cannot be extended
+		// past Cancun: the order check compares timestamps, so a fork pinned at 0
+		// after one pinned at MaxInt64 reads as a rewind.
+		KeplerTime:     newUint64(0),
+		FeynmanTime:    newUint64(0),
+		FeynmanFixTime: newUint64(0),
+
+		// MaxInt64 means "configured, never reached" - the field exists so the
+		// fork order check is satisfied and so the intent is visible, but no block
+		// ever activates it. These are the ones that must NOT run during the
+		// legacy era:
+		//
+		//   Cancun  writes BlobGasUsed/ExcessBlobGas/WithdrawalsHash into every
+		//           header miner/worker.go builds, with no IsPGPLegacy guard, so
+		//           enabling it early changes the header of already-mined blocks.
+		//   Haber   is ordered right after Cancun and shares its activation time on
+		//           BSC mainnet, so it moves with it. Its own effect (the 0x100
+		//           secp256r1 precompile) is execution-layer and legacy-carved-out,
+		//           so deferring it costs nothing before the fork.
+		//   Bohr    requires ParentBeaconRoot on every Parlia header, but only the
+		//           Cancun branch fills it - the two must be switched on together,
+		//           at or after the fork.
+		//   Prague  adds RequestsHash to the header.
+		//   Lorentz/Maxwell/Fermi change snap.BlockInterval (1500/750/450ms),
+		//           the epoch length, and start writing millisecond timestamps.
+		//
+		// When the fork height is pinned, move the ones being enabled to T_fork,
+		// keeping CancunTime == HaberTime == BohrTime.
+		CancunTime:   newUint64(math.MaxInt64),
+		HaberTime:    newUint64(math.MaxInt64),
+		HaberFixTime: newUint64(math.MaxInt64),
+		BohrTime:     newUint64(math.MaxInt64),
+		PascalTime:   newUint64(math.MaxInt64), // only reflashes system contracts; must exist for Prague
+		PragueTime:   newUint64(math.MaxInt64),
+		LorentzTime:  newUint64(math.MaxInt64),
+		MaxwellTime:  newUint64(math.MaxInt64),
+		FermiTime:    newUint64(math.MaxInt64),
+		OsakaTime:    newUint64(math.MaxInt64),
+		MendelTime:   newUint64(math.MaxInt64),
+		PasteurTime:  newUint64(math.MaxInt64),
+		JennerTime:   newUint64(math.MaxInt64),
+		// BPO1-5, Amsterdam and UBT are deliberately absent: BSC's own mainnet
+		// never activated them (BPO1/BPO2 carry "will be skipped in BSC").
+		Parlia: &ParliaConfig{},
+
+		// Required the moment any of CancunTime/PragueTime/OsakaTime is non-nil:
+		// CheckConfigForkOrder refuses a configured blob fork without an entry
+		// (params/config.go:1711-1716). BSC's blob parameters are static, so the
+		// three entries carry the same numbers as its mainnet config.
+		BlobScheduleConfig: &BlobScheduleConfig{
+			Cancun: DefaultCancunBlobConfig,
+			Prague: DefaultPragueBlobConfigBSC,
+			Osaka:  DefaultOsakaBlobConfigBSC,
+		},
+
 		Legacy: &LegacyConfig{
-			ForkHeight:                math.MaxUint64,
-			GasFeeRecipient:           DefaultGasFeeRecipient,
-			GasFeeRecipientRatio:      DefaultGasFeeRecipientRatio,
-			PassBalance:               DefaultPassBalance,
-			DynamicArbiterHeight:      DefaultDynamicArbiterHeight,
-			Producers:                 DefaultLegacyProducers,
-			VerifySeal:                true,
-			ParliaGenesisValidators:   []string{},
-			ParliaGenesisVotingPowers: []uint64{},
-			ParliaGenesisCabinets:     21,
+			ForkHeight: math.MaxUint64,
+			// Zero means "do not inject". It is the only legal value while
+			// ForkHeight is the never-fork sentinel: checkDeployHeight rejects any
+			// non-zero deploy height on a chain without a fixed fork height
+			// (params/pgp_config.go:486-488). Once ForkHeight is pinned it has to
+			// become a concrete 2 <= D <= ForkHeight-2.
+			SystemContractDeployHeight: 0,
+			GasFeeRecipient:            DefaultGasFeeRecipient,
+			GasFeeRecipientRatio:       DefaultGasFeeRecipientRatio,
+			PassBalance:                DefaultPassBalance,
+			DynamicArbiterHeight:       DefaultDynamicArbiterHeight,
+			Producers:                  DefaultLegacyProducers,
+			VerifySeal:                 true,
+			ParliaGenesisValidators:    []string{},
+			ParliaGenesisVotingPowers:  []uint64{},
+			ParliaGenesisVoteAddrs:     []string{},
+			ParliaGenesisCabinets:      21,
 		},
 	}
 
