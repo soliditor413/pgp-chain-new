@@ -113,6 +113,19 @@ func (p *Parlia) updateValidatorSetV2(state vm.StateDB, header *types.Header, ch
 	// 2. sort by voting power
 	eValidators, eVotingPowers, eVoteAddrs := getTopValidatorsByVotingPower(validatorItems, maxElectedValidators)
 
+	// An empty result is legal and means "nobody is electable right now":
+	// StakeHub empty (no createValidator yet), or every registered validator
+	// jailed (getValidatorElectionInfo reports voting power 0 for those, and
+	// getTopValidatorsByVotingPower drops 0-power entries). BSCValidatorSet
+	// keeps currentValidatorSet in that case, so the chain keeps producing with
+	// the set it already has. Log it, because otherwise "staking is broken" is
+	// indistinguishable from "election worked and nothing changed".
+	if len(eValidators) == 0 {
+		log.Warn("validator election returned an empty set, keeping the current validator set",
+			"number", header.Number, "stakeHubValidators", len(validatorItems),
+			"maxElectedValidators", maxElectedValidators)
+	}
+
 	// 3. update validator set to system contract
 	method := "updateValidatorSetV2"
 	data, err := p.validatorSetABI.Pack(method, eValidators, eVotingPowers, eVoteAddrs)
