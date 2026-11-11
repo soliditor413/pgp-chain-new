@@ -140,6 +140,11 @@ def build_config(args, validators):
         "platoBlock": args.fork_height,
         "hertzBlock": args.fork_height,
         "hertzfixBlock": args.fork_height,
+        # 时间型分叉只允许「0 = 创世即激活」这一种写法，见 --feynman-time 的校验。
+        # keplerTime 是 feynmanTime 的前置：CheckConfigForkOrder 会拒绝「kepler 没配、
+        # feynman 配了」的组合。
+        **({"keplerTime": args.kepler_time} if args.kepler_time is not None else {}),
+        **({"feynmanTime": args.feynman_time} if args.feynman_time is not None else {}),
         # ParliaConfig 是空结构体：有这个 key 就等于「Parlia 已启用」
         "parlia": {},
         "legacy": {
@@ -182,7 +187,8 @@ def main() -> int:
                          "双签取证的签名域用它，chainId 不同则罚没永远失败（F-01）。"
                          "配合 legacy.allowForeignGenesis 规避 genesis 不匹配的启动检查。")
     ap.add_argument("--voting-power", type=int, default=100)
-    ap.add_argument("--cabinets", type=int, default=0, help="0 = 取验证人数")
+    ap.add_argument("--cabinets", type=int, default=0,
+                    help="0 = 取验证人数；>0 时必须 <= 验证人数（多出的候选人只参与选举，不参与出块）")
     ap.add_argument("--vote-addrs", action="append", default=[], metavar="HEX48",
                     help="验证人的 48 字节 BLS 票地址，按验证人顺序重复给；留空则不启用 finality。"
                          "给了就必须与验证人数量一致，否则节点启动时会拒绝。")
@@ -212,6 +218,14 @@ def main() -> int:
     ap.add_argument("--omit-system-contract-alloc", action="store_true",
                     help="不把 17 个系统合约写进 genesis alloc，让 0x1000..0x3000 在 D 块之前"
                          "保持空账户，由协议注入安装。配合 --deploy-height 使用。")
+    ap.add_argument("--feynman-time", type=int, default=None,
+                    help="Feynman 时间分叉。只允许 0（创世即激活）：非 0 时，激活块会再次调用"
+                         "StakeHub/BSCGovernor/GovToken/BSCTimelock/TokenRecoverPortal 的"
+                         "initialize()，而这些合约已在 D 块初始化过，initializer 会 revert，"
+                         "Finalize 失败导致停链。")
+    ap.add_argument("--kepler-time", type=int, default=None,
+                    help="Kepler 时间分叉，必须与 --feynman-time 成对给出（顺序校验要求）。"
+                         "同样只允许 0。")
     args = ap.parse_args()
 
     validators = parse_validators(args.validators)
@@ -236,8 +250,20 @@ def main() -> int:
     else:
         sys.exit("--deploy-height=0 生成的 genesis 没有系统合约初始化路径；"
                  "块 1 初始化已删除（F-18），请给一个 D（默认 F-2）")
-    if args.cabinets and args.cabinets != len(validators):
-        sys.exit(f"--cabinets={args.cabinets} 与验证人数 {len(validators)} 不一致")
+    if args.cabinets and not (0 < args.cabinets <= len(validators)):
+        sys.exit(f"--cabinets={args.cabinets} 必须在 (0, {len(validators)}] 内："
+                 "多于验证人的席位没有意义；少于验证人时，多出的候选人只参与选举、不参与出块")
+    if args.feynman_time is not None:
+        if args.kepler_time is None:
+            sys.exit("--feynman-time 必须与 --kepler-time 成对给出："
+                     "CheckConfigForkOrder 会拒绝「kepler 未配置、feynman 已配置」的组合")
+        if args.feynman_time != 0:
+            sys.exit("--feynman-time 只允许 0（创世即激活）。非 0 时激活块会再次调用 "
+                     "StakeHub/BSCGovernor/GovToken/BSCTimelock/TokenRecoverPortal 的 "
+                     "initialize()，而这些合约已在 D 块初始化过，initializer 会 revert，"
+                     "Finalize 失败导致停链。")
+    if args.kepler_time is not None and args.kepler_time != 0:
+        sys.exit("--kepler-time 只允许 0（创世即激活）：测试链不需要一个未来的 Kepler 边界")
 
     # 规范成 params.DefaultLegacyProducers 的写法：无 0x、小写。
     producers = []
