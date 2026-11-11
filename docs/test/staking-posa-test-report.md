@@ -2,7 +2,7 @@
 
 执行时间：2026-11-11（Asia/Shanghai）
 被测二进制：`bsc/build/bin/geth`（本仓库 HEAD `7ca26d22e`）
-链 ID：860621；系统合约镜像：`pgp-fork-v4`
+链 ID：860621；系统合约镜像：`pgp-fork-v4`（T1–T6 时点）→ **`pgp-fork-v5`**（含 §5.4 与 §8.5 两处合约补丁，`imageHash = 0x7a98039c…`）
 
 ---
 
