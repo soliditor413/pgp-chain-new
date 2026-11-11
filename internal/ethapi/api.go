@@ -1038,7 +1038,19 @@ func applyMessage(ctx context.Context, b Backend, args TransactionArgs, state *s
 	if err := args.CallDefaults(gp.Gas(), blockContext.BaseFee, b.ChainConfig().ChainID); err != nil {
 		return nil, err
 	}
-	msg := args.ToMessage(header.BaseFee, true)
+	// ToMessage must see the same basefee CallDefaults saw. On a legacy block the
+	// two disagree: the header carries no BaseFee, but the block context does, so
+	// CallDefaults fills the 1559 fee fields and leaves GasPrice nil, while
+	// ToMessage(nil) goes down the "no basefee" branch, reads the GasPrice that
+	// was never set, and returns a Message whose GasPrice is nil. The Sign() below
+	// then dereferences it: every eth_call against a pre-fork block crashed the
+	// RPC handler with -32603 unless the caller happened to pass a legacy
+	// gasPrice -- which is exactly the block range a fork migration needs to
+	// inspect.
+	msg := args.ToMessage(blockContext.BaseFee, true)
+	if msg.GasPrice == nil {
+		msg.GasPrice = new(uint256.Int)
+	}
 	// Lower the basefee to 0 to avoid breaking EVM
 	// invariants (basefee < feecap).
 	if msg.GasPrice.Sign() == 0 {

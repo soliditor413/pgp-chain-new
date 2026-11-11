@@ -445,3 +445,48 @@ func (b *backendMock) CurrentView() *filtermaps.ChainView           { return nil
 func (b *backendMock) NewMatcherBackend() filtermaps.MatcherBackend { return nil }
 
 func (b *backendMock) HistoryPruningCutoff() uint64 { return 0 }
+
+// TestCallDefaultsAndToMessageUseTheSameBaseFee pins the invariant applyMessage
+// depends on: the baseFee handed to CallDefaults must be the one handed to
+// ToMessage.
+//
+// They used to differ on legacy blocks -- CallDefaults got the block context's
+// basefee, ToMessage got the header's, which is nil there. CallDefaults then set
+// the 1559 fee fields and left GasPrice unset, ToMessage took the "no basefee"
+// branch, read the unset GasPrice, and returned a Message with GasPrice == nil;
+// applyMessage's Sign() dereferenced it. Every eth_call against a pre-fork block
+// came back as "method handler crashed" unless the caller happened to pass a
+// legacy gasPrice, which is precisely the range a fork migration has to inspect.
+func TestCallDefaultsAndToMessageUseTheSameBaseFee(t *testing.T) {
+	chainID := big.NewInt(1)
+	for _, tc := range []struct {
+		name    string
+		baseFee *big.Int
+	}{
+		{"no basefee, legacy header", nil},
+		{"zero basefee", big.NewInt(0)},
+		{"non-zero basefee", big.NewInt(1_000_000_000)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var args TransactionArgs
+			if err := args.CallDefaults(0, tc.baseFee, chainID); err != nil {
+				t.Fatalf("CallDefaults: %v", err)
+			}
+			msg := args.ToMessage(tc.baseFee, true)
+			if msg.GasPrice == nil {
+				t.Fatal("GasPrice is nil: CallDefaults and ToMessage disagreed about the basefee")
+			}
+			// Also make sure a caller-supplied legacy gasPrice survives, since
+			// that is the one input that worked even before the fix.
+			var withPrice TransactionArgs
+			price := hexutil.Big(*big.NewInt(7))
+			withPrice.GasPrice = &price
+			if err := withPrice.CallDefaults(0, tc.baseFee, chainID); err != nil {
+				t.Fatalf("CallDefaults(price): %v", err)
+			}
+			if got := withPrice.ToMessage(tc.baseFee, true).GasPrice; got == nil || got.Uint64() != 7 {
+				t.Fatalf("caller gasPrice lost: have %v, want 7", got)
+			}
+		})
+	}
+}
