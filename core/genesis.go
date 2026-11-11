@@ -683,6 +683,23 @@ func (g *Genesis) Commit(db ethdb.Database, triedb *triedb.Database, tracer *tra
 	if config == nil {
 		return nil, errors.New("invalid genesis without chain config")
 	}
+	// Derive the BSC block forks from Legacy.ForkHeight before anything reads
+	// them, so "pin the fork height, leave the block forks nil" means the same
+	// thing on both paths a chain can take.
+	//
+	// This used to happen only in chainConfigOrDefault, which is reached when the
+	// database already holds a genesis (the compatibility re-check). A fresh
+	// `geth init` goes straight here, so on that path the BSC forks stayed nil,
+	// CheckConfigForkOrder read "nil block fork" as "not configured" and refused
+	// the chain outright:
+	//   unsupported fork ordering: hertzfixBlock not enabled, but keplerTime
+	//   enabled at timestamp 0
+	// which is the opposite of the documented intent. It also made a
+	// fresh-database init and a restart behave differently for the same genesis.
+	//
+	// Idempotent and non-destructive: only nil fields are filled, so the
+	// sentinels that mainnet ships (explicitly not scheduled) are left alone.
+	config.ApplyPGPForkHeight()
 	if err := config.CheckConfigForkOrder(); err != nil {
 		return nil, err
 	}
