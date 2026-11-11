@@ -108,7 +108,20 @@ verify_proofs() {
 
 cmd_start() {
   load_env
-  KEEPALIVE=1 "$MULTI" start
+  # start 会一直阻塞在 `wait`（KEEPALIVE=1），也就是整条链的生命周期都压在这一次
+  # bash 进程里。而这个进程是**边读脚本边执行**的：运行期间只要有人编辑 multi.sh，
+  # bash 就会按字节偏移继续读被改写的文件，读到半条语句就
+  #   multi.sh: line N: syntax error near unexpected token `;;'
+  # 然后退出（exit 2），子 geth 随父 shell 一起被回收。
+  # 实测代价：一条跑了 44 分钟、已经到 block 771 的链，因为我在注释里加了两行而全掉，
+  # 报错还长得像脚本本身有语法错误（bash -n 是过的）。
+  # 所以让它执行一份快照：运行期间改动 multi.sh 不再影响这条已经起来的链。
+  local snap="$STAKING_HOME/.multi.snapshot.sh"
+  cp "$MULTI" "$snap"
+  # 快照换了位置，multi.sh 内部由 SELF_DIR 推出的 REPO_ROOT 就不再指向仓库，
+  # 那两个由它推导的二进制路径必须显式传进去（PGP_PARLIA_MULTI_HOME 已在 lib.sh 导出）。
+  GETH_BIN="$GETH_BIN" BOOTNODE_BIN="$BOOTNODE_BIN" SEED_PEERS_PY="$SEED_PEERS_PY" \
+    KEEPALIVE=1 bash "$snap" start
 }
 
 cmd_stop() { "$MULTI" stop; }

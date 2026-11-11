@@ -13,6 +13,12 @@
 #   ./multi.sh stop
 #   ./multi.sh clean
 #
+# 运行期间不要编辑这个文件：`start` 会一直阻塞在 `wait`，而这个 bash 进程是
+# 边读边执行的，文件被改写后它会按字节偏移读到半条语句并以 exit 2 退出，
+# 子节点一起被回收。staking-devnet 的 run.sh start 已经把脚本快照到
+# $STAKING_HOME/.multi.snapshot.sh 再执行，所以那条路径不受影响；直接调用
+# multi.sh start 时才需要注意。
+#
 # 为什么必须要多进程，不能像 run.sh 那样单进程跑 N 席
 # ---------------------------------------------------
 # Parlia 的 recents 防双签会拦下「同一个验证人连签」。窗口长度是

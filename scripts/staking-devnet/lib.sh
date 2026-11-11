@@ -15,6 +15,8 @@ REPO_ROOT=$(cd "$SELF_DIR/../.." && pwd)
 
 GETH_BIN=${GETH_BIN:-$REPO_ROOT/build/bin/geth}
 MULTI=${MULTI:-$REPO_ROOT/scripts/parlia-devnet/multi.sh}
+BOOTNODE_BIN=${BOOTNODE_BIN:-$REPO_ROOT/build/bin/bootnode}
+SEED_PEERS_PY=${SEED_PEERS_PY:-$REPO_ROOT/scripts/pbft-devnet/seed-peers.py}
 STAKING_HOME=${PGP_STAKING_HOME:-$HOME/.pgp-staking/default}
 MULTI_HOME=$STAKING_HOME/net
 export PGP_PARLIA_MULTI_HOME=$MULTI_HOME
