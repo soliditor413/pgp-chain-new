@@ -110,6 +110,7 @@ def build_config(args, validators):
     里没法预先钉死；写死了只会得到一个 ActivateAtTime 永不满足的分叉，然后
     epoch 长度卡在 defaultEpochLength。等链跑起来拿到 H 的 timestamp 再补。
     """
+    _hist = args.fork_height if args.all_forks_at_height else 0
     cfg = {
         "chainId": args.chain_id,
         "homesteadBlock": 0,
@@ -121,17 +122,24 @@ def build_config(args, validators):
         "petersburgBlock": 0,
         "istanbulBlock": 0,
         "muirGlacierBlock": 0,
-        # BSC 的历史分叉全部压在 0，因为它们描述的是「合约版本」，
-        # 而我们要用的正是最新那版字节码。
-        "ramanujanBlock": 0,
-        "nielsBlock": 0,
-        "mirrorSyncBlock": 0,
-        "brunoBlock": 0,
-        "eulerBlock": 0,
-        "nanoBlock": 0,
-        "moranBlock": 0,
-        "gibbsBlock": 0,
-        "planckBlock": 0,
+        # BSC 的历史分叉默认压在 0：它们描述的是「合约版本」，而我们要用的正是
+        # 最新那版字节码。--all-forks-at-height 会改成钉在 forkHeight，用来完全
+        # 复刻主网钉高后的形态（ApplyPGPForkHeight 把 13 个都填到 F）。
+        #
+        # 两者的分叉前后行为并不总是等价：precompile 选择有 `case rules.IsPGPLegacy`
+        # 兜底（legacy 段一律用 legacy 集合），但 core/state_transition.go 里的
+        # IsNano 黑名单检查没有这层兜底——nanoBlock=0 时它会在 legacy 段就生效。
+        # 黑名单目前是空的，所以两种写法都看不出差别；一旦有人往里加地址，
+        # 只有"全部钉在 F"才与主网一致。
+        "ramanujanBlock": _hist,
+        "nielsBlock": _hist,
+        "mirrorSyncBlock": _hist,
+        "brunoBlock": _hist,
+        "eulerBlock": _hist,
+        "nanoBlock": _hist,
+        "moranBlock": _hist,
+        "gibbsBlock": _hist,
+        "planckBlock": _hist,
         "berlinBlock": 0,
         "londonBlock": 0,
         # 现代档，与共识切换同高度。lubanBlock 单独处理：哨兵值表示不启用，
@@ -215,6 +223,9 @@ def main() -> int:
                     help="把 lubanBlock 钉在哨兵高度，表示 Luban 不启用：引擎全程走 "
                          "pre-Luban 的 extraData 格式（无 validator count 前缀、无 BLS 公钥、"
                          "无 vote attestation）。不写这个开关时 lubanBlock 与 ForkHeight 同高。")
+    ap.add_argument("--all-forks-at-height", action="store_true",
+                    help="把 9 个历史 BSC 块分叉也钉在 forkHeight，等价于主网钉高后 "
+                         "ApplyPGPForkHeight 的结果。默认把它们压在 0（合约版本取最新）。")
     ap.add_argument("--omit-system-contract-alloc", action="store_true",
                     help="不把 17 个系统合约写进 genesis alloc，让 0x1000..0x3000 在 D 块之前"
                          "保持空账户，由协议注入安装。配合 --deploy-height 使用。")

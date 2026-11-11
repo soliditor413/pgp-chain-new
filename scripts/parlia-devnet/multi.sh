@@ -97,6 +97,10 @@ GENESIS_TIMESTAMP=${GENESIS_TIMESTAMP:-}
 # BSCValidatorSet 会保留原集合继续出块（长度保护，见 contracts/BSCValidatorSet.sol），
 # 但质押与选举等于没上线——用 staking-devnet 的 `run.sh check` 断言 election.total > 0。
 FEYNMAN=${FEYNMAN:-1}
+# 1 = 把 9 个历史 BSC 块分叉也钉在 FORK_HEIGHT（复刻主网钉高后的形态）；
+# 0 = 压在 0（合约版本取最新，历史上一直这么跑）。二者在 legacy 段只有
+# IsNano 黑名单检查这条不受 IsPGPLegacy 兜底，详见 gen-genesis.py 的注释。
+ALL_FORKS_AT_FORK_HEIGHT=${ALL_FORKS_AT_FORK_HEIGHT:-0}
 # 覆盖 breathe block 间隔（秒）。留空 = 不传 flag（内核默认 86400）。
 BREATHE_INTERVAL=${BREATHE_INTERVAL:-}
 # legacy 生产者数量。0 = 取 SEATS；1 = 回退单仲裁人（组网不收敛时用）。
@@ -308,6 +312,9 @@ print("\n".join(m["producers"]))
     time_args+=(--feynman-time 0 --kepler-time 0)
   fi
 
+  local -a allfork_args=()
+  [ "$ALL_FORKS_AT_FORK_HEIGHT" = "1" ] && allfork_args=(--all-forks-at-height)
+
   python3 "$SELF_DIR/gen-genesis.py" \
     --contracts-out "$CONTRACT_ROOT/out" \
     --validators "$HOME_DIR/validators.conf" \
@@ -319,6 +326,7 @@ print("\n".join(m["producers"]))
     "${producer_args[@]+"${producer_args[@]}"}" \
     "${vote_args[@]+"${vote_args[@]}"}" \
     "${balances[@]+"${balances[@]}"}" \
+    "${allfork_args[@]+"${allfork_args[@]}"}" \
     --out "$GENESIS"
 
   for ((i = 0; i < seats; i++)); do
