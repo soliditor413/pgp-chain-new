@@ -296,14 +296,82 @@ cast call 0x0000000000000000000000000000000000001000 "getMiningValidators()(addr
 
 ---
 
-## 8. 本轮实际交付
+## 8. 实测结果（Run E，13 个块分叉全部 = F=40）
+
+**配置形态**：`ALL_FORKS_AT_FORK_HEIGHT=1` 生成，13 个 BSC 块分叉全部 40，`keplerTime/feynmanTime/feynmanFixTime = 0`，
+其余时间分叉未配置；D=20；4 个 PBFT 生产者（node0-3）+ 4 个 POSA 验证人（node4-7）不相交；8 节点。
+
+`fork-probe` 确认：`13 个 ← == ForkHeight`，`推导填充 0`（显式写了，不需要推导）。
+
+| 验证项 | 实测 | 判定 |
+|---|---|---|
+| V1 共识切换 | legacy 1..39 只由 node0-3 出块；40..47 只由 node4-7 出块 | PASS |
+| V2 Luban | extraLen：block 39 = **407**，block 40 = **97**，41 = 97 | PASS |
+| V3 D 块注入 | 0x1000 = **29031** / 0x1001 = 13386 / 0x2002 = 47087 B（与 v5 manifest 一致） | PASS |
+| V4 预编译切换 | block 39 调 0x66/0x68 → **空返回 `0x`**（不是预编译，当空账户处理）；block 45 → **`execution reverted`**（预编译存在，拒绝空输入） | PASS |
+| V5 初始集合 | `getMiningValidators()` = node4..7，顺序与 genesis 一致；`cabinets = 4` | PASS |
+| V6 空集合 breathe | 首个 post-fork breathe = **block 82**，StakeHub 为空时链继续出块（v5 长度保护），随后注册 → `election.total = 4` | PASS |
+| V8 全网一致 | 8 节点 hash 一致 @120；`check --deep` 除 election 外全绿（注册前） | PASS |
+
+### 8.1 顺带发现：`eth_call` 打 legacy 块会打崩 RPC handler（已修）
+
+做 V4 的前后对比时发现：`eth_call` 打到**分叉前**的块会返回 `-32603 method handler crashed`，
+分叉后正常。栈顶是 `internal/ethapi/api.go:1044` 的 `msg.GasPrice.Sign()`，`msg.GasPrice` 为 nil。
+
+根因：`CallDefaults(blockContext.BaseFee, …)` 与 `ToMessage(header.BaseFee, …)` 用了**不同的 baseFee 来源**。
+legacy 块 header 没有 `BaseFee`，但 block context 有，于是 `CallDefaults` 走 1559 分支只填了
+`MaxFeePerGas/MaxPriorityFeePerGas`，`GasPrice` 留空；`ToMessage(nil)` 走「无 basefee」分支去读这个空
+`GasPrice`，得到 nil Message 字段，`Sign()` 直接崩。
+
+修法：`ToMessage` 改用 `blockContext.BaseFee`（与 `CallDefaults` 同源），并加一层 nil 兜底。
+修复后 block 39 的三种费用写法（不给 / `gasPrice=0x0` / 只给 1559 字段）都返回 `0x`，不再 panic。
+回归测试：`internal/ethapi` 的 `TestCallDefaultsAndToMessageUseTheSameBaseFee`。
+
+> 这条直接影响本方案：**分叉前的状态无法"事后"用 `eth_call` 回放**。要么在分叉窗口内就把探针跑完，
+> 要么确认这个修复已在二进制里。V4 之所以能给出干净的 A/B，是因为修复后可以按块高回放。
+
+### 8.2 必须说清楚的一件事：13 个分叉钉在同一高度时，无法逐个观测
+
+把 13 个块分叉全部钉在 F，也就意味着 **Parlia 的第一个块就是它们全部生效的块**——
+不存在"某个分叉已生效、另一个还没"的链上窗口。所以在链上能看到的只有它们的**合成效果**（Luban 的 extra 形态最明显），
+无法把 Plato/Hertz/Planck 等分开验证。
+
+各分叉在本移植里的实际分量（非测试调用点数，`grep` 实测）：
+
+| 分叉 | 调用点 | 作用 | 链上可独立观测 |
+|---|---|---|---|
+| Luban | 多处 | extra 布局、post-Luban 合约 ABI、预编译集 | ✅ extraLen 407→97 |
+| Plato | 9 | forkchoice 最终性、finality reward、预编译集 | ⚠️ 间接（epoch 块系统交易） |
+| Ramanujan | 3 | 出块时间与 backoff 规则 | ⚠️ 只能看时间戳抖动，不可靠 |
+| Planck / Nano / Moran / Hertz | 各 1–2 | 预编译集（Nano 另含交易黑名单） | ⚠️ 需针对具体预编译地址构造探测 |
+| Hertzfix | 2 | gas/费用细则 | ⚠️ 需构造特定交易 |
+| Euler | 1 | pre-Luban 验证人 ABI 选择 | ❌ 本形态下走不到（Luban==F，pre-Luban 路径不存在） |
+| **Niels / MirrorSync / Bruno / Gibbs** | **0** | **无**（本移植没有引用） | ❌ 占位字段，无法测 |
+
+要逐个验证这 13 个，唯一办法是**按 `CheckConfigForkOrder` 允许的顺序把它们错开**（例如 Luban=F、
+Plato=F+20、Hertz=F+40…），代价是链的形态偏离主网。这是下一轮的工作量，不是本轮能声称已完成的。
+
+### 8.3 对主网配置的含义
+
+- 把 13 个块分叉全部钉在 F 是**正确的生产形态**，`fork-probe` 会逐行确认。
+- 不要在 `PGPChainConfig` 里保留 `MaxInt64` 哨兵就宣布"已排期"——那会让 Luban/Plato/Hertz 永不激活而配置看起来正常。
+- 时间分叉里 `Cancun/Haber/Bohr` 若要在 F 之后启用，`T_fork` 必须取 F 块的真实出块时间并留余量；
+  它们一旦早于 F 就会改写 legacy 段 header。
+
+---
+
+## 9. 本轮实际交付
 
 | 文件 | 内容 | 状态 |
 |---|---|---|
-| `core/genesis.go` | 在 `Commit` 里补 `ApplyPGPForkHeight()`（修 §1.1 的阻塞项） | 已改，待提交 |
+| `core/genesis.go` | 在 `Commit` 里补 `ApplyPGPForkHeight()`（修 §1.1 的阻塞项） | 已提交 `ed7a2f689` |
 | `core/genesis_pgp_forkfill_test.go` | 两条回归：nil 会被填；哨兵/显式值不被覆盖 | 通过 |
-| `scripts/fork-probe/main.go` | 离线分叉矩阵探针（本方案 §2.0 / §4 层 1 的工具） | 通过 |
-| `docs/test/pgp-fork-activation-test-plan.md` | 本文 | — |
+| `scripts/fork-probe/main.go` | 离线分叉矩阵探针（§2.0 / §4 层 1 的工具） | 已提交 `65ebe59a2` |
+| `scripts/parlia-devnet/gen-genesis.py` + `multi.sh` | `ALL_FORKS_AT_FORK_HEIGHT=1`：把 9 个历史块分叉也钉在 F，复刻主网形态 | 本轮新增 |
+| `internal/ethapi/api.go` + `transaction_args_test.go` | 修 §8.1 的 legacy `eth_call` panic，加不变量测试 | 本轮新增 |
+| `docs/test/pgp-fork-activation-test-plan.md` | 本文（含 §8 实测结果） | — |
 
-**没做的**（时间与资源原因，已在文中标 [待执行]）：用 §2.2 的 nil 形态真正起一条链跑 V1–V8。
-上一轮的 `run.sh` 链路验证的是"分叉后行为"，不是"nil→推导"这条配置路径；两者不要混为一谈。
+**仍然没做的**：
+- 13 个分叉的**逐项**验证（§8.2）：需要把它们错开钉高，属下一轮；本轮给的是合成效果 + 每个分叉的分量清单。
+- 时间分叉 `Cancun/Haber/Bohr/Prague/...` 的链上生效验证：本轮它们都未配置（`MaxInt64`/缺席），
+  只验证了 `Kepler/Feynman/FeynmanFix = 0` 这条前缀组的间接效果（0x66/0x68 在 F 后可用）。
