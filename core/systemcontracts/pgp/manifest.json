@@ -1,8 +1,8 @@
 {
   "version": 1,
   "sourceRepo": "github.com/pgprotocol/bsc-genesis-contract",
-  "sourceCommit": "24c7f2b54e388a9e2fa7a3dbc8b0ff2555b56817",
-  "sourceTag": "pgp-fork-v4",
+  "sourceCommit": "546eca5e20c3ffa290d59652f2961322188734a6",
+  "sourceTag": "pgp-fork-v5",
   "sourceDirty": false,
   "dirtyDiffSha256": "0xe3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
   "foundry": {
@@ -16,8 +16,8 @@
       "name": "BSCValidatorSet",
       "source": "contracts/BSCValidatorSet.sol",
       "solc": "0.6.4",
-      "codeLen": 28917,
-      "codeHash": "0xd52ae6beb999f3d0d7cc28d5fa6cadaf4f1d4f3821652b7a5d482bfa4d4a7e1d",
+      "codeLen": 29031,
+      "codeHash": "0xf489f5d8fd78b204db246490da7c267a4caeb1b12768f144d86268183379837b",
       "initSignature": "init(bytes,uint256)",
       "initSelector": "0x1663df00",
       "deployInit": true
@@ -38,8 +38,8 @@
       "name": "SystemReward",
       "source": "contracts/SystemReward.sol",
       "solc": "0.6.4",
-      "codeLen": 3224,
-      "codeHash": "0x1e43dfdc69e6f7b0b74b532911133839572dc838c34fb82ab0624cec5c3522f2",
+      "codeLen": 3309,
+      "codeHash": "0x90be5a02c75ea37d5cdf21ea854262f0b2c487215dc1eaabe9832bffb2c3d2ee",
       "initSignature": "",
       "initSelector": "",
       "deployInit": false
@@ -199,5 +199,5 @@
       "deployInit": true
     }
   ],
-  "imageHash": "0x3187f8c460adfa7acddab5df6ab31bfe985f98ad8e9a9cd239c4d8087fbddf6c"
+  "imageHash": "0x7a98039cbc213abbee5cdd270dae999a6e5d3f7c5225e6bdb236ca0f4e53ec12"
 }
