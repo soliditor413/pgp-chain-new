@@ -351,7 +351,44 @@ legacy 块 header 没有 `BaseFee`，但 block context 有，于是 `CallDefault
 要逐个验证这 13 个，唯一办法是**按 `CheckConfigForkOrder` 允许的顺序把它们错开**（例如 Luban=F、
 Plato=F+20、Hertz=F+40…），代价是链的形态偏离主网。这是下一轮的工作量，不是本轮能声称已完成的。
 
-### 8.3 对主网配置的含义
+### 8.3 Cancun..Fermi 组：已启用，可工作（实测）
+
+上一轮这组全是未配置状态，本轮补测：把它们全部钉在 `T_fork = T0+300`（F=40 之后约 49 块），
+用 `BSC_TIME_FORKS=<ts>` 生成创世。**结论：可以启用，链在 450ms 出块下稳定运行。**
+
+启用过程中踩到三个硬前置，缺一个就 `init` 失败：
+
+| # | 前置 | 不满足时的报错 | 说明 |
+|---|---|---|---|
+| 1 | `feynmanFixTime` 必须同时给 | `unsupported fork ordering: feynmanFixTime not enabled, but cancunTime enabled` | 它在顺序链里卡在 feynman 和 cancun 之间且**非可选**。主网预设里是 0，只有自造 genesis 会漏 |
+| 2 | 配置项名是 `blobSchedule`（不是 `blobScheduleConfig`） | `invalid chain configuration: missing entry for fork "cancun" in blobSchedule` | `ChainConfig.BlobScheduleConfig` 的 json tag 是 `blobSchedule` |
+| 3 | 字段名是 `baseFeeUpdateFraction`（不是 `updateFraction`） | 同上 | `BlobConfig.UpdateFraction` 的 json tag |
+
+实测（`eth_getBlockByNumber`）：
+
+| 块 | ts | Δ | blobGasUsed | parentBeaconBlockRoot | requestsHash |
+|---|---|---|---|---|---|
+| 88 | 1794450597 | 3s | — | — | — |
+| **89** | **1794450600** = T_fork | **0.45s** | ✅ | ✅ | ✅ |
+| 90 | 1794450600 | 0.45s | ✅ | ✅ | ✅ |
+
+同一块 89 上还叠了两件事：它同时是 **breathe 块**（T0+300），且 StakeHub 为空 →
+`updateValidatorSetV2([],[],[])` 走了 v5 的长度保护（gas 24,528，保留原集合）。三件事撞在一个块上，链照常出块。
+
+块间隔的量化：89..129 共 41 个块用了约 18 秒（≈440ms/块），`MixDigest` 里的毫秒分量按 450 步进
+（150,600,50,500,950,…）。`header.Time` 仍是**秒**，毫秒部分存在 `MixDigest`（`Header.MilliTimestamp()`），
+所以按秒做的时间计算（breathe 桶）不受影响。
+
+启用这组的真实代价（不是"开了就更新"）：
+
+| 变化 | 影响 |
+|---|---|
+| `snap.BlockInterval` 3000 → 1500（Lorentz）→ 750（Maxwell）→ 450ms（Fermi） | 出块节奏变了；脚手架里所有"3s 一块"的假设（T0 对齐、等待超时）都要复核 |
+| `EpochLength` 200 → 500（Lorentz）→ 1000（Maxwell） | 验证人集合的 checkpoints 间隔变了，切换验证人的块距变长 |
+| `turnLength` 改为从合约 `getTurnLength()` 读（Bohr） | 我们的 v5 合约实现了该方法（`turnLength==0` 时返回 1），所以没改变轮次；若治理把它设成别的值，出块行为会变 |
+| header 增加 `blobGasUsed/excessBlobGas/parentBeaconBlockRoot/requestsHash` | **头哈希与不开时不同**；任何按 header 序列化/比对的工具都要能认这些字段 |
+
+### 8.4 对主网配置的含义
 
 - 把 13 个块分叉全部钉在 F 是**正确的生产形态**，`fork-probe` 会逐行确认。
 - 不要在 `PGPChainConfig` 里保留 `MaxInt64` 哨兵就宣布"已排期"——那会让 Luban/Plato/Hertz 永不激活而配置看起来正常。
