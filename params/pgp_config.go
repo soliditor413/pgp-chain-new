@@ -367,7 +367,7 @@ var (
 		// The zero group is a prefix of the fork order and cannot be extended
 		// past Cancun: the order check compares timestamps, so a fork pinned at 0
 		// after one pinned at MaxInt64 reads as a rewind.
-		KeplerTime:     newUint64(math.MaxInt64),
+		KeplerTime:     newUint64(0),
 		FeynmanTime:    newUint64(0),
 		FeynmanFixTime: newUint64(0),
 
