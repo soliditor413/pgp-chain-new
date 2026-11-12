@@ -2332,9 +2332,12 @@ func (p *Parlia) GetJustifiedNumberAndHash(chain consensus.ChainHeaderReader, he
 	// finality, and the callers already treat an error as "nothing justified":
 	// core/headerchain.go:GetJustifiedNumber and core/blockchain.go
 	// :GetJustifiedNumber both swallow it and return 0. Answering that directly
-	// skips a snapshot walk that is guaranteed to fail -- which on mainnet is
-	// one failed walk and one ERROR line per inserted batch, for every block of
-	// the 800k-plus legacy history.
+	// skips a snapshot walk that is guaranteed to fail.
+	//
+	// It is not a rare path. BlockChain.writeHeadBlock updates justifiedBlockGauge
+	// through this function every time the head advances, so a full sync pays one
+	// failed walk and one ERROR line per block -- the whole legacy history, at
+	// block intervals, indistinguishable in the log from a real problem.
 	//
 	// GetFinalizedHeader next to this has the same guard (it checks IsPlato
 	// first); this function was missing it.
