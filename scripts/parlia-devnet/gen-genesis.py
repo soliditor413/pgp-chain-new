@@ -153,6 +153,31 @@ def build_config(args, validators):
         # feynman 配了」的组合。
         **({"keplerTime": args.kepler_time} if args.kepler_time is not None else {}),
         **({"feynmanTime": args.feynman_time} if args.feynman_time is not None else {}),
+        # feynmanFixTime 在顺序链里卡在 feynman 和 cancun 之间，且是**非可选**的：
+        # 只给 cancun 而不给 feynmanFixTime，init 会报
+        #   unsupported fork ordering: feynmanFixTime not enabled, but cancunTime enabled
+        # 主网预设里它是 0，所以只有自造 genesis 才会漏。
+        **({"feynmanFixTime": args.feynman_time} if args.feynman_time is not None else {}),
+        # feynmanFixTime 在顺序链里卡在 feynman 和 cancun 之间，且是**非可选**的：
+        # 只给 cancun 而不给 feynmanFixTime，init 会报
+        #   unsupported fork ordering: feynmanFixTime not enabled, but cancunTime enabled
+        # 主网预设里它是 0，所以只有自造 genesis 才会漏。
+        **({"feynmanFixTime": args.feynman_time} if args.feynman_time is not None else {}),
+        # --bsc-time-forks 一次性把 Cancun..Fermi 全组钉在同一个时间戳。
+        # 这一组是非可选链：开 Fermi 就必须同时给 Cancun/Haber/HaberFix/Bohr/
+        # Pascal/Prague/Lorentz/Maxwell。时间戳必须 > 最后一个 legacy 块的时间，
+        # 否则 Cancun 会往 legacy header 里写 BlobGasUsed 等字段，历史块被改写。
+        **({k: args.bsc_time_forks for k in (
+            "cancunTime", "haberTime", "haberFixTime", "bohrTime", "pascalTime",
+            "pragueTime", "lorentzTime", "maxwellTime", "fermiTime",
+        )} if args.bsc_time_forks is not None else {}),
+        # 只要 Cancun/Prague 排了时间，就必须给 blobSchedule 条目，否则
+        # CheckConfigForkOrder 报 "missing entry for fork ... in blobSchedule"。
+        # 数值取 BSC 的静态参数（DefaultCancunBlobConfig / DefaultPragueBlobConfigBSC 相同）。
+        **({"blobSchedule": {
+            "cancun": {"target": 3, "max": 6, "baseFeeUpdateFraction": 3338477},
+            "prague": {"target": 3, "max": 6, "baseFeeUpdateFraction": 3338477},
+        }} if args.bsc_time_forks is not None else {}),
         # ParliaConfig 是空结构体：有这个 key 就等于「Parlia 已启用」
         "parlia": {},
         "legacy": {
@@ -234,6 +259,10 @@ def main() -> int:
                          "StakeHub/BSCGovernor/GovToken/BSCTimelock/TokenRecoverPortal 的"
                          "initialize()，而这些合约已在 D 块初始化过，initializer 会 revert，"
                          "Finalize 失败导致停链。")
+    ap.add_argument("--bsc-time-forks", type=int, default=None, metavar="TS",
+                    help="把 Cancun/Haber/HaberFix/Bohr/Pascal/Prague/Lorentz/Maxwell/Fermi "
+                         "全部钉在 TS。这一组是非可选链，不能只开其中后面的几个。"
+                         "TS 必须晚于最后一个 legacy 块的时间，否则 Cancun 会改写历史 header。")
     ap.add_argument("--kepler-time", type=int, default=None,
                     help="Kepler 时间分叉，必须与 --feynman-time 成对给出（顺序校验要求）。"
                          "同样只允许 0。")

@@ -101,6 +101,9 @@ FEYNMAN=${FEYNMAN:-1}
 # 0 = 压在 0（合约版本取最新，历史上一直这么跑）。二者在 legacy 段只有
 # IsNano 黑名单检查这条不受 IsPGPLegacy 兜底，详见 gen-genesis.py 的注释。
 ALL_FORKS_AT_FORK_HEIGHT=${ALL_FORKS_AT_FORK_HEIGHT:-0}
+# 非空 = 把 Cancun/Haber/HaberFix/Bohr/Pascal/Prague/Lorentz/Maxwell/Fermi 全组钉在这个
+# 时间戳（Unix 秒）。这一组不是可选的，开 Fermi 就得全给。留空 = 都不启用。
+BSC_TIME_FORKS=${BSC_TIME_FORKS:-}
 # 覆盖 breathe block 间隔（秒）。留空 = 不传 flag（内核默认 86400）。
 BREATHE_INTERVAL=${BREATHE_INTERVAL:-}
 # legacy 生产者数量。0 = 取 SEATS；1 = 回退单仲裁人（组网不收敛时用）。
@@ -311,6 +314,9 @@ print("\n".join(m["producers"]))
     # 只允许 0：非 0 会在激活块再次 initialize() 已经初始化过的 5 个合约。
     time_args+=(--feynman-time 0 --kepler-time 0)
   fi
+  # Cancun..Fermi 整组（含 Lorentz/Maxwell/Fermi 的块间隔切换）。必须晚于最后一个
+  # legacy 块的时间，否则 Cancun 会往历史 header 里写 blob 字段。
+  [ -n "${BSC_TIME_FORKS:-}" ] && time_args+=(--bsc-time-forks "$BSC_TIME_FORKS")
 
   local -a allfork_args=()
   [ "$ALL_FORKS_AT_FORK_HEIGHT" = "1" ] && allfork_args=(--all-forks-at-height)
