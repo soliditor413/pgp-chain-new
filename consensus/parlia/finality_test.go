@@ -169,3 +169,60 @@ func TestGetFinalizedHeaderUsesParentSnapshotForFastFinalityQuorum(t *testing.T)
 }
 
 var _ consensus.ChainHeaderReader = (*finalizedHeaderChain)(nil)
+
+// TestJustifiedNumberOnLegacyBlocksSkipsTheSnapshot pins the guard that keeps a
+// mainnet sync readable.
+//
+// Before it existed, every header insertion on a chain that had not forked yet
+// asked Parlia for the justified block, which walked a snapshot over PBFT
+// headers. Those carry a producer seal instead of the 32-byte vanity plus
+// 65-byte secp256k1 seal Parlia expects, so the walk always failed -- with
+// "invalid signature recovery id" on an ordinary block and "invalid validators
+// bytes" on an epoch one -- and logged an ERROR per batch for the whole 800k
+// block legacy history. The callers already treat an error as "nothing is
+// justified", so the answer is the same either way; only the wasted walk and the
+// noise are gone.
+func TestJustifiedNumberOnLegacyBlocksSkipsTheSnapshot(t *testing.T) {
+	genesis := &types.Header{Number: big.NewInt(0)}
+	head := &types.Header{Number: big.NewInt(82798), Extra: make([]byte, 32+65)}
+	chain := &finalizedHeaderChain{
+		cfg:      params.PGPChainConfig, // ForkHeight is still the never-fork sentinel
+		current:  head,
+		byHash:   map[common.Hash]*types.Header{genesis.Hash(): genesis, head.Hash(): head},
+		byNumber: map[uint64]*types.Header{0: genesis, 82798: head},
+	}
+	engine := New(params.PGPChainConfig, nil, nil, genesis.Hash())
+
+	number, hash, err := engine.GetJustifiedNumberAndHash(chain, []*types.Header{head})
+	if err != nil {
+		t.Fatalf("a legacy head must not report an error: %v", err)
+	}
+	if number != 0 {
+		t.Fatalf("justified number = %d, want 0", number)
+	}
+	if hash != genesis.Hash() {
+		t.Fatalf("justified hash = %s, want the genesis hash %s", hash, genesis.Hash())
+	}
+
+	// The guard must stop at the fork: once the height is forked the snapshot is
+	// consulted for real, and with a stub that cannot serve it that is an error.
+	forked := *params.PGPChainConfig
+	legacy := *params.PGPChainConfig.Legacy
+	legacy.ForkHeight = 40
+	// A configured fork height demands a validator set, otherwise New refuses to
+	// build the engine at all (the same check that protects mainnet).
+	legacy.ParliaGenesisValidators = []string{"0x0000000000000000000000000000000000000001"}
+	legacy.ParliaGenesisVotingPowers = []uint64{100}
+	legacy.ParliaGenesisCabinets = 1
+	forked.Legacy = &legacy
+	forkedChain := &finalizedHeaderChain{
+		cfg:      &forked,
+		current:  head,
+		byHash:   map[common.Hash]*types.Header{genesis.Hash(): genesis, head.Hash(): head},
+		byNumber: map[uint64]*types.Header{0: genesis, 82798: head},
+	}
+	forkedEngine := New(&forked, nil, nil, genesis.Hash())
+	if _, _, err := forkedEngine.GetJustifiedNumberAndHash(forkedChain, []*types.Header{head}); err == nil {
+		t.Fatal("a forked height must still consult the snapshot, so this stub cannot succeed")
+	}
+}

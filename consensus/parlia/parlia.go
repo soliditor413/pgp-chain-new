@@ -2322,6 +2322,29 @@ func (p *Parlia) GetJustifiedNumberAndHash(chain consensus.ChainHeaderReader, he
 		return 0, common.Hash{}, errors.New("illegal chain or header")
 	}
 	head := headers[len(headers)-1]
+	// A legacy block has no Parlia extra: its header carries a PBFT producer
+	// seal, not the 32-byte vanity plus 65-byte secp256k1 seal Parlia expects,
+	// so the snapshot can only fail -- on the seal recovery for an ordinary
+	// block ("invalid signature recovery id") and on the validator list for an
+	// epoch block ("invalid validators bytes").
+	//
+	// Nothing on a chain that has not forked can be justified by Parlia
+	// finality, and the callers already treat an error as "nothing justified":
+	// core/headerchain.go:GetJustifiedNumber and core/blockchain.go
+	// :GetJustifiedNumber both swallow it and return 0. Answering that directly
+	// skips a snapshot walk that is guaranteed to fail -- which on mainnet is
+	// one failed walk and one ERROR line per inserted batch, for every block of
+	// the 800k-plus legacy history.
+	//
+	// GetFinalizedHeader next to this has the same guard (it checks IsPlato
+	// first); this function was missing it.
+	if p.chainConfig.IsPGPLegacy(head.Number) {
+		genesis := chain.GetHeaderByNumber(0)
+		if genesis == nil {
+			return 0, common.Hash{}, errors.New("genesis header not found")
+		}
+		return 0, genesis.Hash(), nil
+	}
 	snap, err := p.snapshot(chain, head.Number.Uint64(), head.Hash(), headers)
 	if err != nil {
 		log.Error("Unexpected error when getting snapshot",
