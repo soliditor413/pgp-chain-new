@@ -101,6 +101,11 @@ FEYNMAN=${FEYNMAN:-1}
 # 0 = 压在 0（合约版本取最新，历史上一直这么跑）。二者在 legacy 段只有
 # IsNano 黑名单检查这条不受 IsPGPLegacy 兜底，详见 gen-genesis.py 的注释。
 ALL_FORKS_AT_FORK_HEIGHT=${ALL_FORKS_AT_FORK_HEIGHT:-0}
+# legacy 段的手续费分成：ratio% 给 GAS_FEE_RECIPIENT，其余给出块人。
+# ratio=0（默认）时全给 coinbase，等于看不出分成，交易类型测试若要对比
+# 「legacy 分成 vs 分叉后进 SystemAddress」必须显式给非 0。
+GAS_FEE_RECIPIENT=${GAS_FEE_RECIPIENT:-0x0000000000000000000000000000000000000000}
+GAS_FEE_RECIPIENT_RATIO=${GAS_FEE_RECIPIENT_RATIO:-0}
 # 非空 = 把 Cancun/Haber/HaberFix/Bohr/Pascal/Prague/Lorentz/Maxwell/Fermi 全组钉在这个
 # 时间戳（Unix 秒）。这一组不是可选的，开 Fermi 就得全给。留空 = 都不启用。
 BSC_TIME_FORKS=${BSC_TIME_FORKS:-}
@@ -326,6 +331,8 @@ print("\n".join(m["producers"]))
     --validators "$HOME_DIR/validators.conf" \
     --fork-height "$fork_height" \
     --cabinets "$cabinets" \
+    --gas-fee-recipient "$GAS_FEE_RECIPIENT" \
+    --gas-fee-recipient-ratio "$GAS_FEE_RECIPIENT_RATIO" \
     --gas-limit "$GAS_LIMIT" \
     "${deploy_args[@]+"${deploy_args[@]}"}" \
     "${time_args[@]+"${time_args[@]}"}" \
@@ -757,7 +764,7 @@ cmd_start_node() {
   [ -f "$HOME_DIR/devnet.env" ] || die "缺少 $HOME_DIR/devnet.env；先跑 ./multi.sh init"
   local dir
   dir=$(node_dir "$i")
-  [ -f "$dir/validator.addr" ] || die "节点 $i 不存在（$dir）"
+  [ -f "$dir/validator.addr" ] || die "节点 $i 不存在（${dir}）"
   case " $(lock_holders) " in *" node$i "*) die "节点 $i 的 datadir 还被占用" ;; esac
   # shellcheck disable=SC1090
   . "$HOME_DIR/devnet.env"

@@ -11,6 +11,11 @@
 #   ./run.sh delegate I ETH
 #   ./run.sh evidence --height H --node I
 #   ./run.sh status
+#   ./run.sh build               # 预编译 txtypes 工具
+#   ./run.sh phase [--wait W]    # 当前处于 legacy / pre-cancun / post-cancun
+#   ./run.sh gate                # 起链后门槛：出块、8 节点一致、余额就绪
+#   ./run.sh txtypes --type N    # 发一笔指定类型的交易并断言
+#   ./run.sh matrix [--window W] # 5 类型 + 未知类型跑一遍
 #   ./run.sh window             # 距下一个 breathe 边界还剩多少秒/块
 #   ./run.sh check [--deep]     # 自检闸门：election 非空、mining==cabinets、集合一致
 #                              # --deep 再加 8 节点 hash 一致性。非 0 退出 = 不该继续。
@@ -22,7 +27,8 @@ SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 cmd_init() {
   local run=${1:?用法: run.sh init <a|b|c|d>}
-  local seats cab breathe align legacy posa
+  local seats cab breathe align legacy posa fork delay
+  fork=40; delay=0
   case "$run" in
     a) seats=6; cab=6; breathe=300; align=1; legacy=0; posa=0 ;;
     b) seats=6; cab=5; breathe=300; align=1; legacy=0; posa=0 ;;
@@ -30,7 +36,11 @@ cmd_init() {
     d) seats=4; cab=4; breathe=2592000; align=0; legacy=0; posa=0 ;;
     # e: 4 个 legacy 生产者 + 4 个全新的 POSA 验证人（两批人完全不相交）
     e) seats=8; cab=4; breathe=300; align=1; legacy=4; posa=4 ;;
-    *) die "未知 run: $run（可选 a/b/c/d/e）" ;;
+    # f: 交易类型矩阵。F=100 让 legacy 段有 ~300s 可以跑完 W0；
+    #    Cancun..Fermi 排在 T0+600，于是分叉后还有 ~300s 的「未开 Cancun」窗口；
+    #    breathe 拉到 30 天，避免 updateValidatorSetV2 混进测试窗口。
+    f) seats=8; cab=4; breathe=2592000; align=1; legacy=4; posa=4; fork=100; delay=600 ;;
+    *) die "未知 run: ${run}（可选 a/b/c/d/e/f）" ;;
   esac
 
   local ts
@@ -45,6 +55,20 @@ cmd_init() {
   rm -rf "$STAKING_HOME/prep" "$STAKING_HOME/evidence.json"
   echo "$run" > "$STAKING_HOME/run"
 
+  # legacy 段的费率分成：给一个非 0 比例，才能对比「分叉前按比例分给 fee sink」
+  # 与「分叉后整笔进 SystemAddress」。收款地址用最后一个节点，它既不是发送方
+  # 也不是接收方，余额增量好观测。
+  local fee_rcpt="" fee_ratio=0
+  if [ "$run" = f ]; then
+    fee_ratio=65
+    # 固定地址而不是节点地址：init 时 node 目录还没建出来（multi.sh 才建），
+    # 而且这个地址不需要私钥，余额从 0 起算，增量最好观测。
+    fee_rcpt=0x000000000000000000000000000000000000fee5
+  fi
+
+  local tfork=""
+  [ "$delay" -gt 0 ] && tfork=$((ts + delay))
+
   CABINETS=$cab \
   LEGACY_PRODUCERS=$legacy \
   POSA_VALIDATORS=$posa \
@@ -56,11 +80,15 @@ cmd_init() {
   BLS_VOTE=1 \
   BALANCE_WEI=0x21e19e0c9bab2400000 \
   HTTP_API='eth,net,web3,admin,debug' \
-    "$MULTI" init "$seats" 40
+  BSC_TIME_FORKS=$tfork \
+  GAS_FEE_RECIPIENT=${fee_rcpt:-0x0000000000000000000000000000000000000000} \
+  GAS_FEE_RECIPIENT_RATIO=$fee_ratio \
+    "$MULTI" init "$seats" "$fork"
 
   load_env
   echo
-  echo "run=$run  seats=$SEATS_N  cabinets=$CABINETS  breathe=${BREATHE_INTERVAL:-default}  T0=$((ts))"
+  echo "run=$run  seats=$SEATS_N  cabinets=$CABINETS  breathe=${BREATHE_INTERVAL:-default}  T0=$((ts))  fork=$fork"
+  [ -n "$tfork" ] && echo "时间分叉（Cancun..Fermi）TS=$tfork  fee sink=$fee_rcpt ratio=$fee_ratio%"
 }
 
 cmd_prepare() {
@@ -101,7 +129,7 @@ verify_proofs() {
     out=$(cast call "$BLS_PRECOMPILE" \
       "$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["precompileInput"])' "$STAKING_HOME/prep/node$i.json")" \
       --rpc-url "$(rpc_url "$i")")
-    [ "$out" = "0x01" ] || die "节点 $i 的 BLS proof 未通过 0x66（返回 $out）；检查 voteAddress/chainId"
+    [ "$out" = "0x01" ] || die "节点 $i 的 BLS proof 未通过 0x66（返回 ${out}）；检查 voteAddress/chainId"
     echo "node$i 0x66 proof OK"
   done
 }
@@ -223,6 +251,150 @@ cmd_status() {
   expect0 producers "$(( h > 20 ? h - 19 : 1 ))" "$h"
 }
 
+# tx 类型矩阵用的工具：预先编译，避免 W0 窗口被 go run 冷启动吃掉一半时间。
+TXTOOLS=${TXTOOLS:-$REPO_ROOT/build/bin/txtypes}
+
+cmd_build() {
+  ( cd "$REPO_ROOT" && go build -o build/bin/txtypes ./scripts/staking-devnet/txtypes ) || die "编译 txtypes 失败"
+  echo "已编译: $TXTOOLS"
+}
+
+# phase 需要读 genesis 的 chainConfig，显式传路径，不依赖环境里有没有 PGP_STAKING_HOME。
+expect0_phase() {
+  python3 "$SELF_DIR/expect.py" --port "$(node_http 0)" --genesis "$MULTI_HOME/genesis.json" phase
+}
+
+# run.sh phase [--wait legacy|pre-cancun|post-cancun]
+cmd_phase() {
+  load_env
+  local want=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --wait) want=${2:?}; shift 2 ;;
+      *) die "未知参数 $1" ;;
+    esac
+  done
+  local i out cur
+  for ((i = 0; i < 900; i++)); do
+    out=$(expect0_phase 2>/dev/null || true)
+    if [ -z "$out" ]; then cur="starting"; else cur=$(echo "$out" | jsonf 'd["phase"]'); fi
+    if [ -z "$want" ] || [ "$cur" = "$want" ]; then
+      echo "$out"
+      return 0
+    fi
+    sleep 2
+  done
+  die "等待 phase=$want 超时（当前 ${cur}）"
+}
+
+# 起链后、进矩阵前的最低门槛：出块已开始、8 节点一致、发送账户都有余额。
+# 它挡掉的是"链还没起来就发 tx"这类假失败，不是功能性断言。
+cmd_gate() {
+  load_env
+  local h i ports="" low=0
+  # 创世前 RPC 已经在，但 head 还没有块；用 || echo 0 兜住"连接被拒"的阶段。
+  h=$(head 0 2>/dev/null || echo 0)
+  for ((i = 0; h < 2 && i < 180; i++)); do sleep 2; h=$(head 0 2>/dev/null || echo 0); done
+  [ "$h" -ge 2 ] || die "链没有出块（head=${h}）"
+
+  for ((i = 0; i < SEATS_N; i++)); do ports="${ports:+$ports,}$(node_http "$i")"; done
+  local agree
+  agree=$(python3 "$SELF_DIR/expect.py" --port "$(node_http 0)" hashes "$ports" head | jsonf 'd["agree"]')
+  [ "$agree" = "True" ] || die "节点之间 head hash 不一致"
+
+  for i in 0 1 2 3 4 5; do
+    local addr bal
+    addr=$(val_addr "$i")
+    bal=$(python3 "$SELF_DIR/expect.py" --port "$(node_http 0)" balance "$addr" | jsonf 'd["eth"]')
+    printf '  node%d %s 余额 %s ETH\n' "$i" "${addr:0:10}.." "$bal"
+    awk -v b="$bal" 'BEGIN{exit !(b < 1)}' && low=1
+  done
+  [ "$low" = 0 ] || die "有账户余额低于 1 ETH"
+  echo "gate 通过: head=${h}（8 节点一致，账户余额就绪）"
+}
+
+# 一个交易类型固定用一个账户：delegated 账户有在途限制，混用会互相踩。
+tx_node() {
+  case "$1" in
+    0) echo 0 ;;
+    1) echo 1 ;;
+    2) echo 2 ;;
+    3) echo 4 ;;
+    4) echo 3 ;;
+    *) echo 0 ;;
+  esac
+}
+
+# run.sh txtypes --type N [工具自己的参数...]
+cmd_txtypes() {
+  load_env
+  [ -x "$TXTOOLS" ] || die "缺少 ${TXTOOLS}；先跑 ./run.sh build"
+  local ty="" nodenv=""
+  local -a args=()
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --type) ty=${2:?}; shift 2 ;;
+      --node) nodenv=${2:?}; shift 2 ;;
+      *) args+=("$1"); shift ;;
+    esac
+  done
+  [ -n "$ty" ] || die "用法: run.sh txtypes --type 0..5 [--node I] [--tip ... --expect ...]"
+
+  local node from to
+  node=${nodenv:-$(tx_node "$ty")}
+  from=$(val_addr "$node")
+  to=$(val_addr 5)
+
+  "$TXTOOLS" \
+    --genesis "$MULTI_HOME/genesis.json" \
+    --rpc "$(rpc_url "$node")" \
+    --keystore "$(node_dir "$node")/keystore" \
+    --password-file "$(node_dir "$node")/password.txt" \
+    --from "$from" --to "$to" --type "$ty" \
+    "${args[@]+"${args[@]}"}"
+}
+
+# run.sh matrix [--window legacy|pre-cancun|post-cancun]
+# 期望值由工具按 genesis chainConfig 推导，这里只负责挑类型、串联、归档。
+cmd_matrix() {
+  load_env
+  local window=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --window) window=${2:?}; shift 2 ;;
+      *) die "未知参数 $1" ;;
+    esac
+  done
+
+  local dir="$STAKING_HOME/txtypes"
+  mkdir -p "$dir"
+  local file="$dir/results.jsonl"
+  local fail=0 pass=0 skipped=0 ty out rc
+
+  echo "== 交易类型矩阵 window=${window:-auto} =="
+  for ty in 0 1 2 3 4 5; do
+    local extra=()
+    [ "$ty" = "3" ] && extra+=(--timeout 300s)
+    # setcode 的委托目标：BSCValidatorSet（D 块起有代码），委托后 getCode 会是
+    # 0xef0100‖0x…1000，能直接比对。
+    [ "$ty" = "4" ] && extra+=(--delegate 0x0000000000000000000000000000000000001000)
+    rc=0
+    out=$("$TXTOOLS" \
+      --genesis "$MULTI_HOME/genesis.json" \
+      --rpc "$(rpc_url "$(tx_node "$ty")")" \
+      --keystore "$(node_dir "$(tx_node "$ty")")/keystore" \
+      --password-file "$(node_dir "$(tx_node "$ty")")/password.txt" \
+      --from "$(val_addr "$(tx_node "$ty")")" \
+      --to "$(val_addr 5)" --type "$ty" \
+      "${extra[@]+"${extra[@]}"}" 2>&1) || rc=$?
+    echo "$out" >> "$file"
+    printf '  type %s: %s\n' "$ty" "$(echo "$out" | jsonf 'd.get("outcome","?") + " expect=" + d.get("expect","?") + " phase=" + d.get("phase","?")' 2>/dev/null || echo '解析失败')"
+    if [ $rc -eq 0 ]; then pass=$((pass + 1)); else fail=$((fail + 1)); fi
+  done
+  echo "结果: pass=$pass fail=$fail  （明细 ${file}）"
+  [ $fail -eq 0 ] || return 1
+}
+
 # 距下一个 breathe 边界的剩余窗口。分叉后、第一个 breathe 块之前，这就是
 # "还能补救的时间"——超过它而 StakeHub 仍为空，链就停在那个块上（报告 §8）。
 cmd_window() {
@@ -333,6 +505,11 @@ case "${1:-}" in
   evidence)   shift; cmd_evidence "$@" ;;
   status)     shift; cmd_status "$@" ;;
   window)     shift; cmd_window "$@" ;;
+  build)      shift; cmd_build "$@" ;;
+  phase)      shift; cmd_phase "$@" ;;
+  gate)       shift; cmd_gate "$@" ;;
+  txtypes)    shift; cmd_txtypes "$@" ;;
+  matrix)     shift; cmd_matrix "$@" ;;
   check)      shift; cmd_check "$@" ;;
   *)
     sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'

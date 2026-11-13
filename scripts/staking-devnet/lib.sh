@@ -70,7 +70,7 @@ wait_head() {
       return 0
     fi
     if [ $(( $(date +%s) - t0 )) -gt 1800 ]; then
-      die "等待 head>=$target 超时（当前 $h），看 $MULTI_HOME/logs/node$node.log"
+      die "等待 head>=$target 超时（当前 ${h}），看 $MULTI_HOME/logs/node$node.log"
     fi
     sleep 5
   done
