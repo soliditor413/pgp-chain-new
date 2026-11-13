@@ -11,6 +11,7 @@ made against `latest` (a devnet is not an archive node, so historical
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 import urllib.request
@@ -92,6 +93,10 @@ def cmd_block(a):
     b = block(a.port, a.number)
     if b is None:
         raise SystemExit(f"block {a.number} not found")
+    def _int(key):
+        v = b.get(key)
+        return int(v, 16) if isinstance(v, str) else None
+
     print(json.dumps({
         "number": int(b["number"], 16),
         "hash": b["hash"].lower(),
@@ -100,6 +105,12 @@ def cmd_block(a):
         "extraLen": (len(b["extraData"]) - 2) // 2,
         "gasUsed": int(b["gasUsed"], 16),
         "txs": len(b.get("transactions") or []),
+        # Cancun 之后这些字段才出现；缺失即 None，用来断言分叉前后 header 形态
+        "baseFeePerGas": _int("baseFeePerGas"),
+        "blobGasUsed": _int("blobGasUsed"),
+        "excessBlobGas": _int("excessBlobGas"),
+        "hasParentBeaconRoot": "parentBeaconBlockRoot" in b,
+        "hasRequestsHash": "requestsHash" in b,
     }))
 
 
@@ -270,6 +281,108 @@ def cmd_window(a):
     }))
 
 
+def cmd_receipt(a):
+    """Receipt as JSON. found=false instead of an error, so a caller can poll."""
+    r = rpc(a.port, "eth_getTransactionReceipt", [a.hash])
+    if not r:
+        print(json.dumps({"found": False, "hash": a.hash.lower()}))
+        return
+
+    def n(key):
+        v = r.get(key)
+        return int(v, 16) if isinstance(v, str) else None
+
+    out = {
+        "found": True,
+        "hash": r["transactionHash"].lower(),
+        "status": n("status"),
+        # type 缺失视为 0（legacy）
+        "type": n("type") or 0,
+        "blockNumber": n("blockNumber"),
+        "blockHash": (r.get("blockHash") or "").lower(),
+        "gasUsed": n("gasUsed"),
+        "cumulativeGasUsed": n("cumulativeGasUsed"),
+        "from": (r.get("from") or "").lower(),
+        "to": (r.get("to") or "").lower(),
+        "effectiveGasPrice": n("effectiveGasPrice"),
+    }
+    if r.get("blobGasUsed") is not None:
+        out["blobGasUsed"] = n("blobGasUsed")
+        out["blobGasPrice"] = n("blobGasPrice")
+    if r.get("contractAddress"):
+        out["contractAddress"] = r["contractAddress"].lower()
+    print(json.dumps(out))
+
+
+def cmd_tx(a):
+    """Transaction lookup. blockNumber=null means it is still in the pool."""
+    t = rpc(a.port, "eth_getTransactionByHash", [a.hash])
+    if not t:
+        print(json.dumps({"found": False, "hash": a.hash.lower()}))
+        return
+    print(json.dumps({
+        "found": True,
+        "hash": t["hash"].lower(),
+        "type": int(t["type"], 16) if t.get("type") else 0,
+        "nonce": int(t["nonce"], 16),
+        "from": (t.get("from") or "").lower(),
+        "blockNumber": int(t["blockNumber"], 16) if t.get("blockNumber") else None,
+        "gasPrice": int(t["gasPrice"], 16) if t.get("gasPrice") else None,
+    }))
+
+
+def cmd_delegation(a):
+    """EIP-7702 delegation marker: 0xef0100 || address (23 bytes)."""
+    code = rpc(a.port, "eth_getCode", [a.addr, "latest"]) or "0x"
+    raw = code[2:]
+    is_del = len(raw) == 46 and raw.startswith("ef0100")
+    print(json.dumps({
+        "addr": a.addr.lower(),
+        "code": code,
+        "bytes": len(raw) // 2,
+        "isDelegation": is_del,
+        "delegate": ("0x" + raw[6:]) if is_del else None,
+    }))
+
+
+def cmd_phase(a):
+    """Which window the head is in, derived from the genesis chain config.
+
+    Deriving it here (rather than hardcoding heights per window) keeps the
+    expectation and the object under test reading the same source: the fork is
+    defined by head.Time, and 450ms blocks make height<->time non-linear.
+    """
+    with open(a.genesis) as f:
+        g = json.load(f)
+    cfg = g.get("config") or {}
+    legacy = cfg.get("legacy") or {}
+    fork = legacy.get("forkHeight")
+    cancun = cfg.get("cancunTime")
+    prague = cfg.get("pragueTime")
+
+    h = head(a.port)
+    b = block(a.port, h)
+    ts = int(b["timestamp"], 16)
+
+    if fork is None or h < fork:
+        phase = "legacy"
+    elif cancun is not None and ts < cancun:
+        phase = "pre-cancun"
+    else:
+        phase = "post-cancun"
+
+    print(json.dumps({
+        "head": h,
+        "headTs": ts,
+        "forkHeight": fork,
+        "cancunTime": cancun,
+        "pragueTime": prague,
+        "phase": phase,
+        "usCancun": (cancun - ts) if cancun is not None else None,
+        "usPrague": (prague - ts) if prague is not None else None,
+    }))
+
+
 def cmd_txscan(a):
     """Find txs in a block paying `to` with a given 4-byte selector."""
     b = rpc(a.port, "eth_getBlockByNumber", [hex(a.number), True])
@@ -288,6 +401,10 @@ def cmd_txscan(a):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=18560)
+    # phase 需要一个 chainConfig 来源；默认指向当前 run 的 genesis。
+    ap.add_argument("--genesis",
+                    default=os.path.join(os.environ.get("PGP_STAKING_HOME", "."), "net", "genesis.json"),
+                    help="genesis.json（phase 用它读 forkHeight/cancunTime/pragueTime）")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("head").set_defaults(fn=cmd_head)
@@ -328,6 +445,11 @@ def main():
     p.add_argument("--interval", type=int, required=True, help="breathe 间隔（秒）")
     p.add_argument("--sample", type=int, default=20, help="用最近多少个块估算块间隔")
     p.set_defaults(fn=cmd_window)
+
+    p = sub.add_parser("receipt"); p.add_argument("hash"); p.set_defaults(fn=cmd_receipt)
+    p = sub.add_parser("tx"); p.add_argument("hash"); p.set_defaults(fn=cmd_tx)
+    p = sub.add_parser("delegation"); p.add_argument("addr"); p.set_defaults(fn=cmd_delegation)
+    p = sub.add_parser("phase"); p.set_defaults(fn=cmd_phase)
 
     p = sub.add_parser("txscan")
     p.add_argument("number", type=int)
