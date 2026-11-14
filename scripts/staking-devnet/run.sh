@@ -148,8 +148,13 @@ cmd_start() {
   cp "$MULTI" "$snap"
   # 快照换了位置，multi.sh 内部由 SELF_DIR 推出的 REPO_ROOT 就不再指向仓库，
   # 那两个由它推导的二进制路径必须显式传进去（PGP_PARLIA_MULTI_HOME 已在 lib.sh 导出）。
+  #
+  # exec 而不是普通调用：只有替换掉当前进程，run.sh 自己才不会在链结束（子进程
+  # 退出）之后回过头来继续读自己被改写的文件。实测代价：链已经跑了 2.5 小时、
+  # 17993 个块，stop 之后外层报 "run.sh: line 514: syntax error near unexpected
+  # token `;;'" 并以 exit 2 收场——链没事，报错来自外壳。
   GETH_BIN="$GETH_BIN" BOOTNODE_BIN="$BOOTNODE_BIN" SEED_PEERS_PY="$SEED_PEERS_PY" \
-    KEEPALIVE=1 bash "$snap" start
+    KEEPALIVE=1 exec bash "$snap" start
 }
 
 cmd_stop() { "$MULTI" stop; }
