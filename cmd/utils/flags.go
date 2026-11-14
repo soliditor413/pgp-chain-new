@@ -162,8 +162,8 @@ var (
 	}
 	BSCMainnetFlag = &cli.BoolFlag{
 		Name:     "mainnet",
+		Aliases:  []string{"bsc", "pgp"},
 		Usage:    "PGP mainnet",
-		Value:    true,
 		Category: flags.EthCategory,
 	}
 	// SpvArbiterHeightFlag is pgp-chain's --spv.arbiter.height
@@ -2715,6 +2715,33 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 	}
 	// Override any default configs for hard coded networks.
 	switch {
+	case ctx.Bool(BSCMainnetFlag.Name):
+		if !ctx.IsSet(NetworkIdFlag.Name) {
+			cfg.NetworkId = params.PGPChainConfig.ChainID.Uint64()
+		}
+		cfg.Genesis = core.DefaultPGPGenesisBlock()
+		// The genesis carries params.PGPChainConfig itself, so this write lands
+		// on the config NewBlockChain is about to persist. Doing it here rather
+		// than after start-up is the same ordering pgp-chain uses
+		// (pgp-chain/eth/backend.go:227-229 runs before SetupGenesisBlock), and
+		// it means a fresh datadir records the operator's value instead of
+		// silently falling back to the literal in params.
+		//
+		// An existing datadir keeps whatever it recorded; params
+		// .ChainConfig.DynamicArbiterHeight covers the case where that is
+		// nothing at all.
+		if ctx.IsSet(SpvArbiterHeightFlag.Name) {
+			if legacy := cfg.Genesis.Config.Legacy; legacy != nil {
+				legacy.DynamicArbiterHeight = ctx.Uint64(SpvArbiterHeightFlag.Name)
+			}
+		}
+		// pgp-chain has no DNS discovery tree yet, so this is a no-op until one
+		// is added to params/dnsdisc. It is kept so that the mainnet preset
+		// behaves the same way as the other built-in networks.
+		SetDNSDiscoveryDefaults(cfg, params.PGPGenesisHash)
+		log.Info("Using pgp-chain mainnet preset",
+			"networkid", cfg.NetworkId, "genesis", cfg.Genesis.ToBlock().Hash(),
+			"spvArbiterHeight", cfg.Genesis.Config.DynamicArbiterHeight())
 	case ctx.Bool(ChapelFlag.Name) || cfg.NetworkId == 12345:
 		if !ctx.IsSet(NetworkIdFlag.Name) {
 			cfg.NetworkId = 12345
@@ -2821,54 +2848,6 @@ func SetEthConfig(ctx *cli.Context, stack *node.Node, cfg *ethconfig.Config) {
 			Fatalf("Invalid genesis file: %v", err)
 		}
 		cfg.Genesis = genesis
-	// The pgp mainnet preset is the fallback, not the first arm: BSCMainnetFlag
-	// carries Value: true upstream, so ctx.Bool on it is true even when the
-	// operator asked for --chapel, --dev or --override.genesis, and as the first
-	// arm it silently swallowed every other preset. Keeping the flag's value
-	// preserves "no flag at all means mainnet"; keeping the arm last is what
-	// makes the other presets reachable.
-	case ctx.Bool(BSCMainnetFlag.Name):
-		if !ctx.IsSet(NetworkIdFlag.Name) {
-			cfg.NetworkId = params.PGPChainConfig.ChainID.Uint64()
-		}
-		// The genesis is materialised only when there is something to change on
-		// it. A nil cfg.Genesis makes SetupGenesisBlock use the genesis already in
-		// the datadir and fall back to DefaultPGPGenesisBlock for an empty one
-		// (core/genesis.go:378-382), which is what a datadir written by
-		// `geth init` or --override.genesis needs. Assigning the compiled default
-		// unconditionally rejected those datadirs with "database contains
-		// incompatible genesis".
-		var genesis *core.Genesis
-		spvHeightSet := ctx.IsSet(SpvArbiterHeightFlag.Name)
-		if spvHeightSet {
-			genesis = core.DefaultPGPGenesisBlock()
-			// The genesis carries params.PGPChainConfig itself, so this write lands
-			// on the config NewBlockChain is about to persist. Doing it here rather
-			// than after start-up is the same ordering pgp-chain uses
-			// (pgp-chain/eth/backend.go:227-229 runs before SetupGenesisBlock), and
-			// it means a fresh datadir records the operator's value instead of
-			// silently falling back to the literal in params.
-			//
-			// An existing datadir keeps whatever it recorded; params
-			// .ChainConfig.DynamicArbiterHeight covers the case where that is
-			// nothing at all.
-			if legacy := genesis.Config.Legacy; legacy != nil {
-				legacy.DynamicArbiterHeight = ctx.Uint64(SpvArbiterHeightFlag.Name)
-			}
-			cfg.Genesis = genesis
-		}
-		// pgp-chain has no DNS discovery tree yet, so this is a no-op until one
-		// is added to params/dnsdisc. It is kept so that the mainnet preset
-		// behaves the same way as the other built-in networks.
-		SetDNSDiscoveryDefaults(cfg, params.PGPGenesisHash)
-		if genesis != nil {
-			log.Info("Using pgp-chain mainnet preset",
-				"networkid", cfg.NetworkId, "genesis", genesis.ToBlock().Hash(),
-				"spvArbiterHeight", genesis.Config.DynamicArbiterHeight())
-		} else {
-			log.Info("Using pgp-chain mainnet preset",
-				"networkid", cfg.NetworkId, "genesis", "from datadir, or the built-in default if empty")
-		}
 	default:
 		if ctx.Uint64(NetworkIdFlag.Name) == 1 {
 			SetDNSDiscoveryDefaults(cfg, params.MainnetGenesisHash)
@@ -3237,20 +3216,13 @@ func DialRPCWithHeaders(endpoint string, headers []string) (*rpc.Client, error) 
 
 func MakeGenesis(ctx *cli.Context) *core.Genesis {
 	var genesis *core.Genesis
-	// BSCMainnetFlag carries Value: true so that "no preset flag at all" means
-	// mainnet. That makes ctx.Bool unreliable as a selector here: it is true even
-	// when the operator asked for another preset or for none at all, and a caller
-	// that gets a genesis back is a caller that will not read the datadir's.
-	// ctx.IsSet is the "the user actually asked for this" test; without it,
-	// `geth export` on a datadir whose genesis came from `geth init` failed with
-	// "database contains incompatible genesis".
 	switch {
+	case ctx.Bool(BSCMainnetFlag.Name):
+		genesis = core.DefaultPGPGenesisBlock()
 	case ctx.Bool(ChapelFlag.Name):
 		genesis = core.DefaultChapelGenesisBlock()
 	case ctx.Bool(DeveloperFlag.Name):
 		Fatalf("Developer chains are ephemeral")
-	case ctx.IsSet(BSCMainnetFlag.Name):
-		genesis = core.DefaultPGPGenesisBlock()
 	}
 	return genesis
 }
