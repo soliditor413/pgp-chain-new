@@ -21,6 +21,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/p2p"
@@ -28,15 +29,24 @@ import (
 	"github.com/ethereum/go-ethereum/rpc"
 )
 
+// The listening ports mirror pgp-chain's defaults, which is what operators of the
+// existing network have in their runbooks: 20675 websocket, 20676 HTTP, 20678
+// P2P, 20679 the PBFT network (see PbftNetPortFlag). Upstream geth's 8545/8546/
+// 30303 would collide with whatever else runs on a host that already carries an
+// ELA node, which is exactly the deployment shape here.
+//
+// The authenticated Engine API (8551) has no pgp-chain counterpart - that port
+// arrived with the merge-era geth this fork is based on - so it keeps its
+// upstream value rather than inventing a number in the 2067x series.
 const (
 	DefaultHTTPHost   = "localhost" // Default host interface for the HTTP RPC server
-	DefaultHTTPPort   = 8545        // Default TCP port for the HTTP RPC server
+	DefaultHTTPPort   = 20676       // Default TCP port for the HTTP RPC server
 	DefaultWSHost     = "localhost" // Default host interface for the websocket RPC server
-	DefaultWSPort     = 8546        // Default TCP port for the websocket RPC server
+	DefaultWSPort     = 20675       // Default TCP port for the websocket RPC server
 	DefaultAuthHost   = "localhost" // Default host interface for the authenticated apis
 	DefaultAuthPort   = 8551        // Default port for the authenticated apis
-	DefaultListenPort = 30303       // Default port for the TCP listening address
-	DefaultDiscPort   = 30303       // Default port for the UDP discovery address
+	DefaultListenPort = 20678       // Default port for the TCP listening address
+	DefaultDiscPort   = 20678       // Default port for the UDP discovery address
 )
 
 const (
@@ -72,7 +82,10 @@ var DefaultConfig = Config{
 	BatchResponseMaxSize: 25 * 1000 * 1000,
 	GraphQLVirtualHosts:  []string{"localhost"},
 	P2P: p2p.Config{
-		ListenAddr:    ":30303",
+		// Built from the constant rather than spelled out: the two used to be
+		// separate literals, so changing one left the effective default on the old
+		// port and no test noticed.
+		ListenAddr:    ":" + strconv.Itoa(DefaultListenPort),
 		MaxPeers:      50,
 		MaxPeersPerIP: 0, // by default, it will be same as MaxPeers
 		NAT:           nat.Any(),
@@ -94,19 +107,19 @@ func DefaultDataDir() string {
 	if home != "" {
 		switch runtime.GOOS {
 		case "darwin":
-			return filepath.Join(home, "Library", "Ethereum")
+			return filepath.Join(home, "Library", "PGP_Ethereum")
 		case "windows":
 			// We used to put everything in %HOME%\AppData\Roaming, but this caused
 			// problems with non-typical setups. If this fallback location exists and
 			// is non-empty, use it, otherwise DTRT and check %LOCALAPPDATA%.
-			fallback := filepath.Join(home, "AppData", "Roaming", "Ethereum")
+			fallback := filepath.Join(home, "AppData", "Roaming", "PGP_Ethereum")
 			appdata := windowsAppData()
 			if appdata == "" || common.IsNonEmptyDir(fallback) {
 				return fallback
 			}
-			return filepath.Join(appdata, "Ethereum")
+			return filepath.Join(appdata, "PGP_Ethereum")
 		default:
-			return filepath.Join(home, ".ethereum")
+			return filepath.Join(home, ".PGP_Ethereum")
 		}
 	}
 	// As we cannot guess a stable location, return empty and handle later
