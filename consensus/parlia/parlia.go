@@ -1143,10 +1143,46 @@ func (p *Parlia) prepareTurnLength(chain consensus.ChainHeaderReader, header *ty
 	return nil
 }
 
+// minAttestationBlockNumber is the first block number that may carry a vote
+// attestation.
+//
+// Two floors apply and the higher one wins:
+//
+//   - 3, inherited from BSC. The first two blocks have no ancestor chain worth
+//     voting on, and the assembly below calls snapshot(number-1), which for block
+//     1 would underflow and for block 2 would land on a genesis header that is not
+//     a Parlia header at all.
+//   - ForkHeight+1 on a chain with a legacy era. The first Parlia block's parent
+//     is a legacy block, so assembly there asks snapshot() for ForkHeight-2 - one
+//     block *below* the anchor at ForkHeight-1. The anchor is matched by exact
+//     number (snapshot(), "number == anchor"), so that walk does not stop at the
+//     anchor; it continues down to the genesis, where parseValidators meets a
+//     PBFT header and fails. That error would reject the first post-fork block,
+//     so attestation starts one block later, where the parent is already Parlia
+//     and snapshot(ForkHeight-1) is the anchor itself.
+//
+// Legacy is nil on every chain without a legacy section (BSC mainnet, chapel);
+// reading Legacy.ForkHeight without this check panics in exactly the chains that
+// enable Luban but never had a legacy era.
+func (p *Parlia) minAttestationBlockNumber() uint64 {
+	const upstreamFloor = 3
+	legacy := p.chainConfig.Legacy
+	if legacy == nil || legacy.ForkHeight == 0 || legacy.ForkHeight == math.MaxUint64 {
+		return upstreamFloor
+	}
+	if floor := legacy.ForkHeight + 1; floor > upstreamFloor {
+		return floor
+	}
+	return upstreamFloor
+}
+
 // assembleVoteAttestation collects votes and assembles the vote attestation into the block header.
 func (p *Parlia) assembleVoteAttestation(chain consensus.ChainHeaderReader, header *types.Header) error {
 	// === Step 1: Preconditions ===
-	if !p.chainConfig.IsLuban(header.Number) || header.Number.Uint64() < 3 || p.VotePool == nil {
+	if !p.chainConfig.IsLuban(header.Number) || p.VotePool == nil {
+		return nil
+	}
+	if header.Number.Uint64() < p.minAttestationBlockNumber() {
 		return nil
 	}
 
