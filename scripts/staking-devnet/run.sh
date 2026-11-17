@@ -27,8 +27,8 @@ SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 
 cmd_init() {
   local run=${1:?用法: run.sh init <a|b|c|d>}
-  local seats cab breathe align legacy posa fork delay
-  fork=40; delay=0
+  local seats cab breathe align legacy posa fork delay dep
+  fork=40; delay=0; dep=20
   case "$run" in
     a) seats=6; cab=6; breathe=300; align=1; legacy=0; posa=0 ;;
     b) seats=6; cab=5; breathe=300; align=1; legacy=0; posa=0 ;;
@@ -42,6 +42,13 @@ cmd_init() {
     f) seats=8; cab=4; breathe=2592000; align=1; legacy=4; posa=4; fork=100; delay=600 ;;
     *) die "未知 run: ${run}（可选 a/b/c/d/e/f）" ;;
   esac
+
+  # FORK_OVERRIDE 用于边界实验（例如 F=4 的最小 legacy 段）。
+  # D 必须满足 2 <= D <= F-2，否则 gen-genesis 直接拒。
+  if [ -n "${FORK_OVERRIDE:-}" ]; then
+    fork=$FORK_OVERRIDE
+    [ "$fork" -lt 22 ] && dep=$((fork - 2))
+  fi
 
   local ts
   if [ "$align" = 1 ]; then
@@ -75,7 +82,7 @@ cmd_init() {
   FEYNMAN=1 \
   GENESIS_TIMESTAMP=$ts \
   BREATHE_INTERVAL=$breathe \
-  DEPLOY_HEIGHT=20 \
+  DEPLOY_HEIGHT=$dep \
   OMIT_SYSTEM_ALLOC=1 \
   BLS_VOTE=1 \
   BALANCE_WEI=0x21e19e0c9bab2400000 \
