@@ -1775,6 +1775,17 @@ func (p *Parlia) finalizeAndAssemble(chain consensus.ChainHeaderReader, header *
 
 func (p *Parlia) IsActiveValidatorAt(chain consensus.ChainHeaderReader, header *types.Header, checkVoteKeyFn func(bLSPublicKey *types.BLSPublicKey) bool) bool {
 	number := header.Number.Uint64()
+	// A legacy block has no Parlia validator set to consult, and there is
+	// nothing to vote on before the fork either. Answering without a lookup also
+	// avoids one: number-1 sits below the anchor at ForkHeight-1, and the anchor
+	// is matched by exact number, so snapshot() would walk past it into the
+	// legacy genesis and fail on the PBFT extra data. The vote manager asks this
+	// on a timer with whatever the head currently is, so on a chain with a long
+	// legacy era that walk ran -- and logged an error -- every few seconds until
+	// the fork.
+	if p.chainConfig.IsPGPLegacy(header.Number) {
+		return false
+	}
 	snap, err := p.snapshot(chain, number-1, header.ParentHash, nil)
 	if err != nil {
 		log.Error("failed to get the snapshot from consensus", "error", err)
@@ -1798,6 +1809,12 @@ func (p *Parlia) VerifyVote(chain consensus.ChainHeaderReader, vote *types.VoteE
 	if header.Number.Uint64() != targetNumber {
 		log.Warn("unexpected target number", "expect", header.Number.Uint64(), "real", targetNumber)
 		return errors.New("target number mismatch")
+	}
+	// A vote can only target a Parlia block. Rejecting a legacy target here also
+	// keeps the snapshot lookup below from asking for targetNumber-1, which is
+	// below the anchor at ForkHeight-1 and would walk into the legacy genesis.
+	if p.chainConfig.IsPGPLegacy(header.Number) {
+		return errors.New("vote targets a pre-fork block")
 	}
 
 	justifiedBlockNumber, justifiedBlockHash, err := p.GetJustifiedNumberAndHash(chain, []*types.Header{header})
