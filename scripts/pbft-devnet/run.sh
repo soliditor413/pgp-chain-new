@@ -221,9 +221,9 @@ cmd_init() {
     local password
     password=$(devnet_password)
 
-    if [ -e "$DATA_DIR/geth" ]; then
+    if [ -e "$DATA_DIR/pgp" ]; then
         die "datadir $DATA_DIR already holds a chain. Use './run.sh clean' first:
-  a new producer set changes the genesis hash, and geth refuses to init a
+  a new producer set changes the genesis hash, and pgp refuses to init a
   datadir whose stored genesis differs (GenesisMismatchError)."
     fi
 
@@ -311,7 +311,7 @@ PY
 # environment wiring would otherwise start as a silent verifier.
 cmd_start() {
     [ -f "$GENESIS" ] || die "no genesis at $GENESIS: run './run.sh init' first"
-    [ -d "$DATA_DIR/geth" ] || die "datadir $DATA_DIR is empty: run './run.sh init' first"
+    [ -d "$DATA_DIR/pgp" ] || die "datadir $DATA_DIR is empty: run './run.sh init' first"
     is_running && die "a devnet node is already running (pid $(pid_of)); './run.sh stop' first"
     ensure_geth
     mkdir -p "$LOG_DIR"
@@ -362,7 +362,7 @@ cmd_start() {
 }
 
 cmd_start_follower() {
-    [ -d "$DATA_DIR/geth" ] || die "datadir $DATA_DIR is empty: run './run.sh init' first"
+    [ -d "$DATA_DIR/pgp" ] || die "datadir $DATA_DIR is empty: run './run.sh init' first"
     is_running && die "a devnet node is already running (pid $(pid_of)); './run.sh stop' first"
     ensure_geth
     mkdir -p "$LOG_DIR"

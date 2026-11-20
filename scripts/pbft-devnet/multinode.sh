@@ -233,9 +233,9 @@ cmd_init() {
 
     local i
     for ((i = 0; i < NODES; i++)); do
-        if [ -e "$(node_dir "$i")/geth" ]; then
+        if [ -e "$(node_dir "$i")/pgp" ]; then
             die "datadir $(node_dir "$i") already holds a chain. './multinode.sh clean' first:
-  the producer set determines the genesis hash, and geth refuses to init a
+  the producer set determines the genesis hash, and pgp refuses to init a
   datadir whose stored genesis differs (GenesisMismatchError)."
         fi
     done

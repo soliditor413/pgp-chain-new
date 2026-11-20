@@ -47,7 +47,7 @@ addressing.
 
 WHAT IT WRITES
 
-    <datadir>/geth/network/dpos/peers.json      (mode 0600)
+    <datadir>/pgp/network/dpos/peers.json      (mode 0600)
 
     {
       "Addresses": [
@@ -61,9 +61,10 @@ and not base64: dpos/p2p's addrmgr decodes peer.PID as a [33]byte, so a hex
 string fails to unmarshal. Addr is where THAT producer listens on
 --pbft.net.port, which is a different port from devp2p --port.
 
-The DPoS data dir is <datadir>/geth/network/dpos because eth/backend.go sets
-Config.Pbft.DataDir = stack.ResolvePath("network/dpos") and geth resolves
-relative paths under <datadir>/geth.
+The DPoS data dir is <datadir>/pgp/network/dpos because eth/backend.go sets
+Config.Pbft.DataDir = stack.ResolvePath("network/dpos"), and ResolvePath resolves
+relative paths under the instance dir - <datadir>/<clientIdentifier>, which is
+<datadir>/pgp now that cmd/geth/main.go declares pgp as the client identifier.
 
 USAGE
 
@@ -357,7 +358,7 @@ def main():
         if not os.path.isdir(n["datadir"]):
             die("node %d: datadir %s does not exist" % (i, n["datadir"]))
 
-        target_dir = os.path.join(n["datadir"], "geth", "network", "dpos")
+        target_dir = os.path.join(n["datadir"], "pgp", "network", "dpos")
         target = os.path.join(target_dir, "peers.json")
 
         addrs = []
@@ -385,9 +386,9 @@ def main():
             print("    SKIP: exists (use --force to replace)")
             continue
         if not os.path.isdir(os.path.dirname(target_dir)):
-            # <datadir>/geth is created by `geth init`; if it is missing the
+            # <datadir>/pgp is created by `pgp init`; if it is missing the
             # datadir is wrong, not merely empty.
-            warn("%s has no geth/ subdir -- is the datadir right? creating it anyway"
+            warn("%s has no pgp/ subdir -- is the datadir right? creating it anyway"
                  % n["datadir"])
         os.makedirs(target_dir, mode=0o700, exist_ok=True)
         with open(target, "w") as f:

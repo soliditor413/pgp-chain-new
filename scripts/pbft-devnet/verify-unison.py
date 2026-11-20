@@ -1747,12 +1747,12 @@ def build_specs(args: argparse.Namespace) -> List[NodeSpec]:
     for i, dd in enumerate(datadirs):
         dd = os.path.abspath(os.path.expanduser(dd))
         name = names[i]
-        geth = args.geth or os.path.join(os.path.dirname(dd.rstrip("/")), "geth")
+        geth = args.geth or os.path.join(os.path.dirname(dd.rstrip("/")), "pgp")
         if not os.path.exists(geth):
-            found = shutil.which("geth")
+            found = shutil.which("pgp")
             geth = found or ""
 
-        ipc = args.ipc or os.path.join(dd, "geth.ipc")
+        ipc = args.ipc or os.path.join(dd, "pgp.ipc")
 
         # 日志：优先级 --log 覆盖 > --log-dir > <datadir>/../logs/geth.log
         if name in log_overrides:
@@ -1791,7 +1791,8 @@ def main(argv: Sequence[str]) -> int:
     ap.add_argument("--datadirs", help="逗号分隔的 datadir 列表（--selftest 时可省略）")
     ap.add_argument("--rpc", help="逗号分隔的 HTTP RPC 端口（与 --datadirs 一一对应，可省略）")
     ap.add_argument("--names", help="逗号分隔的节点名，默认 node0,node1,...")
-    ap.add_argument("--geth", help="geth 可执行文件路径，默认 <datadir>/../geth")
+    ap.add_argument("--geth", "--pgp", dest="geth",
+                    help="客户端可执行文件路径，默认 <datadir>/../pgp；--geth 是旧名，保留作别名")
     ap.add_argument("--ipc", help="统一覆盖 IPC 路径（单节点时方便）")
     ap.add_argument("--log-dir", help="从该目录找 <name>-geth.log / <name>/logs/geth.log")
     ap.add_argument("--log", action="append", metavar="NAME=PATH", help="逐台覆盖日志路径，可重复")
