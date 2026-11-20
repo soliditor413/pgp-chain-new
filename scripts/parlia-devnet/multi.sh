@@ -43,7 +43,7 @@ SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SELF_DIR/../.." && pwd)
 CONTRACT_ROOT=${CONTRACT_ROOT:-$REPO_ROOT/../bsc-genesis-contract}
 
-GETH_BIN=${GETH_BIN:-$REPO_ROOT/build/bin/geth}
+GETH_BIN=${GETH_BIN:-$REPO_ROOT/build/bin/pgp}
 HOME_DIR=${PGP_PARLIA_MULTI_HOME:-$HOME/.pgp-parlia-multi}
 GENESIS=$HOME_DIR/genesis.json
 LOG_DIR=$HOME_DIR/logs
@@ -125,7 +125,7 @@ SEED_PEERS_PY=${SEED_PEERS_PY:-$REPO_ROOT/scripts/pbft-devnet/seed-peers.py}
 mkdir -p "$LOG_DIR"
 
 die() { echo "错误: $*" >&2; exit 1; }
-need_bin() { [ -x "$GETH_BIN" ] || die "找不到 ${GETH_BIN}；先跑 go build -o build/bin/geth ./cmd/geth"; }
+need_bin() { [ -x "$GETH_BIN" ] || die "找不到 ${GETH_BIN}；先跑 make pgp（产物是 build/bin/pgp，源码目录仍是 cmd/geth）"; }
 need_bootnode() { [ -x "$BOOTNODE_BIN" ] || die "找不到 ${BOOTNODE_BIN}；先跑 go build -o build/bin/bootnode ./cmd/bootnode"; }
 node_dir() { echo "$HOME_DIR/node$1"; }
 node_http() { echo $((HTTP_BASE + $1)); }
@@ -355,10 +355,10 @@ print("\n".join(m["producers"]))
   local -a enodes=()
   for ((i = 0; i < seats; i++)); do
     dir=$(node_dir "$i")
-    [ -f "$dir/geth/nodekey" ] || "$BOOTNODE_BIN" -genkey "$dir/geth/nodekey" >/dev/null 2>&1 \
+    [ -f "$dir/pgp/nodekey" ] || "$BOOTNODE_BIN" -genkey "$dir/pgp/nodekey" >/dev/null 2>&1 \
       || die "节点 $i 的 devp2p nodekey 生成失败"
     local id
-    id=$("$BOOTNODE_BIN" -nodekey "$dir/geth/nodekey" -writeaddress) \
+    id=$("$BOOTNODE_BIN" -nodekey "$dir/pgp/nodekey" -writeaddress) \
       || die "节点 $i 的 enode id 推导失败"
     enodes+=("enode://$id@127.0.0.1:$((P2P_BASE + i))")
   done
@@ -417,7 +417,7 @@ lock_holders() {
   python3 - "$HOME_DIR" <<'PY'
 import fcntl, glob, os, sys
 held = []
-for p in sorted(glob.glob(os.path.join(sys.argv[1], "node*", "geth", "LOCK"))):
+for p in sorted(glob.glob(os.path.join(sys.argv[1], "node*", "pgp", "LOCK"))):
     try:
         f = open(p, "a")
     except OSError:

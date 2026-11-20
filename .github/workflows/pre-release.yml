@@ -55,7 +55,7 @@ jobs:
           tar -xvf ./x86_64-linux-musl-cross.tgz
           GIT_COMMIT=$(git rev-parse HEAD)
           GIT_COMMIT_DATE=$(git log -n1 --pretty='format:%cd' --date=format:'%Y%m%d')
-          GOOS=linux GOARCH=amd64 CGO_ENABLED=1 CC=$(pwd)/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc go build -ldflags "-X main.gitCommit=$GIT_COMMIT -X main.gitDate=$GIT_COMMIT_DATE -extldflags=-static" -o ./build/bin/geth -a ./cmd/geth
+          GOOS=linux GOARCH=amd64 CGO_ENABLED=1 CC=$(pwd)/x86_64-linux-musl-cross/bin/x86_64-linux-musl-gcc go build -ldflags "-X main.gitCommit=$GIT_COMMIT -X main.gitDate=$GIT_COMMIT_DATE -extldflags=-static" -o ./build/bin/pgp -a ./cmd/geth
       
       - name: Temporary replace BLS for Windows
         if: matrix.os == 'windows-latest'
@@ -80,7 +80,7 @@ jobs:
           tar -xvf ./aarch64-linux-musl-cross.tgz
           GIT_COMMIT=$(git rev-parse HEAD)
           GIT_COMMIT_DATE=$(git log -n1 --pretty='format:%cd' --date=format:'%Y%m%d')
-          GOOS=linux GOARCH=arm64 CGO_ENABLED=1 CC=$(pwd)/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc go build -ldflags "-X main.gitCommit=$GIT_COMMIT -X main.gitDate=$GIT_COMMIT_DATE -extldflags=-static" -o ./build/bin/geth-linux-arm64 -a ./cmd/geth
+          GOOS=linux GOARCH=arm64 CGO_ENABLED=1 CC=$(pwd)/aarch64-linux-musl-cross/bin/aarch64-linux-musl-gcc go build -ldflags "-X main.gitCommit=$GIT_COMMIT -X main.gitDate=$GIT_COMMIT_DATE -extldflags=-static" -o ./build/bin/pgp-linux-arm64 -a ./cmd/geth
 
       # ==============================
       #       Upload artifacts
@@ -91,28 +91,28 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         with:
           name: linux
-          path: ./build/bin/geth
+          path: ./build/bin/pgp
 
       - name: Upload MacOS Build
         uses: actions/upload-artifact@v4.3.3
         if: matrix.os == 'macos-latest'
         with:
           name: macos
-          path: ./build/bin/geth
+          path: ./build/bin/pgp
       
       - name: Upload Windows Build
         uses: actions/upload-artifact@v4.3.3
         if: matrix.os == 'windows-latest'
         with:
           name: windows
-          path: ./build/bin/geth.exe
+          path: ./build/bin/pgp.exe
 
       - name: Upload ARM-64 Build
         uses: actions/upload-artifact@v4.3.3
         if: matrix.os == 'ubuntu-latest'
         with:
           name: arm64
-          path: ./build/bin/geth-linux-arm64
+          path: ./build/bin/pgp-linux-arm64
 
   release:
     name: Release
@@ -166,9 +166,9 @@ jobs:
 
       # Rename assets
       - run: |
-          mv ./linux/geth ./linux/geth_linux
-          mv ./macos/geth ./macos/geth_macos
-          mv ./windows/geth.exe ./windows/geth_windows.exe
+          mv ./linux/pgp ./linux/pgp_linux
+          mv ./macos/pgp ./macos/pgp_macos
+          mv ./windows/pgp.exe ./windows/pgp_windows.exe
 
       - name: Create Release
         uses: softprops/action-gh-release@v2
@@ -185,7 +185,7 @@ jobs:
           files: |
             ./mainnet.zip
             ./testnet.zip
-            ./linux/geth_linux
-            ./macos/geth_macos
-            ./windows/geth_windows.exe
-            ./arm64/geth-linux-arm64
+            ./linux/pgp_linux
+            ./macos/pgp_macos
+            ./windows/pgp_windows.exe
+            ./arm64/pgp-linux-arm64

@@ -7,10 +7,10 @@ WORKDIR /bsc
 ENV CGO_CFLAGS="-O -D__BLST_PORTABLE__" 
 ENV CGO_CFLAGS_ALLOW="-O -D__BLST_PORTABLE__"
 RUN make geth
-RUN mv /bsc/build/bin/geth /usr/local/bin/geth
+RUN mv /bsc/build/bin/pgp /usr/local/bin/pgp
 
 EXPOSE 8545 8547 30303 30303/udp
-ENTRYPOINT [ "/usr/local/bin/geth" ]
+ENTRYPOINT [ "/usr/local/bin/pgp" ]
 
 FROM ethereum/solc:0.6.4-alpine as bsc-genesis
 
@@ -20,6 +20,6 @@ RUN git clone https://github.com/bnb-chain/bsc-genesis-contract.git /root/genesi
     && cd /root/genesis && npm install
 #RUN curl -L https://foundry.paradigm.xyz | bash
 
-COPY --from=bsc /usr/local/bin/geth /usr/local/bin/geth
+COPY --from=bsc /usr/local/bin/pgp /usr/local/bin/pgp
 
 ENTRYPOINT [ "/bin/bash" ]

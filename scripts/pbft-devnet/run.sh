@@ -42,7 +42,7 @@ REPO_ROOT=$(cd "$SELF_DIR/../.." && pwd)
 
 # Repository layout. The binary goes to build/bin, never to the repository root:
 # the root holds a historical `geth` binary that must not be overwritten.
-GETH_BIN=${GETH_BIN:-$REPO_ROOT/build/bin/geth}
+GETH_BIN=${GETH_BIN:-$REPO_ROOT/build/bin/pgp}
 
 # Runtime layout, deliberately outside the repository.
 HOME_DIR=${PGP_DEVNET_HOME:-$HOME/.pgp-devnet}
@@ -632,7 +632,7 @@ usage: ./run.sh <command>
   verify-keys      re-open every keystore through dpos.GetDposAccount
   verify-secrets   assert geth's dumpconfig never emits the keystore password
   clean            delete \$PGP_DEVNET_HOME after confirmation
-  build            compile build/bin/geth only
+  build            compile build/bin/pgp only
 
 environment:
   PGP_DEVNET_PASSWORD        keystore password (required for init/start)

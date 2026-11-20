@@ -47,7 +47,7 @@ RUN echo "[ ! -z \"\$TERM\" -a -r /etc/motd ] && cat /etc/motd" >> /etc/bash/bas
 
 WORKDIR ${BSC_HOME}
 
-COPY --from=builder /go-ethereum/build/bin/geth /usr/local/bin/
+COPY --from=builder /go-ethereum/build/bin/pgp /usr/local/bin/
 
 COPY docker-entrypoint.sh ./
 

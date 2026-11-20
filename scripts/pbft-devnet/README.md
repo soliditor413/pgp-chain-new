@@ -42,7 +42,7 @@ export PGP_DEVNET_PASSWORD='换成你自己的密码'
 ./scripts/pbft-devnet/run.sh stop
 ```
 
-`geth` 二进制不存在时会自动 `go build -o build/bin/geth ./cmd/geth`。
+`pgp` 二进制不存在时会自动 `go build -o build/bin/pgp ./cmd/geth`（产物叫 pgp，源码目录仍是 cmd/geth）。
 **不会**动仓库根目录那个历史遗留的 `geth`。
 
 ⚠️ `clean` 删的是**整个 `$PGP_DEVNET_HOME`**，包括 `keys/` 里的 arbiter keystore ——

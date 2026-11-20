@@ -13,7 +13,7 @@ set -euo pipefail
 SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SELF_DIR/../.." && pwd)
 
-GETH_BIN=${GETH_BIN:-$REPO_ROOT/build/bin/geth}
+GETH_BIN=${GETH_BIN:-$REPO_ROOT/build/bin/pgp}
 MULTI=${MULTI:-$REPO_ROOT/scripts/parlia-devnet/multi.sh}
 BOOTNODE_BIN=${BOOTNODE_BIN:-$REPO_ROOT/build/bin/bootnode}
 SEED_PEERS_PY=${SEED_PEERS_PY:-$REPO_ROOT/scripts/pbft-devnet/seed-peers.py}

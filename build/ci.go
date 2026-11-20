@@ -77,6 +77,14 @@ var (
 	// dev-tools section). Order matches the historical layout produced by ci.go.
 	allToolsBinaries = []string{"abigen", "bootnode", "evm", "geth", "rlpdump", "clef"}
 
+	// binaryOutputNames maps a cmd/<dir> package name to the executable name it is
+	// published under. Only geth differs: the source directory keeps its upstream
+	// name so upstream patches still apply cleanly, while the artifact carries this
+	// fork's identity. Every other package keeps the historical 1:1 mapping.
+	binaryOutputNames = map[string]string{
+		"geth": "pgp",
+	}
+
 	// Keeper build targets with their configurations
 	keeperTargets = []struct {
 		Name   string
@@ -132,7 +140,7 @@ var (
 			Description: "Developer utility version of the EVM (Ethereum Virtual Machine) that is capable of running bytecode snippets within a configurable environment and execution mode.",
 		},
 		{
-			BinaryName:  "geth",
+			BinaryName:  "pgp",
 			Description: "Ethereum CLI client.",
 		},
 		{
@@ -172,6 +180,15 @@ var (
 
 var GOBIN, _ = filepath.Abs(filepath.Join("build", "bin"))
 
+// executableName returns the published binary name for a cmd/ package directory.
+// Directories not listed in binaryOutputNames keep their own name.
+func executableName(pkgDir string) string {
+	if name, ok := binaryOutputNames[pkgDir]; ok {
+		return name
+	}
+	return pkgDir
+}
+
 // executablePath returns the path to a built binary in GOBIN, applying the
 // platform-specific extension for the given target OS.
 func executablePath(name, targetOS string) string {
@@ -186,7 +203,7 @@ func executablePath(name, targetOS string) string {
 func gethArchiveFiles(targetOS string) []string {
 	return []string{
 		"COPYING",
-		executablePath("geth", targetOS),
+		executablePath(executableName("geth"), targetOS),
 	}
 }
 
@@ -196,7 +213,7 @@ func gethArchiveFiles(targetOS string) []string {
 func allToolsArchiveFiles(targetOS string) []string {
 	files := []string{"COPYING"}
 	for _, name := range allToolsBinaries {
-		files = append(files, executablePath(name, targetOS))
+		files = append(files, executablePath(executableName(name), targetOS))
 	}
 	return files
 }
@@ -286,7 +303,7 @@ func doInstall(cmdline []string) {
 	// Do the build!
 	for _, pkg := range packages {
 		args := slices.Clone(gobuild.Args)
-		outputPath := executablePath(path.Base(pkg), *targetOS)
+		outputPath := executablePath(executableName(path.Base(pkg)), *targetOS)
 		if output != nil && *output != "" {
 			outputPath = *output
 		}
@@ -734,8 +751,8 @@ func doArchive(cmdline []string) {
 	var (
 		env      = build.Env()
 		basegeth = archiveBasename(*targetOS, *arch, version.Archive(env.Commit))
-		geth     = "geth-" + basegeth + ext
-		alltools = "geth-alltools-" + basegeth + ext
+		geth     = executableName("geth") + "-" + basegeth + ext
+		alltools = executableName("geth") + "-alltools-" + basegeth + ext
 	)
 	maybeSkipArchive(env)
 	if err := build.WriteArchive(geth, gethArchiveFiles(*targetOS)); err != nil {
@@ -1256,7 +1273,7 @@ func doWindowsInstaller(cmdline []string) {
 			continue
 		}
 		allTools = append(allTools, filepath.Base(file))
-		if filepath.Base(file) == "geth.exe" {
+		if filepath.Base(file) == executableName("geth")+".exe" {
 			gethTool = file
 		} else {
 			devTools = append(devTools, file)
@@ -1288,7 +1305,7 @@ func doWindowsInstaller(cmdline []string) {
 	if env.Commit != "" {
 		ver[2] += "-" + env.Commit[:8]
 	}
-	installer, err := filepath.Abs("geth-" + archiveBasename("windows", *arch, version.Archive(env.Commit)) + ".exe")
+	installer, err := filepath.Abs(executableName("geth") + "-" + archiveBasename("windows", *arch, version.Archive(env.Commit)) + ".exe")
 	if err != nil {
 		log.Fatalf("Failed to convert installer file path: %v", err)
 	}

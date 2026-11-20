@@ -2,7 +2,7 @@
 # with Go source code. If you know what GOPATH is then you probably
 # don't need to bother with make.
 
-.PHONY: geth geth-linux evm faucet all test truffle-test lint fmt clean devtools help
+.PHONY: pgp geth pgp-linux geth-linux evm faucet all test truffle-test lint fmt clean devtools help
 .PHONY: docker
 
 GOBIN = ./build/bin
@@ -40,20 +40,25 @@ LINUX_GOPROXY ?= https://goproxy.cn,direct
 LINUX_CACHE_PREFIX ?= bsc-linux
 LINUX_GOMOD_VOLUME = $(LINUX_CACHE_PREFIX)-gomod
 LINUX_GOCACHE_VOLUME = $(LINUX_CACHE_PREFIX)-gocache
-LINUX_BINARY = $(GOBIN)/geth-$(subst /,-,$(LINUX_PLATFORM))
+LINUX_BINARY = $(GOBIN)/pgp-$(subst /,-,$(LINUX_PLATFORM))
 # Scratch dir bind mounted over the build output directory. build/ci.go pins
 # GOBIN to <repo>/build/bin (build/ci.go:173), so without this the container
 # would overwrite the host's native binaries with linux ones.
 LINUX_STAGE = build/.linux-stage
 
-#? geth: Build geth.
-geth:
+#? pgp: Build pgp. The source directory is still cmd/geth, build/ci.go renames
+#? the artifact (see binaryOutputNames there).
+pgp:
 	$(GORUN) build/ci.go install ./cmd/geth
 	@echo "Done building."
-	@echo "Run \"$(GOBIN)/geth\" to launch geth."
+	@echo "Run \"$(GOBIN)/pgp\" to launch pgp."
 
-#? geth-linux: Build geth for linux through docker (macOS needs this, see LINUX_PLATFORM).
-geth-linux:
+#? geth: Alias for pgp, kept because the release workflows and the docker
+#? targets still call `make geth`.
+geth: pgp
+
+#? pgp-linux: Build pgp for linux through docker (macOS needs this, see LINUX_PLATFORM).
+pgp-linux:
 	@mkdir -p $(GOBIN) $(LINUX_STAGE)
 	@docker volume create $(LINUX_GOMOD_VOLUME) >/dev/null
 	@docker volume create $(LINUX_GOCACHE_VOLUME) >/dev/null
@@ -68,11 +73,14 @@ geth-linux:
 		-e CGO_CFLAGS_ALLOW="-O -D__BLST_PORTABLE__" \
 		$(LINUX_GOLANG_IMAGE) \
 		go run build/ci.go install -static ./cmd/geth
-	@mv -f $(LINUX_STAGE)/geth $(LINUX_BINARY)
+	@mv -f $(LINUX_STAGE)/pgp $(LINUX_BINARY)
 	@rm -rf $(LINUX_STAGE)
 	@chmod +x $(LINUX_BINARY)
 	@echo "Done building."
 	@echo "Copy \"$(LINUX_BINARY)\" to a $(LINUX_PLATFORM) host and run it there."
+
+#? geth-linux: Alias for pgp-linux.
+geth-linux: pgp-linux
 
 #? faucet: Build faucet
 faucet:

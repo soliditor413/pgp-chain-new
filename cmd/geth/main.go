@@ -46,7 +46,7 @@ import (
 )
 
 const (
-	clientIdentifier = "geth" // Client identifier to advertise over the network
+	clientIdentifier = "pgp" // Client identifier to advertise over the network
 )
 
 var (

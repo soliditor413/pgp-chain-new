@@ -145,8 +145,8 @@ func SetupTelemetry(cfg node.OpenTelemetryConfig, stack *node.Node) error {
 
 	// Define resource attributes
 	var attr = []attribute.KeyValue{
-		semconv.ServiceName("geth"),
-		attribute.String("client.name", version.ClientName("geth")),
+		semconv.ServiceName("pgp"),
+		attribute.String("client.name", version.ClientName("pgp")),
 	}
 	// Add instance ID if provided
 	if cfg.InstanceID != "" {

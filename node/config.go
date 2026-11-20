@@ -360,7 +360,10 @@ func (c *Config) ExtRPCEnabled() bool {
 func (c *Config) NodeName() string {
 	name := c.name()
 	// Backwards compatibility: previous versions used title-cased "Geth", keep that.
-	if name == "geth" || name == "geth-testnet" {
+	// pgp-chain has always advertised itself as "Geth" too (its node/config.go maps
+	// "pgp" the same way), so keeping the mapping means a renamed node is
+	// indistinguishable from an old one in admin.peers.
+	if name == "geth" || name == "geth-testnet" || name == "pgp" || name == "pgp-testnet" {
 		name = "Geth"
 	}
 	if c.UserIdent != "" {
@@ -406,7 +409,7 @@ func (c *Config) ResolvePath(path string) string {
 	// by geth 1.4 are used if they exist.
 	if warn, isOld := isOldGethResource[path]; isOld {
 		oldpath := ""
-		if c.name() == "geth" {
+		if c.name() == "geth" || c.name() == "pgp" {
 			oldpath = filepath.Join(c.DataDir, path)
 		}
 		if oldpath != "" && common.FileExist(oldpath) {

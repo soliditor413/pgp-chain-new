@@ -22,6 +22,7 @@
 /build/cache/
 /build/bin/
 /geth*.zip
+/pgp*.zip
 
 # used by the build/ci.go archive + upload tool
 /geth*.tar.gz
@@ -29,6 +30,11 @@
 /geth*.tar.gz.asc
 /geth*.zip.sig
 /geth*.zip.asc
+/pgp*.tar.gz
+/pgp*.tar.gz.sig
+/pgp*.tar.gz.asc
+/pgp*.zip.sig
+/pgp*.zip.asc
 
 
 # travis
@@ -68,13 +74,15 @@ cmd/keeper/keeper
 # showing up in `git status`, and the next bare build recreates them.
 #
 # /geth is what a bare `go build ./cmd/geth` leaves behind (a ~137 MB unstripped
-# binary); `make geth` writes build/bin/geth, which is ignored further up. The
-# leading slash is load-bearing: a bare `geth` pattern also matches the cmd/geth
-# directory and would ignore the whole cmd/ tree.
+# binary); /pgp is the same thing after build/ci.go started publishing the
+# artifact under that name. `make pgp` writes build/bin/pgp, which is ignored
+# further up. The leading slash is load-bearing: a bare `geth` or `pgp` pattern
+# also matches the cmd/geth directory and would ignore the whole cmd/ tree.
 #
 # /package-lock.json is what npm leaves behind when run in a directory with no
 # package.json: it exits ENOENT but still writes an empty lockfile.
 /geth
+/pgp
 /package-lock.json
 
 # A finished devnet run, kept verbatim so that the "exit 0" path of gate.sh can be

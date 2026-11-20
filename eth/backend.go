@@ -482,7 +482,7 @@ func New(stack *node.Node, config *ethconfig.Config) (*Ethereum, error) {
 
 	// Initialize filtermaps log index.
 	// Auto-enable checkpoint file
-	checkpointFile := filepath.Join(stack.DataDir(), "geth", "filtermap_checkpoints.json")
+	checkpointFile := filepath.Join(stack.InstanceDir(), "filtermap_checkpoints.json")
 
 	fmConfig := filtermaps.Config{
 		History:            config.LogHistory,

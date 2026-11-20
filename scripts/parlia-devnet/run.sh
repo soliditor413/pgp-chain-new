@@ -51,7 +51,7 @@ SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SELF_DIR/../.." && pwd)
 CONTRACT_ROOT=${CONTRACT_ROOT:-$REPO_ROOT/../bsc-genesis-contract}
 
-GETH_BIN=${GETH_BIN:-$REPO_ROOT/build/bin/geth}
+GETH_BIN=${GETH_BIN:-$REPO_ROOT/build/bin/pgp}
 HOME_DIR=${PGP_PARLIA_HOME:-$HOME/.pgp-parlia-devnet}
 CHAIN_DIR=$HOME_DIR/chain
 LOG_DIR=$HOME_DIR/logs
@@ -66,7 +66,7 @@ mkdir -p "$CHAIN_DIR" "$LOG_DIR"
 die() { echo "错误: $*" >&2; exit 1; }
 
 need_bin() {
-  [ -x "$GETH_BIN" ] || die "找不到 $GETH_BIN；先跑 go build -o build/bin/geth ./cmd/geth"
+  [ -x "$GETH_BIN" ] || die "找不到 $GETH_BIN；先跑 make pgp（产物是 build/bin/pgp，源码目录仍是 cmd/geth）"
 }
 
 cmd_init() {

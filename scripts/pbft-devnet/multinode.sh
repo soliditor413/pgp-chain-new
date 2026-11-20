@@ -59,7 +59,7 @@ set -euo pipefail
 SELF_DIR=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
 REPO_ROOT=$(cd "$SELF_DIR/../.." && pwd)
 
-GETH_BIN=${GETH_BIN:-$REPO_ROOT/build/bin/geth}
+GETH_BIN=${GETH_BIN:-$REPO_ROOT/build/bin/pgp}
 # bootnode is used for one thing only: turning a nodekey into the enode id that
 # goes into --bootnodes. It is already in the tree (cmd/bootnode), which avoids
 # hand-deriving a secp256k1 public key in bash.
@@ -273,7 +273,7 @@ cmd_init() {
 
     # Nodekeys first: --bootnodes needs every enode id, and the ids come from
     # these keys. Generating them here, instead of letting geth create
-    # datadir/geth/nodekey on first start, is what makes the topology knowable
+    # datadir/pgp/nodekey on first start, is what makes the topology knowable
     # before any node runs.
     log "generating $NODES devp2p nodekey(s) -> $NODEKEY_DIR"
     for ((i = 0; i < NODES; i++)); do
@@ -446,9 +446,9 @@ EOF
 seed_dpos_peers() {
     local i=$1 dd
     dd=$(node_dir "$i")
-    mkdir -p "$dd/geth/network/dpos"
+    mkdir -p "$dd/pgp/network/dpos"
     python3 - "$KEYS_DIR/producers.json" "$i" "$DPOS_ADDRESS" "$BASE_DPOS_PORT" \
-        "$dd/geth/network/dpos/peers.json" <<'PY'
+        "$dd/pgp/network/dpos/peers.json" <<'PY'
 import json, sys
 manifest, self_index = sys.argv[1], int(sys.argv[2])
 host, base_port, out = sys.argv[3], int(sys.argv[4]), sys.argv[5]
@@ -463,7 +463,7 @@ for a in accounts:
     addrs.append({"PID": list(key), "Addr": "%s:%d" % (host, base_port + a["index"])})
 json.dump({"Addresses": addrs}, open(out, "w"), indent=2)
 PY
-    chmod 600 "$dd/geth/network/dpos/peers.json"
+    chmod 600 "$dd/pgp/network/dpos/peers.json"
 }
 
 # --- start / stop -----------------------------------------------------------

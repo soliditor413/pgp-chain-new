@@ -40,6 +40,6 @@ export PRODUCERS=${PRODUCERS:-1}
 # Distinct from pbft-devnet's 8555/30399 so both can run side by side.
 export HTTP_PORT=${HTTP_PORT:-8577}
 export P2P_PORT=${P2P_PORT:-30401}
-export GETH_BIN=${GETH_BIN:-$REPO_ROOT/build/bin/geth}
+export GETH_BIN=${GETH_BIN:-$REPO_ROOT/build/bin/pgp}
 
 exec "$DEVNET_RUN" "$@"

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"path/filepath"
 	"sync"
 
 	elacom "github.com/elastos/Elastos.ELA/common"
@@ -138,9 +137,21 @@ func startSpv(stack *node.Node, backend ethapi.Backend, elaLevel elalog.Level, c
 		utils.Fatalf("Cannot derive the ELA deposit address from genesis %s: %v", genesis.Hash(), err)
 	}
 
-	// The ELA stores live next to the chain data so --datadir and the network
-	// subdirectory apply to them too.
-	dir := filepath.Join(stack.InstanceDir(), "spv")
+	// The ELA stores live in the datadir root, not in the instance subdirectory.
+	// pgp-chain has always put them there - cmd/pgp/main.go passes --datadir
+	// straight through into spv.Config.DataDir - and that placement is exactly what
+	// makes an existing pgp-chain datadir readable without resyncing the ELA side.
+	// Keeping them under <datadir>/<instance>/ would leave the EVM chain intact but
+	// silently restart SPV from height 0, which is very hard to notice.
+	dir := stack.DataDir()
+	if dir == "" {
+		// Ephemeral node. pgp-chain passes the empty string on, which makes
+		// SpvDbInit resolve filepath.Join("", "spv_transaction_info.db") to a path
+		// relative to the working directory. Refusing is better than writing into
+		// whatever directory the operator happened to launch from.
+		log.Warn("No datadir configured; the ELA SPV service is not started")
+		return
+	}
 
 	// Stamp the directory with the ELA network before anything opens a database
 	// in it. Two networks' headers in one store is not a clean failure: the store
