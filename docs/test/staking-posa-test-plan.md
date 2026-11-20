@@ -48,7 +48,7 @@
 | --- | --- |
 | 平台 | macOS Intel，Go 1.25.0，Python 3.13，Node 22 |
 | Foundry | `/usr/local/bin/{forge,cast,anvil}` 已装 |
-| 构建 | `cd bsc && go build -o build/bin/geth ./cmd/geth`；`cd bsc-genesis-contract && forge build`（`out/` 必须存在） |
+| 构建 | `cd pgp-c && make pgp`（产物 `build/bin/pgp`，源码目录仍是 `cmd/geth`）；`cd bsc-genesis-contract && forge build`（`out/` 必须存在） |
 | 链 ID | **860621**（合约内 `bscChainID` 是编译期常量，不能改） |
 
 
@@ -138,7 +138,7 @@ README.md       # 四个 run 的参数、门禁、已知坑
 
 | 门 | 命令 | 期望 |
 | --- | --- | --- |
-| G0-1 编译 | `go build -o build/bin/geth ./cmd/geth && go build -o build/bin/bootnode ./cmd/bootnode` | 两个二进制都存在 |
+| G0-1 编译 | `go build -o build/bin/pgp ./cmd/geth && go build -o build/bin/bootnode ./cmd/bootnode` | 两个二进制都存在 |
 | G0-2 合约产物 | `ls ../bsc-genesis-contract/out/BSCValidatorSet.sol/*.json` | 存在 |
 | G0-3 单元测试 | `go test ./consensus/router/... ./consensus/parlia/... ./core/systemcontracts/pgp/... ./core/vm/ -run 'DoubleSign\ | Lookahead\ | PGP'` | 全绿（作为回归基线） |
 | G0-4 genesis 形状 | `python3 -c 'import json;g=json.load(open(".../genesis.json"));print(g["config"]["feynmanTime"],g["config"]["keplerTime"],g["config"]["legacy"]["parliaGenesisCabinets"],len(g["config"]["legacy"]["producers"]))'` | 输出 `0 0 <cabinets> <seats>`（B 为 `0 0 5 6`） |

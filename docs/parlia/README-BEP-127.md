@@ -15,7 +15,7 @@ make sure you have unlocked the consensus address of your validator
 
 ### Running `built-in interactive`
 ```shell
-$ geth attach geth.ipc
+$ pgp attach pgp.ipc
 ```
 
 This command will:

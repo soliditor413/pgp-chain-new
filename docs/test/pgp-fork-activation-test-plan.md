@@ -239,8 +239,8 @@ KeplerTime             time   是
 ### 6.1 用现成脚手架（最省事，[待执行]）
 
 ```bash
-cd bsc
-go build -o build/bin/geth ./cmd/geth
+cd pgp-c
+go build -o build/bin/pgp ./cmd/geth
 go build -o build/bin/bootnode ./cmd/bootnode
 
 # 先看配置矩阵
