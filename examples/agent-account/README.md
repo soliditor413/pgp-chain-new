@@ -123,3 +123,26 @@ Enter the expected chain ID, account contract and agent. Direct owner wallets
 can issue grants, pause, resume and revoke. For a council-owned account, submit
 owner actions through the council's vote and execute workflow. The spending
 history groups matching Paid events by account and agent in 500-block windows.
+
+### Authorize recurring native purchases
+
+For a service with a fixed recipient, the owner can let the session signer
+approve new task IDs without adding each purchase to the policy file. Add
+this field to the signer-owned policy (alongside the chain, account, session
+address and Clef IPC path):
+
+```json
+"nativePurchaseSession": {
+  "recipient": "<service address>",
+  "maxPerPurchaseWei": "80",
+  "generation": 1
+}
+```
+
+Each purchase must have positive native value, empty calldata, the approved
+recipient, and a fresh task ID. The signer checks the current on-chain grant
+before signing. Its remaining budget and expiry apply across the session;
+the account enforces the aggregate budget even if signed purchases arrive
+concurrently. Explicit entries in tasks take precedence for those task IDs.
+Renewing or resuming a grant changes its generation. Update the signer policy
+only after the owner approves the new generation.

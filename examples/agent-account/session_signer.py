@@ -25,14 +25,31 @@ def clef_sign(ipc_path, agent, typed_data):
     return sig
 
 
-def sign_purchase(intent, policy, sign):
-    # Use only amounts and destinations supplied independently by the operator.
+def approved_generation(intent, policy):
+    fields = {"taskId", "amountWei", "recipient"}
+    if not fields <= intent.keys() <= fields | {"data"}:
+        return None
     task = intent["taskId"].lower()
-    approved = policy["tasks"].get(task)
-    if (not approved or not {"taskId", "amountWei", "recipient"} <= intent.keys() <= {"taskId", "amountWei", "recipient", "data"}
-            or intent.get("data", "0x").lower() != approved.get("data", "0x").lower()
-            or intent["recipient"].lower() != approved["recipient"].lower()
-            or intent["amountWei"] != approved["amountWei"]):
+    recipient = intent["recipient"].lower()
+    operation = intent.get("data", "0x").lower()
+    tasks = policy.get("tasks", {})
+    if task in tasks:
+        # Explicit task entries take precedence even if the session rule is broader.
+        exact = tasks[task]
+        if (recipient == exact["recipient"].lower() and intent["amountWei"] == exact["amountWei"]
+                and operation == exact.get("data", "0x").lower()):
+            return int(exact["generation"])
+        return None
+    session = policy.get("nativePurchaseSession")
+    if (session and recipient == session["recipient"].lower() and operation == "0x"
+            and 0 < int(intent["amountWei"]) <= int(session["maxPerPurchaseWei"])):
+        return int(session["generation"])
+    return None
+
+
+def sign_purchase(intent, policy, sign):
+    generation = approved_generation(intent, policy)
+    if generation is None:
         return {"status": "task_not_approved"}
     result = prepare_purchase(intent)
     if result["status"] != "within_grant":
@@ -41,9 +58,9 @@ def sign_purchase(intent, policy, sign):
     if (int(data["domain"]["chainId"]) != int(policy["chainId"])
             or data["domain"]["verifyingContract"].lower() != policy["account"].lower()
             or data["message"]["agent"].lower() != policy["agent"].lower()
-            or int(data["message"]["generation"]) != int(approved["generation"])):
+            or int(data["message"]["generation"]) != generation):
         return {"status": "signer_policy_mismatch"}
-    return {"status": "signed", "taskId": task,
+    return {"status": "signed", "taskId": intent["taskId"].lower(),
             "signature": sign(policy["clefIpc"], policy["agent"], data)}
 
 
