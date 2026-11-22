@@ -71,6 +71,19 @@ class PurchaseTests(unittest.TestCase):
         self.assertEqual([call.args[0] for call in node.call_args_list],
                          ["eth_call", "eth_estimateGas", "eth_gasPrice"])
 
+    def test_reverted_receipt_includes_transaction_fee(self):
+        receipt = {"status": "0x0", "blockHash": self.at, "gasUsed": "0x5208",
+                   "effectiveGasPrice": "0x3", "from": self.key}
+        args = {"taskId": self.task, "txHash": "0x" + "66" * 32}
+        with patch.object(agent, "rpc", return_value=receipt):
+            result = agent.purchase_receipt(args)
+        self.assertEqual(result["status"], "reverted")
+        self.assertEqual(result["payer"], self.key)
+        self.assertEqual(result["transactionExecutionFeeWei"], "63000")
+        del receipt["effectiveGasPrice"]
+        with patch.object(agent, "rpc", return_value=receipt):
+            self.assertNotIn("transactionExecutionFeeWei", agent.purchase_receipt(args))
+
     def test_signed_intent(self):
         typed = self.prepare()["typedData"]
         self.assertEqual(typed["domain"], dict(chainId="860621", verifyingContract=self.account))

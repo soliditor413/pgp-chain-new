@@ -66,7 +66,12 @@ async function invoke(action) {
     if (!/^0x[0-9a-f]{64}$/i.test(hash)) throw Error('请填写完整交易哈希');
     const r = await rpc('eth_getTransactionReceipt', [hash]);
     if (!r) return '等待节点返回回执';
-    return '交易' + (BigInt(r.status) ? '执行成功' : '执行失败') + '，区块 ' + BigInt(r.blockNumber);
+    const lines = ['交易' + (BigInt(r.status) ? '执行成功' : '执行失败') + '，区块 ' + BigInt(r.blockNumber)];
+    if (r.from) lines.push('交易费用支付方 ' + r.from);
+    if (r.gasUsed != null && r.effectiveGasPrice != null) {
+      lines.push('整笔交易执行费 ' + (BigInt(r.gasUsed) * BigInt(r.effectiveGasPrice)) + ' wei');
+    }
+    return lines.join('\n');
   }
   if (action === 'inspect') {
     const data = await call('0xb869cea3' + word(agent));

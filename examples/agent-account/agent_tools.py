@@ -178,8 +178,13 @@ def purchase_receipt(args):
     receipt = rpc("eth_getTransactionReceipt", [args["txHash"]])
     if receipt is None:
         return {"status": "awaiting_receipt"}
+    details = {"blockHash": receipt["blockHash"], "txHash": args["txHash"],
+               "taskId": args["taskId"], "payer": receipt.get("from")}
+    if receipt.get("gasUsed") is not None and receipt.get("effectiveGasPrice") is not None:
+        details["transactionExecutionFeeWei"] = str(int(receipt["gasUsed"], 16)
+                                                    * int(receipt["effectiveGasPrice"], 16))
     if int(receipt["status"], 16) == 0:
-        return {"status": "reverted", "blockHash": receipt["blockHash"]}
+        return {"status": "reverted", **details}
     for event in receipt["logs"]:
         topics = [t.lower() for t in event["topics"]]
         if (event["address"].lower() == os.environ["PGP_ACCOUNT"].lower()
@@ -187,9 +192,9 @@ def purchase_receipt(args):
                 and topics[0] == "0x37db9851b6c9a32f8ddcf4734e6526de7c85268ef735f7883ea70dc8a39c9c85"
                 and topics[1] == args["taskId"].lower()
                 and topics[2][-40:] == os.environ["PGP_AGENT"][2:].lower()):
-            return {"status": "payment_included", "blockHash": receipt["blockHash"],
+            return {"status": "payment_included", **details,
                     "recipient": "0x" + topics[3][-40:], "amountWei": str(int(event["data"], 16))}
-    return {"status": "no_matching_payment", "blockHash": receipt["blockHash"]}
+    return {"status": "no_matching_payment", **details}
 
 
 SUBMIT = {**SIMULATE, "name": "submit_purchase",
