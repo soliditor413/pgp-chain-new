@@ -132,6 +132,26 @@ def encode_call_bytes(args):
     return format(len(raw) // 2, "064x") + raw.ljust((len(raw) + 63) // 64 * 64, "0")
 
 
+def estimate_fee(transaction):
+    gas = int(rpc("eth_estimateGas", [transaction]), 16)
+    price = int(rpc("eth_gasPrice", []), 16)
+    return gas, price
+
+
+def preview_transaction(tx, block_hash, purchases):
+    sponsor = os.environ.get("PGP_SPONSOR")
+    estimation_tx = {**tx, "from": sponsor} if sponsor else tx
+    rpc("eth_call", [estimation_tx, {"blockHash": block_hash, "requireCanonical": True}])
+    gas, price = estimate_fee(estimation_tx)
+    return {"status": "simulated", "transaction": tx, "blockHash": block_hash,
+            "operations": [{"taskId": p["taskId"], "recipient": p["recipient"],
+                            "nativeValueWei": p["amountWei"], "callData": p.get("data", "0x")}
+                           for p in purchases],
+            "nativeValueForwardedWei": str(sum(int(p["amountWei"]) for p in purchases)),
+            "feeEstimate": {"payer": sponsor, "gas": str(gas), "gasPriceWei": str(price),
+                            "feeWei": str(gas * price)}}
+
+
 def simulate_purchase(args):
     recovery, r, s = split_signature(args.get("signature"))
     result = check_purchase({k: v for k, v in args.items() if k != "signature"})
@@ -141,8 +161,7 @@ def simulate_purchase(args):
              format(int(args["amountWei"]), "x"), format(7 * 32, "x"),
              format(recovery, "x"), r, s]
     tx = {"to": os.environ["PGP_ACCOUNT"], "data": "0xf959dd1b" + "".join(w.zfill(64) for w in words) + encode_call_bytes(args)}
-    rpc("eth_call", [tx, {"blockHash": result["blockHash"], "requireCanonical": True}])
-    return {"status": "simulated", "transaction": tx, "blockHash": result["blockHash"]}
+    return preview_transaction(tx, result["blockHash"], [args])
 
 
 RECEIPT = {"name": "purchase_receipt", "description": "Check inclusion and payment event for one task.",
@@ -189,9 +208,8 @@ def sponsor_transaction(transaction, task_fields):
     if not re.fullmatch("0x[0-9a-fA-F]{40}", sponsor):
         return {"status": "sponsor_not_configured"}
     tx = {**transaction, "from": sponsor}
-    gas = int(rpc("eth_estimateGas", [tx]), 16)
+    gas, price = estimate_fee(tx)
     ceiling = int(os.environ["PGP_SPONSOR_MAX_GAS"])
-    price = int(rpc("eth_gasPrice", []), 16)
     if gas > ceiling or gas * price > int(os.environ["PGP_SPONSOR_MAX_FEE_WEI"]):
         return {"status": "sponsor_budget_exceeded"}
     tx.update(gas=hex(gas), gasPrice=hex(price))
@@ -234,7 +252,10 @@ def check_batch(args):
     return {"status": "within_grant", "typedData": requests, "blockHash": block["hash"]}
 
 
-def submit_batch(args):
+SIMULATE_BATCH = batch_tool("simulate_purchase_batch", SIMULATE, "Preview signed calls and the estimated total sponsor fee.")
+
+
+def simulate_batch(args):
     batch = os.environ.get("PGP_BATCH", "")
     if not re.fullmatch("0x[0-9a-fA-F]{40}", batch):
         return {"status": "batch_not_configured"}
@@ -263,8 +284,14 @@ def submit_batch(args):
         offset += len(encoded) // 2
     head = "".join(os.environ[k][2:].zfill(64) for k in ("PGP_ACCOUNT", "PGP_AGENT")) + word(96)
     tx = {"to": batch, "data": "0x9f08efe2" + head + word(len(items)) + "".join(offsets + tuples)}
-    rpc("eth_call", [tx, at])
-    return sponsor_transaction(tx, {"taskIds": [p["taskId"] for p in items]})
+    return preview_transaction(tx, result["blockHash"], items)
+
+
+def submit_batch(args):
+    preview = simulate_batch(args)
+    if preview["status"] != "simulated":
+        return preview
+    return sponsor_transaction(preview["transaction"], {"taskIds": [p["taskId"] for p in args["purchases"]]})
 
 
 SIGN = {**TOOL, "name": "sign_purchase",
@@ -291,6 +318,7 @@ HANDLERS = {
     "submit_purchase": submit_purchase,
     "purchase_receipt": purchase_receipt,
     "prepare_purchase_batch": check_batch,
+    "simulate_purchase_batch": simulate_batch,
     "submit_purchase_batch": submit_batch,
 }
 
@@ -301,9 +329,9 @@ def dispatch(message):
         return {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
                 "serverInfo": {"name": "pgp-agent", "version": "0.1"}}
     if method == "tools/list":
-        specs = [TOOL, PREPARE, SIMULATE, SUBMIT, RECEIPT, PREPARE_BATCH, SUBMIT_BATCH, SIGN]
+        specs = [TOOL, PREPARE, SIMULATE, SUBMIT, RECEIPT, PREPARE_BATCH, SIMULATE_BATCH, SUBMIT_BATCH, SIGN]
         read_only = {"check_purchase", "prepare_purchase", "simulate_purchase",
-                     "purchase_receipt", "prepare_purchase_batch"}
+                     "purchase_receipt", "prepare_purchase_batch", "simulate_purchase_batch"}
         return {"tools": [{**spec, "annotations": {"readOnlyHint": spec["name"] in read_only}}
                           for spec in specs]}
     if method == "ping":

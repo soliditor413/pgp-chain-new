@@ -61,6 +61,16 @@ class PurchaseTests(unittest.TestCase):
         self.assertEqual(result["taskId"], self.task)
         self.assertNotIn("txHash", result)
 
+    def test_preview_separates_forwarded_value_from_sponsor_fee(self):
+        items = [self.args, {**self.args, "amountWei": "0", "data": "0x12345678"}]
+        with patch.object(agent, "rpc", side_effect=["0x", "0x5208", "0x2"]) as node:
+            preview = agent.preview_transaction({"to": self.account}, self.at, items)
+        self.assertEqual(preview["nativeValueForwardedWei"], "20")
+        self.assertEqual(preview["operations"][1]["callData"], "0x12345678")
+        self.assertEqual(preview["feeEstimate"]["feeWei"], "42000")
+        self.assertEqual([call.args[0] for call in node.call_args_list],
+                         ["eth_call", "eth_estimateGas", "eth_gasPrice"])
+
     def test_signed_intent(self):
         typed = self.prepare()["typedData"]
         self.assertEqual(typed["domain"], dict(chainId="860621", verifyingContract=self.account))
