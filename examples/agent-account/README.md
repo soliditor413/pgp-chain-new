@@ -174,3 +174,5 @@ For a delivery that requires final settlement, pass includeFinality: true to
 purchase_receipt. Wait for payment_included and finality equal to finalized.
 An unavailable finalized head produces unknown. A mismatched canonical block
 returns chain_changed; look up the transaction again before releasing the service.
+
+For services using `PgpResultInbox`, set `PGP_RESULT_INBOX` to the application's trusted inbox on the configured chain. Call the read-only `service_result` tool with the same `taskId` used for payment. It reports whether the service was requested, awaits a proof, or has a verified output commitment at the returned block hash. Use `purchase_receipt` separately for payment and finality. The application defines what its verifier proves and how to retrieve the actual output.

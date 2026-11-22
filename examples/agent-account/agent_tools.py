@@ -394,7 +394,41 @@ def review_activity(args):
             "count": len(entries), "nativeValueForwardedWei": str(total), "payments": entries}
 
 
+RESULT = {
+    "name": "service_result",
+    "description": "Read delivery status and commitments from the configured PgpResultInbox for this task.",
+    "inputSchema": {"type": "object", "additionalProperties": False, "required": ["taskId"],
+                    "properties": {"taskId": TOOL["inputSchema"]["properties"]["taskId"]}}}
+
+
+def service_result(args):
+    if set(args) != {"taskId"} or not re.fullmatch("0x[0-9a-fA-F]{64}", args["taskId"]):
+        raise ValueError("invalid task identifier")
+    inbox = os.environ.get("PGP_RESULT_INBOX")
+    if not inbox:
+        return {"status": "result_inbox_unconfigured"}
+    if not re.fullmatch("0x[0-9a-fA-F]{40}", inbox):
+        raise ValueError("invalid configured result inbox")
+    block = rpc("eth_getBlockByNumber", ["latest", False])
+    at = {"blockHash": block["hash"], "requireCanonical": True}
+    # PgpResultInbox.results(bytes32) returns two flags and two commitments.
+    raw = rpc("eth_call", [{"to": inbox, "data": "0x4c6b25b1" + args["taskId"][2:]}, at])
+    if not re.fullmatch("0x(?:0{63}[01]){2}[0-9a-fA-F]{128}", raw):
+        raise ValueError("unexpected result inbox response")
+    requested, verified = raw[65] == "1", raw[129] == "1"
+    if verified and not requested:
+        raise ValueError("inconsistent result flags")
+    report = {"taskId": args["taskId"], "inbox": inbox, "blockHash": block["hash"],
+              "status": "unrequested"}
+    if requested:
+        report.update(status="awaiting_proof", inputCommitment="0x" + raw[130:194])
+    if verified:
+        report.update(status="result_verified", outputCommitment="0x" + raw[194:])
+    return report
+
+
 HANDLERS = {
+    "service_result": service_result,
     "review_purchase_activity": review_activity,
     "check_purchase": check_purchase,
     "prepare_purchase": prepare_purchase,
@@ -414,8 +448,8 @@ def dispatch(message):
         return {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
                 "serverInfo": {"name": "pgp-agent", "version": "0.1"}}
     if method == "tools/list":
-        specs = [TOOL, PREPARE, SIMULATE, SUBMIT, RECEIPT, PREPARE_BATCH, SIMULATE_BATCH, SUBMIT_BATCH, SIGN, ACTIVITY]
-        read_only = {"review_purchase_activity", "check_purchase", "prepare_purchase", "simulate_purchase",
+        specs = [TOOL, PREPARE, SIMULATE, SUBMIT, RECEIPT, PREPARE_BATCH, SIMULATE_BATCH, SUBMIT_BATCH, SIGN, ACTIVITY, RESULT]
+        read_only = {"service_result", "review_purchase_activity", "check_purchase", "prepare_purchase", "simulate_purchase",
                      "purchase_receipt", "prepare_purchase_batch", "simulate_purchase_batch"}
         return {"tools": [{**spec, "annotations": {"readOnlyHint": spec["name"] in read_only}}
                           for spec in specs]}

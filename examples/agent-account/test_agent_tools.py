@@ -37,6 +37,21 @@ class PurchaseTests(unittest.TestCase):
         fields = [self.target[2:], agent.EMPTY_CALL_HASH, "14", hex(self.expiry)[2:], "2"]
         return "0x" + "".join(v.zfill(64) for v in fields)
 
+    def test_service_delivery_states(self):
+        args = {"taskId": self.task}
+        with patch.dict(os.environ, PGP_RESULT_INBOX=""):
+            self.assertEqual(agent.service_result(args)["status"], "result_inbox_unconfigured")
+        with patch.dict(os.environ, PGP_RESULT_INBOX=self.target):
+            for flags, status in [((0, 0), "unrequested"), ((1, 0), "awaiting_proof"),
+                                  ((1, 1), "result_verified")]:
+                raw = "0x" + "".join(format(v, "064x") for v in flags) + "ab" * 32 + "cd" * 32
+                with patch.object(agent, "rpc", side_effect=[{"hash": self.at}, raw]) as rpc:
+                    report = agent.service_result(args)
+                rpc.assert_called_with("eth_call", [{"to": self.target, "data": "0x4c6b25b1" + self.task[2:]},
+                                                    {"blockHash": self.at, "requireCanonical": True}])
+                self.assertEqual(report["status"], status)
+                self.assertEqual(report.get("outputCommitment"), "0x" + "cd" * 32 if flags[1] else None)
+
     def prepare(self, **updates):
         response = agent.dispatch({"method": "tools/call", "params": {
             "name": "prepare_purchase", "arguments": {**self.args, **updates}}})
