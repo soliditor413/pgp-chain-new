@@ -16,6 +16,8 @@ class PurchaseTests(unittest.TestCase):
         self.at = "0x" + "55" * 32
         self.paid = False
         self.expiry = 200
+        self.paused_until = 0
+        self.registry = 0
         self.calls = []
         env = patch.dict(os.environ, PGP_ACCOUNT=self.account, PGP_AGENT=self.key)
         env.start()
@@ -34,6 +36,10 @@ class PurchaseTests(unittest.TestCase):
         self.assertEqual(params[1], dict(blockHash=self.at, requireCanonical=True))
         if params[0]["data"].startswith("0xd945af1d"):
             return "0x" + format(self.paid, "064x")
+        if params[0]["data"].startswith("0x851c1f81"):
+            return "0x" + format(self.paused_until, "064x")
+        if params[0]["data"].startswith("0x95a8a93f"):
+            return "0x" + format(self.registry, "064x") + "0" * 192
         fields = [self.target[2:], agent.EMPTY_CALL_HASH, "14", hex(self.expiry)[2:], "2"]
         return "0x" + "".join(v.zfill(64) for v in fields)
 
@@ -125,6 +131,19 @@ class PurchaseTests(unittest.TestCase):
                 self.assertEqual(agent.receipt_finality(receipt), expected)
         with patch.object(agent, "rpc", side_effect=agent.NodeError("eth_getBlockByNumber", -32602)):
             self.assertEqual(agent.receipt_finality(receipt), "unknown")
+
+    def test_signer_matches_current_onchain_policy(self):
+        self.registry = int(self.target, 16)
+        alternate = self.prepare()
+        self.assertEqual(alternate["status"], "alternate_signature_required")
+        self.assertEqual(alternate["registry"], self.target)
+        self.assertNotIn("typedData", alternate)
+        self.expiry = 0
+        self.paused_until = 200
+        self.assertIn("grant_paused", self.prepare()["reasons"])
+        self.paused_until = 0
+        self.assertIn("grant_revoked", self.prepare()["reasons"])
+        self.assertNotIn("eth_chainId", self.calls)
 
     def test_signed_intent(self):
         typed = self.prepare()["typedData"]

@@ -65,13 +65,18 @@ def check_purchase(args, block=None):
     paid, = read("0xd945af1d" + args["taskId"][2:], 1)
     if int(paid, 16):
         return {"status": "already_paid"}
-    target, call_hash, budget, expiry, generation = read("0xb869cea3" + agent[2:].zfill(64), 5)
+    agent_word = agent[2:].zfill(64)
+    target, call_hash, budget, expiry, generation = read("0xb869cea3" + agent_word, 5)
     reasons = []
     expected_hash = EMPTY_CALL_HASH if data == "0x" else rpc("web3_sha3", [data])[2:].lower()
     if target[-40:] != args["recipient"][2:].lower() or call_hash != expected_hash:
         reasons.append("target_or_operation")
     if int(expiry, 16) <= int(block["timestamp"], 16):
-        reasons.append("grant_expired_or_missing")
+        reason = "grant_expired_or_missing"
+        if int(expiry, 16) == 0 and int(target, 16):
+            paused_until, = read("0x851c1f81" + agent_word, 1)
+            reason = "grant_paused" if int(paused_until, 16) else "grant_revoked"
+        reasons.append(reason)
     if int(budget, 16) < int(args["amountWei"]):
         reasons.append("budget")
     result = {"status": "needs_authorization" if reasons else "within_grant",
@@ -84,6 +89,12 @@ def check_purchase(args, block=None):
                             "requestedWei": args["amountWei"],
                             "budgetShortfallWei": str(max(0, int(args["amountWei"]) - int(budget, 16)))}
         result["action"] = "Stop this purchase and ask the owner to review the grant."
+    else:
+        registry, scheme, version, key = read("0x95a8a93f" + agent_word, 4)
+        if int(registry, 16):
+            result.update(status="alternate_signature_required", registry="0x" + registry[-40:],
+                          scheme="0x" + scheme, version=int(version, 16), keyCommitment="0x" + key,
+                          action="Use the signer for this account's configured verification scheme.")
     return result
 
 
