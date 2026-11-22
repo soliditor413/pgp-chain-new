@@ -53,6 +53,14 @@ class PurchaseTests(unittest.TestCase):
                          {"status": "needs_authorization", "reasons": ["budget"]})
         self.assertEqual(agent.check_batch({"purchases": [small, small]}), {"status": "duplicate_task"})
 
+    def test_lost_submission_response_preserves_task_and_requests_reconciliation(self):
+        env = dict(PGP_SPONSOR=self.key, PGP_SPONSOR_MAX_GAS="21000", PGP_SPONSOR_MAX_FEE_WEI="21000")
+        with patch.dict(os.environ, env), patch.object(agent, "rpc", side_effect=["0x5208", "0x1", TimeoutError()]):
+            result = agent.sponsor_transaction({"to": self.account, "data": "0x"}, {"taskId": self.task})
+        self.assertEqual(result["status"], "submission_unconfirmed")
+        self.assertEqual(result["taskId"], self.task)
+        self.assertNotIn("txHash", result)
+
     def test_signed_intent(self):
         typed = self.prepare()["typedData"]
         self.assertEqual(typed["domain"], dict(chainId="860621", verifyingContract=self.account))

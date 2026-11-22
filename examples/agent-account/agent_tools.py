@@ -1,4 +1,4 @@
-"""Read-only MCP server for native-currency purchase authorization on PGP."""
+"""MCP tools for authorized native-currency purchases on PGP."""
 import json
 import os
 import re
@@ -19,6 +19,12 @@ TOOL = {
         "required": ["recipient", "amountWei", "taskId"]}}
 
 
+class NodeError(Exception):
+    def __init__(self, method, code):
+        self.method = method
+        self.code = code
+
+
 def rpc(method, params):
     body = json.dumps(dict(jsonrpc="2.0", id=1, method=method, params=params)).encode()
     request = Request(os.environ["PGP_RPC_URL"], body, {"Content-Type": "application/json"})
@@ -27,7 +33,10 @@ def rpc(method, params):
     if urlsplit(request.full_url).hostname in {"127.0.0.1", "::1", "localhost"}:
         opener = build_opener(ProxyHandler({})).open
     with opener(request, timeout=10) as response:
-        return json.load(response)["result"]
+        payload = json.load(response)
+    if isinstance(payload.get("error"), dict):
+        raise NodeError(method, payload["error"].get("code"))
+    return payload["result"]
 
 
 def check_purchase(args, block=None):
@@ -169,7 +178,12 @@ def sponsor_transaction(transaction, task_fields):
     if gas > ceiling or gas * price > int(os.environ["PGP_SPONSOR_MAX_FEE_WEI"]):
         return {"status": "sponsor_budget_exceeded"}
     tx.update(gas=hex(gas), gasPrice=hex(price))
-    tx_hash = rpc("eth_sendTransaction", [tx])
+    try:
+        tx_hash = rpc("eth_sendTransaction", [tx])
+    except (OSError, ValueError, KeyError, NodeError):
+        # A lost response does not establish whether the node accepted the tx.
+        return {"status": "submission_unconfirmed", **task_fields,
+                "action": "Check settlement and the sponsor transaction history before retrying."}
     return {"status": "submitted", "txHash": tx_hash, **task_fields}
 
 
@@ -252,8 +266,16 @@ def request_signature(args):
             return json.loads(stream.readline(65536))
 
 
-HANDLERS = {"sign_purchase": request_signature, "prepare_purchase_batch": check_batch, "submit_purchase_batch": submit_batch, "submit_purchase": submit_purchase, "purchase_receipt": purchase_receipt,"check_purchase": check_purchase, "prepare_purchase": prepare_purchase,
-            "simulate_purchase": simulate_purchase}
+HANDLERS = {
+    "check_purchase": check_purchase,
+    "prepare_purchase": prepare_purchase,
+    "sign_purchase": request_signature,
+    "simulate_purchase": simulate_purchase,
+    "submit_purchase": submit_purchase,
+    "purchase_receipt": purchase_receipt,
+    "prepare_purchase_batch": check_batch,
+    "submit_purchase_batch": submit_batch,
+}
 
 
 def dispatch(message):
@@ -269,6 +291,13 @@ def dispatch(message):
         try:
             output = HANDLERS[message["params"]["name"]](message["params"]["arguments"])
             failed = False
+        except NodeError as exc:
+            output = {"status": "node_rejected_request", "method": exc.method, "code": exc.code}
+            failed = True
+        except OSError:
+            output = {"status": "service_unreachable",
+                      "action": "Check the configured node or signer connection."}
+            failed = True
         except Exception as exc:
             output = {"status": "check_failed", "error": type(exc).__name__}
             failed = True
