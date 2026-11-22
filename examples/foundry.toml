@@ -1,0 +1,5 @@
+[profile.default]
+src = "agent-account"
+test = "test"
+solc_version = "0.8.26"
+evm_version = "paris"
