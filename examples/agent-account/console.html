@@ -38,6 +38,32 @@ async function invoke(action) {
   if (!window.ethereum) throw Error('请在已连接 EVM 钱包的浏览器中打开');
   const chain = await rpc('eth_chainId');
   if (BigInt(chain) !== BigInt(el('chain').value)) throw Error('请在钱包中切换到所填网络');
+  if (action === 'receipt') {
+    const hash = el('hash').value.trim();
+    if (!/^0x[0-9a-f]{64}$/i.test(hash)) throw Error('请填写完整交易哈希');
+    const r = await rpc('eth_getTransactionReceipt', [hash]);
+    if (!r) return '等待节点返回回执';
+    const lines = ['交易' + (BigInt(r.status) ? '执行成功' : '执行失败') + '，区块 ' + BigInt(r.blockNumber)];
+    if (r.from) lines.push('交易费用支付方 ' + r.from);
+    if (r.gasUsed != null && r.effectiveGasPrice != null) {
+      lines.push('整笔交易执行费 ' + (BigInt(r.gasUsed) * BigInt(r.effectiveGasPrice)) + ' wei');
+    }
+    try {
+      const finalized = await rpc('eth_getBlockByNumber', ['finalized', false]);
+      const canonical = await rpc('eth_getBlockByNumber', [r.blockNumber, false]);
+      if (!canonical || canonical.hash.toLowerCase() !== r.blockHash.toLowerCase()
+          || (finalized && BigInt(finalized.number) === BigInt(r.blockNumber)
+              && finalized.hash.toLowerCase() !== r.blockHash.toLowerCase())) {
+        return '回执对应的区块已变化，请重新查询交易';
+      }
+      if (!finalized) lines.push('节点未提供最终确认状态');
+      else if (BigInt(finalized.number) < BigInt(r.blockNumber)) lines.push('等待最终确认');
+      else lines.push('已最终确认');
+    } catch {
+      lines.push('节点未提供最终确认状态');
+    }
+    return lines.join('\n');
+  }
   const to = address('account'), agent = address('agent');
   const call = data => rpc('eth_call', [{to, data}, 'latest']);
   if (action === 'history') {
@@ -60,18 +86,6 @@ async function invoke(action) {
     el('payments').textContent = ['区块 ' + start + '–' + end + ' · ' + rows.length + ' 笔 · 合计 ' + total + ' wei',
       ...rows].join('\n\n');
     return start ? '查询更早记录可填写截止区块 ' + (start - 1n) : '已查到创世区块';
-  }
-  if (action === 'receipt') {
-    const hash = el('hash').value.trim();
-    if (!/^0x[0-9a-f]{64}$/i.test(hash)) throw Error('请填写完整交易哈希');
-    const r = await rpc('eth_getTransactionReceipt', [hash]);
-    if (!r) return '等待节点返回回执';
-    const lines = ['交易' + (BigInt(r.status) ? '执行成功' : '执行失败') + '，区块 ' + BigInt(r.blockNumber)];
-    if (r.from) lines.push('交易费用支付方 ' + r.from);
-    if (r.gasUsed != null && r.effectiveGasPrice != null) {
-      lines.push('整笔交易执行费 ' + (BigInt(r.gasUsed) * BigInt(r.effectiveGasPrice)) + ' wei');
-    }
-    return lines.join('\n');
   }
   if (action === 'inspect') {
     const data = await call('0xb869cea3' + word(agent));
