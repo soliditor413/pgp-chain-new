@@ -1,6 +1,10 @@
 // SPDX-License-Identifier: LGPL-3.0-or-later
 pragma solidity ^0.8.20;
 
+interface IPgpCouncilWallet {
+    function isValidSignature(bytes32 hash, bytes calldata signature) external view returns (bytes4);
+}
+
 /// Deploy as the owner of an agent account. Independent controller keys
 /// approve a specific target, calldata and salt before its delay starts.
 contract PgpAccountCouncil {
@@ -15,6 +19,12 @@ contract PgpAccountCouncil {
     }
     mapping(bytes32 => Proposal) public proposals;
     mapping(bytes32 => mapping(address => bool)) public approved;
+    mapping(address => uint256) public voteNonce;
+    bytes32 private constant DOMAIN = keccak256("EIP712Domain(uint256 chainId,address verifyingContract)");
+    bytes32 private constant BALLOT = keccak256(
+        "Ballot(address member,bytes32 proposalId,bool support,uint256 nonce,uint256 deadline)"
+    );
+
     event Vote(bytes32 indexed id, address indexed signer, bool support);
     event Scheduled(bytes32 indexed id, address indexed target, bytes data, uint256 readyAt);
     event Executed(bytes32 indexed id);
@@ -36,11 +46,32 @@ contract PgpAccountCouncil {
     }
 
     function vote(address target, bytes calldata data, bytes32 salt, bool support) external {
-        require(member[msg.sender], "member only");
+        _vote(msg.sender, target, data, salt, support);
+    }
+
+    function ballotDigest(address signer, bytes32 id, bool support, uint256 deadline) public view returns (bytes32) {
+        bytes32 domain = keccak256(abi.encode(DOMAIN, block.chainid, address(this)));
+        bytes32 ballot = keccak256(abi.encode(BALLOT, signer, id, support, voteNonce[signer], deadline));
+        return keccak256(abi.encodePacked(hex"1901", domain, ballot));
+    }
+
+    /// An ERC-1271 member wallet selects and migrates its own signature algorithm.
+    function relayVote(address signer, address target, bytes calldata data, bytes32 salt, bool support,
+        uint256 deadline, bytes calldata signature) external {
+        require(member[signer] && signer.code.length != 0 && block.timestamp <= deadline, "invalid ballot");
+        bytes32 digest = ballotDigest(signer, proposalId(target, data, salt), support, deadline);
+        require(IPgpCouncilWallet(signer).isValidSignature(digest, signature)
+            == IPgpCouncilWallet.isValidSignature.selector, "invalid signature");
+        _vote(signer, target, data, salt, support);
+    }
+
+    function _vote(address signer, address target, bytes calldata data, bytes32 salt, bool support) private {
+        require(member[signer], "member only");
         bytes32 id = proposalId(target, data, salt);
         Proposal storage p = proposals[id];
-        require(!p.closed && approved[id][msg.sender] != support, "invalid vote");
-        approved[id][msg.sender] = support;
+        require(!p.closed && approved[id][signer] != support, "invalid vote");
+        approved[id][signer] = support;
+        ++voteNonce[signer];
         if (support) ++p.approvals;
         else --p.approvals;
         if (p.approvals < quorum) p.readyAt = 0;
@@ -48,7 +79,7 @@ contract PgpAccountCouncil {
             p.readyAt = block.timestamp + delay;
             emit Scheduled(id, target, data, p.readyAt);
         }
-        emit Vote(id, msg.sender, support);
+        emit Vote(id, signer, support);
     }
 
     function execute(address target, bytes calldata data, bytes32 salt) external {

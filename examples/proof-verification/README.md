@@ -56,9 +56,12 @@ through distinct consensus and networking paths. A production algorithm change
 needs versioned key registration, epoch activation, serialization and peer
 compatibility, replay across the fork boundary, finality and recovery tests,
 and measurements with a representative validator set. The account contract's
-migration changes none of those consensus formats. Council governance currently
-uses EVM sender identities; upgrading its authentication needs its own deployed
-controllers and a recovery quorum. No post-quantum algorithm has been selected.
+migration changes none of those consensus formats. Council members may vote directly or enroll an ERC-1271 member wallet.
+A relayer submits that wallet's versioned signature through relayVote. The ballot
+binds the council and chain, proposal ID (including council epoch), support,
+member nonce and deadline. Direct and relayed votes both consume the member's
+nonce. Each member wallet governs its own verification and recovery. Quorum
+and activation delay apply to both routes. No post-quantum algorithm has been selected.
 
 PgpResultInbox demonstrates the application side for an off-chain computation.
 The requester records a salted input commitment for a unique task. The service
