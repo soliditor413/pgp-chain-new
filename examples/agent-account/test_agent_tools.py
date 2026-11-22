@@ -147,6 +147,20 @@ class PurchaseTests(unittest.TestCase):
         self.assertIn("grant_revoked", self.prepare()["reasons"])
         self.assertNotIn("eth_chainId", self.calls)
 
+    def test_agent_can_read_its_grant_without_a_purchase(self):
+        result = agent.inspect_grant({})
+        self.assertEqual(result["status"], "active")
+        self.assertEqual(result["recipient"], self.target)
+        self.assertEqual(result["callDataHash"], "0x" + agent.EMPTY_CALL_HASH)
+        self.assertEqual(result["remainingWei"], "20")
+        self.assertEqual(self.calls, ["eth_getBlockByNumber", "eth_call"])
+        self.expiry = 0
+        self.paused_until = 150
+        paused = agent.inspect_grant({})
+        self.assertEqual((paused["status"], paused["expiresAt"]), ("paused", 150))
+        with self.assertRaises(ValueError):
+            agent.inspect_grant({"agent": self.target})
+
     def test_signed_intent(self):
         typed = self.prepare()["typedData"]
         self.assertEqual(typed["domain"], dict(chainId="860621", verifyingContract=self.account))

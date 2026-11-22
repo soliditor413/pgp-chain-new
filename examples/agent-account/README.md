@@ -48,6 +48,8 @@ addresses. The core tools run on Python 3 using only the standard library.
 }
 ```
 
+Call `inspect_grant` with `{}` when the user asks what the agent may do or how much budget remains. It returns the grant status, authorized destination and calldata hash, native budget, expiry, and the block used for the read. A specific purchase still needs the signer and the preflight checks below.
+
 ## Buy a service
 
 1. Assign a stable 32-byte taskId to the purchase. Supply the same recipient,

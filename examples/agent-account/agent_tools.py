@@ -40,16 +40,13 @@ def rpc(method, params):
     return payload["result"]
 
 
-def check_purchase(args, block=None):
-    schema = TOOL["inputSchema"]
-    if not set(schema["required"]) <= args.keys() <= schema["properties"].keys() or any(
-        not isinstance(args[k], str) or not re.fullmatch(v["pattern"], args[k])
-        for k, v in schema["properties"].items() if k in args
-    ):
-        raise ValueError("invalid purchase arguments")
-    data = args.get("data", "0x")
-    if int(args["amountWei"]) >= 2**256 or (args["amountWei"] == "0" and data == "0x"):
-        raise ValueError("invalid native amount")
+GRANT = {
+    "name": "inspect_grant",
+    "description": "Read the configured agent's on-chain spending authority without preparing a purchase.",
+    "inputSchema": {"type": "object", "properties": {}, "additionalProperties": False}}
+
+
+def grant_context(block=None):
     account, agent = (os.environ[k] for k in ("PGP_ACCOUNT", "PGP_AGENT"))
     if not all(re.fullmatch(r"0x[0-9a-fA-F]{40}", addr) for addr in (agent, account)):
         raise ValueError("invalid configured account or agent")
@@ -62,41 +59,71 @@ def check_purchase(args, block=None):
             raise ValueError("unexpected account response")
         return [result[i:i + 64].lower() for i in range(2, len(result), 64)]
 
+    return block, account, agent, read
+
+
+def grant_snapshot(block, account, agent, read):
+    agent_word = agent[2:].zfill(64)
+    target, call_hash, budget, expiry, generation = read("0xb869cea3" + agent_word, 5)
+    expires_at, now = int(expiry, 16), int(block["timestamp"], 16)
+    status = "active"
+    if not int(target, 16):
+        status = "unassigned"
+    elif expires_at == 0:
+        paused_until, = read("0x851c1f81" + agent_word, 1)
+        expires_at = int(paused_until, 16)
+        if not expires_at:
+            status = "revoked"
+        else:
+            status = "paused" if expires_at > now else "expired_during_pause"
+    elif expires_at <= now:
+        status = "expired"
+    return {"status": status, "account": account, "agent": agent, "recipient": "0x" + target[-40:],
+            "callDataHash": "0x" + call_hash, "remainingWei": str(int(budget, 16)),
+            "expiresAt": expires_at, "blockTimestamp": now, "generation": str(int(generation, 16)),
+            "blockHash": block["hash"]}
+
+
+def inspect_grant(args):
+    if args != {}:
+        raise ValueError("inspect_grant takes no arguments")
+    return grant_snapshot(*grant_context())
+
+
+def check_purchase(args, block=None):
+    schema = TOOL["inputSchema"]
+    if not set(schema["required"]) <= args.keys() <= schema["properties"].keys() or any(
+        not isinstance(args[k], str) or not re.fullmatch(v["pattern"], args[k])
+        for k, v in schema["properties"].items() if k in args
+    ):
+        raise ValueError("invalid purchase arguments")
+    data = args.get("data", "0x")
+    if int(args["amountWei"]) >= 2**256 or (args["amountWei"] == "0" and data == "0x"):
+        raise ValueError("invalid native amount")
+    block, account, agent, read = grant_context(block)
     paid, = read("0xd945af1d" + args["taskId"][2:], 1)
     if int(paid, 16):
         return {"status": "already_paid"}
-    agent_word = agent[2:].zfill(64)
-    target, call_hash, budget, expiry, generation = read("0xb869cea3" + agent_word, 5)
+    grant = grant_snapshot(block, account, agent, read)
     reasons = []
-    expected_hash = EMPTY_CALL_HASH if data == "0x" else rpc("web3_sha3", [data])[2:].lower()
-    if target[-40:] != args["recipient"][2:].lower() or call_hash != expected_hash:
+    expected_hash = "0x" + EMPTY_CALL_HASH if data == "0x" else rpc("web3_sha3", [data]).lower()
+    if grant["recipient"] != args["recipient"].lower() or grant["callDataHash"] != expected_hash:
         reasons.append("target_or_operation")
-    if int(expiry, 16) <= int(block["timestamp"], 16):
-        reason = "grant_expired_or_missing"
-        if int(expiry, 16) == 0 and int(target, 16):
-            paused_until, = read("0x851c1f81" + agent_word, 1)
-            resume_before = int(paused_until, 16)
-            if not resume_before:
-                reason = "grant_revoked"
-            elif resume_before > int(block["timestamp"], 16):
-                reason = "grant_paused"
-            else:
-                reason = "paused_grant_expired"
-        reasons.append(reason)
-    if int(budget, 16) < int(args["amountWei"]):
+    if grant["status"] != "active":
+        reasons.append({"unassigned": "grant_expired_or_missing", "expired": "grant_expired_or_missing",
+                        "revoked": "grant_revoked", "paused": "grant_paused",
+                        "expired_during_pause": "paused_grant_expired"}[grant["status"]])
+    shortfall = max(0, int(args["amountWei"]) - int(grant["remainingWei"]))
+    if shortfall:
         reasons.append("budget")
-    result = {"status": "needs_authorization" if reasons else "within_grant",
-            "reasons": reasons, "remainingWei": str(int(budget, 16)),
-            "generation": str(int(generation, 16)), "blockHash": block["hash"]}
-
+    result = {"status": "needs_authorization" if reasons else "within_grant", "reasons": reasons,
+              "remainingWei": grant["remainingWei"], "generation": grant["generation"], "blockHash": block["hash"]}
     if reasons:
-        result["policy"] = {"recipient": "0x" + target[-40:], "callDataHash": "0x" + call_hash,
-                            "expiresAt": int(expiry, 16), "blockTimestamp": int(block["timestamp"], 16),
-                            "requestedWei": args["amountWei"],
-                            "budgetShortfallWei": str(max(0, int(args["amountWei"]) - int(budget, 16)))}
+        result["policy"] = {k: grant[k] for k in ("recipient", "callDataHash", "expiresAt", "blockTimestamp")}
+        result["policy"].update(requestedWei=args["amountWei"], budgetShortfallWei=str(shortfall))
         result["action"] = "Stop this purchase and ask the owner to review the grant."
     else:
-        registry, scheme, version, key = read("0x95a8a93f" + agent_word, 4)
+        registry, scheme, version, key = read("0x95a8a93f" + agent[2:].zfill(64), 4)
         if int(registry, 16):
             result.update(status="alternate_signature_required", registry="0x" + registry[-40:],
                           scheme="0x" + scheme, version=int(version, 16), keyCommitment="0x" + key,
@@ -445,6 +472,7 @@ def service_result(args):
 
 
 HANDLERS = {
+    "inspect_grant": inspect_grant,
     "service_result": service_result,
     "review_purchase_activity": review_activity,
     "check_purchase": check_purchase,
@@ -465,8 +493,8 @@ def dispatch(message):
         return {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
                 "serverInfo": {"name": "pgp-agent", "version": "0.1"}}
     if method == "tools/list":
-        specs = [TOOL, PREPARE, SIMULATE, SUBMIT, RECEIPT, PREPARE_BATCH, SIMULATE_BATCH, SUBMIT_BATCH, SIGN, ACTIVITY, RESULT]
-        read_only = {"service_result", "review_purchase_activity", "check_purchase", "prepare_purchase", "simulate_purchase",
+        specs = [GRANT, TOOL, PREPARE, SIMULATE, SUBMIT, RECEIPT, PREPARE_BATCH, SIMULATE_BATCH, SUBMIT_BATCH, SIGN, ACTIVITY, RESULT]
+        read_only = {"inspect_grant", "service_result", "review_purchase_activity", "check_purchase", "prepare_purchase", "simulate_purchase",
                      "purchase_receipt", "prepare_purchase_batch", "simulate_purchase_batch"}
         return {"tools": [{**spec, "annotations": {"readOnlyHint": spec["name"] in read_only}}
                           for spec in specs]}
