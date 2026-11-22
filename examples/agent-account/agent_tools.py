@@ -75,7 +75,13 @@ def check_purchase(args, block=None):
         reason = "grant_expired_or_missing"
         if int(expiry, 16) == 0 and int(target, 16):
             paused_until, = read("0x851c1f81" + agent_word, 1)
-            reason = "grant_paused" if int(paused_until, 16) else "grant_revoked"
+            resume_before = int(paused_until, 16)
+            if not resume_before:
+                reason = "grant_revoked"
+            elif resume_before > int(block["timestamp"], 16):
+                reason = "grant_paused"
+            else:
+                reason = "paused_grant_expired"
         reasons.append(reason)
     if int(budget, 16) < int(args["amountWei"]):
         reasons.append("budget")

@@ -141,6 +141,8 @@ class PurchaseTests(unittest.TestCase):
         self.expiry = 0
         self.paused_until = 200
         self.assertIn("grant_paused", self.prepare()["reasons"])
+        self.paused_until = 100
+        self.assertIn("paused_grant_expired", self.prepare()["reasons"])
         self.paused_until = 0
         self.assertIn("grant_revoked", self.prepare()["reasons"])
         self.assertNotIn("eth_chainId", self.calls)
