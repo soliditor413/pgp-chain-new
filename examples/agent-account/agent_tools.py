@@ -165,22 +165,49 @@ def simulate_purchase(args):
     return preview_transaction(tx, result["blockHash"], [args])
 
 
-RECEIPT = {"name": "purchase_receipt", "description": "Check inclusion and payment event for one task.",
-           "inputSchema": {"type": "object", "properties": {
-               key: {"type": "string", "pattern": "^0x[0-9a-fA-F]{64}$"}
-               for key in ("txHash", "taskId")}, "required": ["txHash", "taskId"],
-               "additionalProperties": False}}
+RECEIPT = {
+    "name": "purchase_receipt",
+    "description": "Check payment inclusion and optionally query the node's finalized head.",
+    "inputSchema": {"type": "object", "properties": {
+        "txHash": {"type": "string", "pattern": "^0x[0-9a-fA-F]{64}$"},
+        "taskId": {"type": "string", "pattern": "^0x[0-9a-fA-F]{64}$"},
+        "includeFinality": {"type": "boolean"}},
+        "required": ["txHash", "taskId"], "additionalProperties": False}}
+
+
+def receipt_finality(receipt):
+    try:
+        finalized = rpc("eth_getBlockByNumber", ["finalized", False])
+        canonical = rpc("eth_getBlockByNumber", [receipt["blockNumber"], False])
+    except (NodeError, OSError):
+        return "unknown"
+    if canonical is None or canonical["hash"].lower() != receipt["blockHash"].lower():
+        return "chain_changed"
+    if finalized is None:
+        return "unknown"
+    if int(finalized["number"], 16) < int(receipt["blockNumber"], 16):
+        return "awaiting_finality"
+    if (int(finalized["number"], 16) == int(receipt["blockNumber"], 16)
+            and finalized["hash"].lower() != receipt["blockHash"].lower()):
+        return "chain_changed"
+    return "finalized"
 
 
 def purchase_receipt(args):
-    if set(args) != {"txHash", "taskId"} or not all(
-            isinstance(v, str) and re.fullmatch("0x[0-9a-fA-F]{64}", v) for v in args.values()):
-        raise ValueError("invalid transaction hash or task id")
+    keys = {"txHash", "taskId"}
+    if (not keys <= args.keys() <= keys | {"includeFinality"}
+            or not isinstance(args.get("includeFinality", False), bool)
+            or not all(isinstance(args[k], str) and re.fullmatch("0x[0-9a-fA-F]{64}", args[k]) for k in keys)):
+        raise ValueError("invalid receipt arguments")
     receipt = rpc("eth_getTransactionReceipt", [args["txHash"]])
     if receipt is None:
         return {"status": "awaiting_receipt"}
     details = {"blockHash": receipt["blockHash"], "txHash": args["txHash"],
                "taskId": args["taskId"], "payer": receipt.get("from")}
+    if args.get("includeFinality"):
+        details["finality"] = receipt_finality(receipt)
+        if details["finality"] == "chain_changed":
+            return {"status": "chain_changed", **details}
     if receipt.get("gasUsed") is not None and receipt.get("effectiveGasPrice") is not None:
         details["transactionExecutionFeeWei"] = str(int(receipt["gasUsed"], 16)
                                                     * int(receipt["effectiveGasPrice"], 16))

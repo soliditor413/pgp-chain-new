@@ -14,6 +14,21 @@ address, fund the account, and call authorize from the owner wallet. Pass the
 agent's signer address, service recipient, keccak256 of empty bytes,
 budget in wei, and expiry. To stop future purchases call revoke(agent).
 
+From the repository root, using a running private PGP devnet and an existing
+Foundry owner keystore, the deployment commands are:
+
+```sh
+cd examples
+forge build
+forge create --rpc-url "$PGP_RPC_URL" --account "$OWNER_KEYSTORE" --broadcast \
+  agent-account/PgpAgentAccount.sol:PgpAgentAccount --constructor-args "$OWNER_ADDRESS"
+```
+
+Set PGP_ACCOUNT to the deployed address printed by Forge. Send test native
+currency to that address from the devnet owner wallet. In the owner console
+enter that same address and grant the session key a budget. PGP_RPC_URL must
+match the wallet network (the four-node local test uses port 18560 on node 0).
+
 Register this stdio server with your MCP client, replacing the path, RPC and
 addresses. The core tools run on Python 3 using only the standard library.
 
@@ -80,7 +95,15 @@ Keep the policy, Clef IPC socket, session keystore and signer environment
 outside the agent's write access.
 
 Start Clef with the session keystore and the intended chain ID. Configure its
-approval UI according to the owner's policy. Create a signer-owned JSON file:
+approval UI according to the owner's policy. For the Clef shipped with this repository, --ipcpath accepts a directory.
+From the repository root start Clef in a separate terminal, for example:
+
+```sh
+./build/bin/clef --keystore "$SESSION_KEYSTORE_DIR" --chainid 860621 \
+  --configdir "$CLEF_CONFIG_DIR" --ipcpath "$CLEF_IPC_DIR"
+```
+
+Use the socket at `$CLEF_IPC_DIR/clef.ipc` in a signer-owned JSON file:
 
 ```json
 {
@@ -146,3 +169,8 @@ the account enforces the aggregate budget even if signed purchases arrive
 concurrently. Explicit entries in tasks take precedence for those task IDs.
 Renewing or resuming a grant changes its generation. Update the signer policy
 only after the owner approves the new generation.
+
+For a delivery that requires final settlement, pass includeFinality: true to
+purchase_receipt. Wait for payment_included and finality equal to finalized.
+An unavailable finalized head produces unknown. A mismatched canonical block
+returns chain_changed; look up the transaction again before releasing the service.

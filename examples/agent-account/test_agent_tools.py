@@ -98,6 +98,19 @@ class PurchaseTests(unittest.TestCase):
         with patch.object(agent, "rpc", side_effect=[block, [event], dict(block, hash="changed")]):
             self.assertEqual(agent.review_activity({})["status"], "chain_changed")
 
+    def test_finality_requires_a_canonical_receipt_and_finalized_head(self):
+        receipt = {"blockNumber": "0x20", "blockHash": self.at}
+        for tip, block, expected in [
+            ({"number": "0x1f", "hash": self.task}, receipt, "awaiting_finality"),
+            ({"number": "0x20", "hash": self.at}, {"hash": self.at}, "finalized"),
+            ({"number": "0x20", "hash": self.task}, {"hash": self.at}, "chain_changed"),
+            ({"number": "0x21", "hash": self.task}, {"hash": self.task}, "chain_changed"),
+            (None, receipt, "unknown")]:
+            with patch.object(agent, "rpc", side_effect=[tip, {"hash": block.get("hash", self.at)}]):
+                self.assertEqual(agent.receipt_finality(receipt), expected)
+        with patch.object(agent, "rpc", side_effect=agent.NodeError("eth_getBlockByNumber", -32602)):
+            self.assertEqual(agent.receipt_finality(receipt), "unknown")
+
     def test_signed_intent(self):
         typed = self.prepare()["typedData"]
         self.assertEqual(typed["domain"], dict(chainId="860621", verifyingContract=self.account))
