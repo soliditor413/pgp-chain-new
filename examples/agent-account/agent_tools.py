@@ -1,0 +1,289 @@
+"""Read-only MCP server for native-currency purchase authorization on PGP."""
+import json
+import os
+import re
+import socket
+import sys
+from urllib.parse import urlsplit
+from urllib.request import ProxyHandler, Request, build_opener, urlopen
+
+EMPTY_CALL_HASH = "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
+TOOL = {
+    "name": "check_purchase",
+    "description": "Check a native PGP payment to a service before requesting a signature. Amount is in wei.",
+    "inputSchema": {
+        "type": "object", "additionalProperties": False,
+        "properties": {key: {"type": "string", "pattern": pattern} for key, pattern in {
+            "recipient": "^0x[0-9a-fA-F]{40}$", "amountWei": "^[1-9][0-9]*$",
+            "taskId": "^0x[0-9a-fA-F]{64}$"}.items()},
+        "required": ["recipient", "amountWei", "taskId"]}}
+
+
+def rpc(method, params):
+    body = json.dumps(dict(jsonrpc="2.0", id=1, method=method, params=params)).encode()
+    request = Request(os.environ["PGP_RPC_URL"], body, {"Content-Type": "application/json"})
+    # Keep local node calls on loopback even when macOS configures a system proxy.
+    opener = urlopen
+    if urlsplit(request.full_url).hostname in {"127.0.0.1", "::1", "localhost"}:
+        opener = build_opener(ProxyHandler({})).open
+    with opener(request, timeout=10) as response:
+        return json.load(response)["result"]
+
+
+def check_purchase(args, block=None):
+    schema = TOOL["inputSchema"]
+    if set(args) != set(schema["required"]) or any(
+        not isinstance(args[k], str) or not re.fullmatch(v["pattern"], args[k])
+        for k, v in schema["properties"].items()
+    ):
+        raise ValueError("invalid purchase arguments")
+    account, agent = (os.environ[k] for k in ("PGP_ACCOUNT", "PGP_AGENT"))
+    if not all(re.fullmatch(r"0x[0-9a-fA-F]{40}", addr) for addr in (agent, account)):
+        raise ValueError("invalid configured account or agent")
+    block = block or rpc("eth_getBlockByNumber", ["latest", False])
+    at = {"blockHash": block["hash"], "requireCanonical": True}
+
+    def read(data, words):
+        result = rpc("eth_call", [{"to": account, "data": data}, at])
+        if not re.fullmatch("0x[0-9a-fA-F]{" + str(64 * words) + "}", result):
+            raise ValueError("unexpected account response")
+        return [result[i:i + 64].lower() for i in range(2, len(result), 64)]
+
+    paid, = read("0xd945af1d" + args["taskId"][2:], 1)
+    if int(paid, 16):
+        return {"status": "already_paid"}
+    target, call_hash, budget, expiry, generation = read("0xb869cea3" + agent[2:].zfill(64), 5)
+    reasons = []
+    if target[-40:] != args["recipient"][2:].lower() or call_hash != EMPTY_CALL_HASH:
+        reasons.append("target_or_operation")
+    if int(expiry, 16) <= int(block["timestamp"], 16):
+        reasons.append("grant_expired_or_missing")
+    if int(budget, 16) < int(args["amountWei"]):
+        reasons.append("budget")
+    return {"status": "needs_authorization" if reasons else "within_grant",
+            "reasons": reasons, "remainingWei": str(int(budget, 16)),
+            "generation": str(int(generation, 16)), "blockHash": block["hash"]}
+
+
+PREPARE = {**TOOL, "name": "prepare_purchase",
+           "description": "Check authorization and return EIP-712 data for the isolated session signer."}
+SIMULATE = {
+    **TOOL, "name": "simulate_purchase",
+    "description": "Simulate a signed purchase and return the transaction for a gas sponsor.",
+    "inputSchema": {**TOOL["inputSchema"],
+                    "properties": {**TOOL["inputSchema"]["properties"],
+                                   "signature": {"type": "string", "pattern": "^0x[0-9a-fA-F]{130}$"}},
+                    "required": [*TOOL["inputSchema"]["required"], "signature"]}}
+
+
+def prepare_purchase(args, block=None):
+    result = check_purchase(args, block)
+    if result["status"] != "within_grant":
+        return result
+    account = os.environ["PGP_ACCOUNT"]
+    chain_id = int(rpc("eth_chainId", []), 16)
+    fields = [("agent", "address"), ("generation", "uint256"),
+              ("taskId", "bytes32"), ("value", "uint256")]
+    domain = [("chainId", "uint256"), ("verifyingContract", "address")]
+    result["typedData"] = {
+        "domain": {"chainId": str(chain_id), "verifyingContract": account},
+        "primaryType": "Payment",
+        "types": {name: [{"name": k, "type": v} for k, v in spec]
+                  for name, spec in (("Payment", fields), ("EIP712Domain", domain))},
+        "message": {"agent": os.environ["PGP_AGENT"], "generation": result["generation"],
+                    "taskId": args["taskId"], "value": args["amountWei"]}}
+    return result
+
+
+def split_signature(signature):
+    if not isinstance(signature, str) or not re.fullmatch("0x[0-9a-fA-F]{130}", signature):
+        raise ValueError("invalid signature")
+    recovery = int(signature[-2:], 16)
+    if recovery in (0, 1):
+        recovery += 27
+    if recovery not in (27, 28):
+        raise ValueError("invalid recovery id")
+    return recovery, signature[2:66], signature[66:130]
+
+
+def simulate_purchase(args):
+    recovery, r, s = split_signature(args.get("signature"))
+    result = check_purchase({k: v for k, v in args.items() if k != "signature"})
+    if result["status"] != "within_grant":
+        return result
+    words = [os.environ["PGP_AGENT"][2:], args["taskId"][2:],
+             format(int(args["amountWei"]), "x"), format(7 * 32, "x"),
+             format(recovery, "x"), r, s, "0"]
+    tx = {"to": os.environ["PGP_ACCOUNT"], "data": "0xf959dd1b" + "".join(w.zfill(64) for w in words)}
+    rpc("eth_call", [tx, {"blockHash": result["blockHash"], "requireCanonical": True}])
+    return {"status": "simulated", "transaction": tx, "blockHash": result["blockHash"]}
+
+
+RECEIPT = {"name": "purchase_receipt", "description": "Check inclusion and payment event for one task.",
+           "inputSchema": {"type": "object", "properties": {
+               key: {"type": "string", "pattern": "^0x[0-9a-fA-F]{64}$"}
+               for key in ("txHash", "taskId")}, "required": ["txHash", "taskId"],
+               "additionalProperties": False}}
+
+
+def purchase_receipt(args):
+    if set(args) != {"txHash", "taskId"} or not all(
+            isinstance(v, str) and re.fullmatch("0x[0-9a-fA-F]{64}", v) for v in args.values()):
+        raise ValueError("invalid transaction hash or task id")
+    receipt = rpc("eth_getTransactionReceipt", [args["txHash"]])
+    if receipt is None:
+        return {"status": "awaiting_receipt"}
+    if int(receipt["status"], 16) == 0:
+        return {"status": "reverted", "blockHash": receipt["blockHash"]}
+    for event in receipt["logs"]:
+        topics = [t.lower() for t in event["topics"]]
+        if (event["address"].lower() == os.environ["PGP_ACCOUNT"].lower()
+                and len(topics) == 4 and not event.get("removed", False)
+                and topics[0] == "0x37db9851b6c9a32f8ddcf4734e6526de7c85268ef735f7883ea70dc8a39c9c85"
+                and topics[1] == args["taskId"].lower()
+                and topics[2][-40:] == os.environ["PGP_AGENT"][2:].lower()):
+            return {"status": "payment_included", "blockHash": receipt["blockHash"],
+                    "recipient": "0x" + topics[3][-40:], "amountWei": str(int(event["data"], 16))}
+    return {"status": "no_matching_payment", "blockHash": receipt["blockHash"]}
+
+
+SUBMIT = {**SIMULATE, "name": "submit_purchase",
+          "description": "Recheck a session-signed purchase and submit through the configured gas sponsor."}
+
+
+def submit_purchase(args):
+    result = simulate_purchase(args)
+    if result["status"] != "simulated":
+        return result
+    return sponsor_transaction(result["transaction"], {"taskId": args["taskId"]})
+
+
+def sponsor_transaction(transaction, task_fields):
+    sponsor = os.environ.get("PGP_SPONSOR", "")
+    if not re.fullmatch("0x[0-9a-fA-F]{40}", sponsor):
+        return {"status": "sponsor_not_configured"}
+    tx = {**transaction, "from": sponsor}
+    gas = int(rpc("eth_estimateGas", [tx]), 16)
+    ceiling = int(os.environ["PGP_SPONSOR_MAX_GAS"])
+    price = int(rpc("eth_gasPrice", []), 16)
+    if gas > ceiling or gas * price > int(os.environ["PGP_SPONSOR_MAX_FEE_WEI"]):
+        return {"status": "sponsor_budget_exceeded"}
+    tx.update(gas=hex(gas), gasPrice=hex(price))
+    tx_hash = rpc("eth_sendTransaction", [tx])
+    return {"status": "submitted", "txHash": tx_hash, **task_fields}
+
+
+def batch_tool(name, item, description):
+    return {"name": name, "description": description, "inputSchema": {
+        "type": "object", "properties": {"purchases": {"type": "array", "minItems": 1,
+            "maxItems": 32, "items": item["inputSchema"]}}, "required": ["purchases"],
+        "additionalProperties": False}}
+
+
+PREPARE_BATCH = batch_tool("prepare_purchase_batch", TOOL, "Check aggregate budget and prepare individual signatures.")
+SUBMIT_BATCH = batch_tool("submit_purchase_batch", SIMULATE, "Simulate and submit the signed purchases atomically.")
+
+
+def check_batch(args):
+    items = args.get("purchases")
+    if set(args) != {"purchases"} or not isinstance(items, list) or not 1 <= len(items) <= 32:
+        raise ValueError("expected 1 to 32 purchases")
+    tasks = [p["taskId"].lower() for p in items]
+    if len(set(tasks)) != len(tasks):
+        return {"status": "duplicate_task"}
+    block = rpc("eth_getBlockByNumber", ["latest", False])
+    requests = []
+    for p in items:
+        result = prepare_purchase(p, block)
+        if result["status"] != "within_grant":
+            return {**result, "taskId": p["taskId"]}
+        requests.append(result["typedData"])
+    if sum(int(p["amountWei"]) for p in items) > int(result["remainingWei"]):
+        return {"status": "needs_authorization", "reasons": ["budget"]}
+    return {"status": "within_grant", "typedData": requests, "blockHash": block["hash"]}
+
+
+def submit_batch(args):
+    batch = os.environ.get("PGP_BATCH", "")
+    if not re.fullmatch("0x[0-9a-fA-F]{40}", batch):
+        return {"status": "batch_not_configured"}
+    if set(args) != {"purchases"} or not isinstance(args["purchases"], list):
+        raise ValueError("invalid purchases")
+    items = args["purchases"]
+    result = check_batch({"purchases": [{k: v for k, v in p.items() if k != "signature"} for p in items]})
+    if result["status"] != "within_grant":
+        return result
+    at = {"blockHash": result["blockHash"], "requireCanonical": True}
+    if rpc("eth_getCode", [batch, at]) == "0x":
+        raise ValueError("batch contract is missing")
+
+    def word(n):
+        return format(n, "064x")
+
+    offsets, tuples = [], []
+    offset = len(items) * 32
+    for p in items:
+        recovery, r, s = split_signature(p["signature"])
+        # Payment tuple: six head words, followed by the empty bytes length.
+        encoded = (p["taskId"][2:] + word(int(p["amountWei"])) + word(192)
+                   + word(recovery) + r + s + word(0))
+        offsets.append(word(offset))
+        tuples.append(encoded)
+        offset += len(encoded) // 2
+    head = "".join(os.environ[k][2:].zfill(64) for k in ("PGP_ACCOUNT", "PGP_AGENT")) + word(96)
+    tx = {"to": batch, "data": "0x9f08efe2" + head + word(len(items)) + "".join(offsets + tuples)}
+    rpc("eth_call", [tx, at])
+    return sponsor_transaction(tx, {"taskIds": [p["taskId"] for p in items]})
+
+
+SIGN = {**TOOL, "name": "sign_purchase",
+        "description": "Ask the isolated session signer to approve and sign one purchase intent."}
+
+
+def request_signature(args):
+    path = os.environ.get("PGP_SIGNER_SOCKET")
+    if not path:
+        return {"status": "signer_not_configured"}
+    with socket.socket(socket.AF_UNIX) as client:
+        client.settimeout(130)
+        client.connect(path)
+        client.sendall(json.dumps(args).encode() + b"\n")
+        with client.makefile("rb") as stream:
+            return json.loads(stream.readline(65536))
+
+
+HANDLERS = {"sign_purchase": request_signature, "prepare_purchase_batch": check_batch, "submit_purchase_batch": submit_batch, "submit_purchase": submit_purchase, "purchase_receipt": purchase_receipt,"check_purchase": check_purchase, "prepare_purchase": prepare_purchase,
+            "simulate_purchase": simulate_purchase}
+
+
+def dispatch(message):
+    method = message.get("method")
+    if method == "initialize":
+        return {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
+                "serverInfo": {"name": "pgp-agent", "version": "0.1"}}
+    if method == "tools/list":
+        return {"tools": [TOOL, PREPARE, SIMULATE, SUBMIT, RECEIPT, PREPARE_BATCH, SUBMIT_BATCH, SIGN]}
+    if method == "ping":
+        return {}
+    if method == "tools/call" and message["params"]["name"] in HANDLERS:
+        try:
+            output = HANDLERS[message["params"]["name"]](message["params"]["arguments"])
+            failed = False
+        except Exception as exc:
+            output = {"status": "check_failed", "error": type(exc).__name__}
+            failed = True
+        return {"content": [{"type": "text", "text": json.dumps(output)}], "isError": failed}
+    raise ValueError("unsupported method")
+
+
+if __name__ == "__main__":
+    for line in sys.stdin:
+        message = {}
+        try:
+            message = json.loads(line)
+            if "id" not in message:
+                continue
+            reply = {"result": dispatch(message)}
+        except (ValueError, KeyError, TypeError):
+            reply = {"error": {"code": -32600, "message": "Invalid request"}}
+        print(json.dumps({"jsonrpc": "2.0", "id": message.get("id"), **reply}), flush=True)
