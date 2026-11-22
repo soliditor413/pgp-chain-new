@@ -20,6 +20,11 @@ button{font:inherit;padding:.4rem .8rem;margin:.4rem .3rem .4rem 0}output{white-
 <label>原生币预算（wei）<input id="budget" inputmode="numeric"></label>
 <label>到期时间（本地时间）<input id="expiry" type="datetime-local"></label>
 <button id="authorize">钱包确认授权</button><button id="pause">暂停采购</button><button id="resume">恢复采购</button><button id="revoke">撤销授权</button></section>
+<section><h2>多签账户密钥恢复</h2>
+<label>待替换的多签成员地址<input id="oldMember" placeholder="0x…"></label>
+<label>新成员地址<input id="newMember" placeholder="0x…"></label>
+<button id="recoveryStatus">查看恢复进度</button><button id="recoveryApprove">同意替换</button>
+<button id="recoveryWithdraw">撤回同意</button><button id="recoveryExecute">执行替换</button></section>
 <section><h2>采购支出</h2>
 <label>截止区块（留空查最近 500 个区块）<input id="endBlock" inputmode="numeric"></label>
 <button id="history">查看支出明细</button><br><output id="payments" aria-live="polite"></output></section>
@@ -34,10 +39,46 @@ const address = id => {
 };
 const word = n => BigInt(n).toString(16).padStart(64, '0');
 const rpc = (method, params = []) => window.ethereum.request({ method, params });
+async function recoverMember(action, chain) {
+  const account = address('account'), previous = address('oldMember'), replacement = address('newMember');
+  if (previous === replacement) throw Error('新地址和待替换地址须不同');
+  const read = (to, data) => rpc('eth_call', [{to, data}, 'latest']);
+  const owner = await read(account, '0x8da5cb5b');
+  if (!/^0x0{24}[0-9a-f]{40}$/i.test(owner)) throw Error('无法读取智能账户的所有者');
+  const council = '0x' + owner.slice(-40);
+  const quorum = await read(council, '0x1703a018');
+  if (!/^0x[0-9a-f]{64}$/i.test(quorum) || BigInt(quorum) < 2n) throw Error('该账户未配置受支持的多签控制合约');
+  const isMember = async addr => BigInt(await read(council, '0xe7d4539e' + word(addr))) === 1n;
+  if (!await isMember(previous)) return '待替换地址当前不属于多签成员';
+  if (await isMember(replacement)) throw Error('新地址已是多签成员');
+  // All members derive the same rotation proposal within the council's current epoch.
+  const rotate = '9e1e2c46' + word(previous) + word(replacement);
+  const tail = word(rotate.length / 2) + rotate.padEnd(192, '0');
+  const args = word(council) + word(96) + word(0) + tail;
+  if (action === 'recoveryStatus') {
+    const id = await read(council, '0x7999f2e1' + args);
+    const state = await read(council, '0x32ed5b12' + id.slice(2));
+    if (!/^0x[0-9a-f]{192}$/i.test(state)) throw Error('无法读取恢复提案');
+    const [votes, readyAt] = state.slice(2).match(/.{64}/g).map(x => BigInt('0x' + x));
+    const lines = ['恢复提案 ' + id, '同意票 ' + votes + ' / ' + BigInt(quorum)];
+    if (readyAt) lines.push('可执行时间 ' + new Date(Number(readyAt) * 1000).toLocaleString());
+    return lines.join('\n');
+  }
+  const [from] = await rpc('eth_requestAccounts');
+  let data = '0xc97b247c' + args;
+  if (action !== 'recoveryExecute') {
+    if (!await isMember(from)) throw Error('请连接当前多签成员钱包');
+    data = '0x23e4491c' + word(council) + word(128) + word(0) + word(action === 'recoveryApprove' ? 1 : 0) + tail;
+  }
+  await rpc('eth_call', [{from, to:council, data}, 'latest']);
+  el('hash').value = await rpc('eth_sendTransaction', [{from, to:council, data, chainId:chain}]);
+  return '已提交密钥恢复操作，请查询交易回执';
+}
 async function invoke(action) {
   if (!window.ethereum) throw Error('请在已连接 EVM 钱包的浏览器中打开');
   const chain = await rpc('eth_chainId');
   if (BigInt(chain) !== BigInt(el('chain').value)) throw Error('请在钱包中切换到所填网络');
+  if (action.startsWith('recovery')) return recoverMember(action, chain);
   if (action === 'receipt') {
     const hash = el('hash').value.trim();
     if (!/^0x[0-9a-f]{64}$/i.test(hash)) throw Error('请填写完整交易哈希');

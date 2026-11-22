@@ -176,3 +176,10 @@ An unavailable finalized head produces unknown. A mismatched canonical block
 returns chain_changed; look up the transaction again before releasing the service.
 
 For services using `PgpResultInbox`, set `PGP_RESULT_INBOX` to the application's trusted inbox on the configured chain. Call the read-only `service_result` tool with the same `taskId` used for payment. It reports whether the service was requested, awaits a proof, or has a verified output commitment at the returned block hash. Use `purchase_receipt` separately for payment and finality. The application defines what its verifier proves and how to retrieve the actual output.
+
+For a council-owned account, the owner console's key recovery section reads the
+council address from the account. Enter the old and replacement member addresses.
+Each remaining member approves the same pair from their own wallet. The status
+view shows the vote count, quorum, and execution time once scheduled. A member
+can withdraw their approval before execution. After the delay, anyone can submit
+the approved replacement. Recovery requires enough available members to reach quorum.
