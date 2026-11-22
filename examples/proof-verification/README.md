@@ -51,6 +51,15 @@ storage. The per-version limit bounds the gas forwarded to the verifier.
 
 ## Validator and governance migration
 
+Parlia routes the existing aggregate finality proof through
+`verifyAttestationProof` with the BLS v1 rule selected by its legacy header layout.
+The caller derives voters and quorum from the canonical snapshot. A new rule
+needs a consensus activation condition and a matching decoder for its key and
+signature formats. Compare verification time and allocations for 4, 21 and 64
+signers with `go test ./consensus/parlia -run TestAttestationProofVersion -bench BenchmarkAttestationProof -benchmem`.
+This benchmark covers key decoding and aggregate verification, excluding block
+execution, network transport and signature generation.
+
 The legacy P-256 producer keys, Parlia block seals and BLS attestations travel
 through distinct consensus and networking paths. A production algorithm change
 needs versioned key registration, epoch activation, serialization and peer

@@ -597,33 +597,15 @@ func (p *Parlia) verifyVoteAttestation(chain consensus.ChainHeaderReader, header
 	if validatorsBitSet.Count() > uint(len(validators)) {
 		return errors.New("invalid attestation, vote number larger than validators number")
 	}
-	votedAddrs := make([]bls.PublicKey, 0, validatorsBitSet.Count())
+	voteKeys := make([][]byte, 0, validatorsBitSet.Count())
 	for index, val := range validators {
-		if !validatorsBitSet.Test(uint(index)) {
-			continue
+		if validatorsBitSet.Test(uint(index)) {
+			voteKeys = append(voteKeys, snap.Validators[val].VoteAddress[:])
 		}
-
-		voteAddr, err := bls.PublicKeyFromBytes(snap.Validators[val].VoteAddress[:])
-		if err != nil {
-			return fmt.Errorf("BLS public key converts failed: %v", err)
-		}
-		votedAddrs = append(votedAddrs, voteAddr)
 	}
-	// The valid voted validators should be no less than 2/3 validators.
-	if len(votedAddrs) < cmath.CeilDiv(len(snap.Validators)*2, 3) {
-		return errors.New("invalid attestation, not enough validators voted")
-	}
-
-	// === Step 5: Signature verification ===
-	aggSig, err := bls.SignatureFromBytes(attestation.AggSignature[:])
-	if err != nil {
-		return fmt.Errorf("BLS signature converts failed: %v", err)
-	}
-	if !aggSig.FastAggregateVerify(votedAddrs, attestation.Data.Hash()) {
-		return errors.New("invalid attestation, signature verify failed")
-	}
-
-	return nil
+	quorum := cmath.CeilDiv(len(snap.Validators)*2, 3)
+	// The existing header layout selects BLS. A new version requires a coordinated fork.
+	return verifyAttestationProof(attestationBLSv1, voteKeys, quorum, attestation.Data.Hash(), attestation.AggSignature[:])
 }
 
 // verifyHeader checks whether a header conforms to the consensus rules.The
