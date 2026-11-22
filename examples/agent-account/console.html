@@ -4,7 +4,7 @@
 <style>
 body{font:16px/1.55 system-ui;background:#f3f5f7;color:#20303e;margin:2rem auto;padding:0 1rem;max-width:48rem}
 section{background:white;border:1px solid #d3dae0;border-radius:.6rem;margin:1rem 0;padding:1rem}
-label{display:block;margin:.6rem 0}input{display:block;width:95%;padding:.5rem;font:inherit}
+[hidden]{display:none!important}label{display:block;margin:.6rem 0}input{display:block;width:95%;padding:.5rem;font:inherit}
 button{font:inherit;padding:.4rem .8rem;margin:.4rem .3rem .4rem 0}output{white-space:pre-wrap;overflow-wrap:anywhere}
 </style>
 <h1>智能体采购授权</h1>
@@ -19,7 +19,12 @@ button{font:inherit;padding:.4rem .8rem;margin:.4rem .3rem .4rem 0}output{white-
 <label>合约调用数据（普通付款留空）<input id="callData" placeholder="0x…"></label>
 <label>原生币预算（wei）<input id="budget" inputmode="numeric"></label>
 <label>到期时间（本地时间）<input id="expiry" type="datetime-local"></label>
-<button id="authorize">钱包确认授权</button><button id="pause">暂停采购</button><button id="resume">恢复采购</button><button id="revoke">撤销授权</button></section>
+<label>钱包操作<select id="ownerAction">
+<option value="direct">所有者直接执行</option><option value="Status">多签 · 查询进度</option>
+<option value="Approve">多签 · 投同意票</option><option value="Withdraw">多签 · 撤回同意</option>
+<option value="Execute">多签 · 执行已通过提案</option></select></label>
+<label id="proposalNumberLabel" hidden>多签提案编号（所有成员填写同一编号）<input id="proposalNumber" inputmode="numeric"></label>
+<button id="authorize">采购授权</button><button id="pause">暂停采购</button><button id="resume">恢复采购</button><button id="revoke">撤销授权</button></section>
 <section><h2>多签账户密钥恢复</h2>
 <label>待替换的多签成员地址<input id="oldMember" placeholder="0x…"></label>
 <label>新成员地址<input id="newMember" placeholder="0x…"></label>
@@ -40,40 +45,48 @@ const address = id => {
 const word = n => BigInt(n).toString(16).padStart(64, '0');
 const emptyDataHash = 'c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470';
 const rpc = (method, params = []) => window.ethereum.request({ method, params });
+const read = (to, data) => rpc('eth_call', [{to, data}, 'latest']);
+async function councilAddress(account) {
+  const owner = await read(account, '0x8da5cb5b');
+  if (!/^0x0{24}[0-9a-f]{40}$/i.test(owner)) throw Error('无法读取智能账户的所有者');
+  return '0x' + owner.slice(-40);
+}
 async function recoverMember(action, chain) {
   const account = address('account'), previous = address('oldMember'), replacement = address('newMember');
   if (previous === replacement) throw Error('新地址和待替换地址须不同');
-  const read = (to, data) => rpc('eth_call', [{to, data}, 'latest']);
-  const owner = await read(account, '0x8da5cb5b');
-  if (!/^0x0{24}[0-9a-f]{40}$/i.test(owner)) throw Error('无法读取智能账户的所有者');
-  const council = '0x' + owner.slice(-40);
-  const quorum = await read(council, '0x1703a018');
-  if (!/^0x[0-9a-f]{64}$/i.test(quorum) || BigInt(quorum) < 2n) throw Error('该账户未配置受支持的多签控制合约');
+  const council = await councilAddress(account);
   const isMember = async addr => BigInt(await read(council, '0xe7d4539e' + word(addr))) === 1n;
   if (!await isMember(previous)) return '待替换地址当前不属于多签成员';
   if (await isMember(replacement)) throw Error('新地址已是多签成员');
   // All members derive the same rotation proposal within the council's current epoch.
   const rotate = '9e1e2c46' + word(previous) + word(replacement);
-  const tail = word(rotate.length / 2) + rotate.padEnd(192, '0');
-  const args = word(council) + word(96) + word(0) + tail;
-  if (action === 'recoveryStatus') {
+  return councilAction(action.slice('recovery'.length), chain, council, council, rotate, 0n);
+}
+async function councilAction(mode, chain, council, target, payload, salt) {
+  const quorum = await read(council, '0x1703a018');
+  if (!/^0x[0-9a-f]{64}$/i.test(quorum) || BigInt(quorum) < 2n) throw Error('该账户未配置受支持的多签控制合约');
+  const tail = word(payload.length / 2) + payload.padEnd(Math.ceil(payload.length / 64) * 64, '0');
+  const args = word(target) + word(96) + word(salt) + tail;
+  if (mode === 'Status') {
     const id = await read(council, '0x7999f2e1' + args);
     const state = await read(council, '0x32ed5b12' + id.slice(2));
-    if (!/^0x[0-9a-f]{192}$/i.test(state)) throw Error('无法读取恢复提案');
-    const [votes, readyAt] = state.slice(2).match(/.{64}/g).map(x => BigInt('0x' + x));
-    const lines = ['恢复提案 ' + id, '同意票 ' + votes + ' / ' + BigInt(quorum)];
-    if (readyAt) lines.push('可执行时间 ' + new Date(Number(readyAt) * 1000).toLocaleString());
+    if (!/^0x[0-9a-f]{192}$/i.test(state)) throw Error('无法读取多签提案');
+    const [votes, readyAt, closed] = state.slice(2).match(/.{64}/g).map(x => BigInt('0x' + x));
+    const lines = ['多签提案 ' + id, '同意票 ' + votes + ' / ' + BigInt(quorum)];
+    if (closed) lines.push('提案已执行');
+    else if (readyAt) lines.push('可执行时间 ' + new Date(Number(readyAt) * 1000).toLocaleString());
     return lines.join('\n');
   }
   const [from] = await rpc('eth_requestAccounts');
   let data = '0xc97b247c' + args;
-  if (action !== 'recoveryExecute') {
-    if (!await isMember(from)) throw Error('请连接当前多签成员钱包');
-    data = '0x23e4491c' + word(council) + word(128) + word(0) + word(action === 'recoveryApprove' ? 1 : 0) + tail;
+  if (mode !== 'Execute') {
+    if (!['Approve', 'Withdraw'].includes(mode)) throw Error('未知多签操作');
+    if (!BigInt(await read(council, '0xe7d4539e' + word(from)))) throw Error('请连接当前多签成员钱包');
+    data = '0x23e4491c' + word(target) + word(128) + word(salt) + word(mode === 'Approve' ? 1 : 0) + tail;
   }
   await rpc('eth_call', [{from, to:council, data}, 'latest']);
   el('hash').value = await rpc('eth_sendTransaction', [{from, to:council, data, chainId:chain}]);
-  return '已提交密钥恢复操作，请查询交易回执';
+  return '已提交多签操作，请查询交易回执';
 }
 async function invoke(action) {
   if (!window.ethereum) throw Error('请在已连接 EVM 钱包的浏览器中打开');
@@ -153,8 +166,7 @@ async function invoke(action) {
     return '已读取当前链上授权';
   }
   if (!['authorize', 'revoke', 'pause', 'resume'].includes(action)) throw Error('未知操作');
-  const [from] = await rpc('eth_requestAccounts');
-  if ((await call('0x8da5cb5b')).slice(-40).toLowerCase() !== from.slice(2).toLowerCase()) throw Error('请连接账户所有者钱包');
+  const mode = el('ownerAction').value;
   let data = '0x74a8f103' + word(agent);
   if (action === 'pause' || action === 'resume') data = '0x89eba0d2' + word(agent) + word(action === 'pause' ? 1 : 0);
   if (action === 'authorize') {
@@ -163,14 +175,23 @@ async function invoke(action) {
     if (!/^0x(?:[0-9a-f]{2})*$/i.test(payload)) throw Error('请填写完整的十六进制调用数据');
     if (n === '0' && payload === '0x') throw Error('普通付款的预算应大于零');
     if (!/^(0|[1-9][0-9]*)$/.test(n) || BigInt(n) >= 2n**256n) throw Error('预算须为有效的 wei 整数');
-    if (!(expiry > Date.now())) throw Error('到期时间须晚于当前时间');
+    if (!Number.isFinite(expiry) || (['direct','Approve'].includes(mode) && expiry <= Date.now())) throw Error('到期时间须晚于当前时间');
     const operationHash = payload === '0x' ? emptyDataHash : (await rpc('web3_sha3', [payload])).slice(2);
     if (!/^[0-9a-f]{64}$/i.test(operationHash)) throw Error('节点未返回有效的调用数据哈希');
     data = '0x5d9bde97' + word(agent) + word(address('target')) + operationHash + word(n) + word(Math.floor(expiry/1000));
   }
+  const owner = await councilAddress(to);
+  if (mode !== 'direct') {
+    const number = el('proposalNumber').value.trim();
+    if (!/^[0-9]{1,78}$/.test(number) || BigInt(number) >= 2n**256n) throw Error('请填写有效的多签提案编号');
+    return councilAction(mode, chain, owner, to, data.slice(2), BigInt(number));
+  }
+  const [from] = await rpc('eth_requestAccounts');
+  if (owner.toLowerCase() !== from.toLowerCase()) throw Error('请连接所有者钱包或选择多签操作');
   el('hash').value = await rpc('eth_sendTransaction', [{from, to, data, chainId:chain}]);
   return '已提交，点击查询回执查看执行结果';
 }
+el('ownerAction').onchange = () => { el('proposalNumberLabel').hidden = el('ownerAction').value === 'direct'; };
 for (const b of document.querySelectorAll('button')) b.onclick = async () => {
   b.disabled = true;
   try { el('feedback').textContent = await invoke(b.id); }

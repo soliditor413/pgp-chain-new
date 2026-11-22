@@ -143,8 +143,7 @@ Serve this directory locally with
 `python3 -m http.server 8080 --bind 127.0.0.1` and open
 `http://127.0.0.1:8080/console.html` in a browser with an EVM wallet.
 Enter the expected chain ID, account contract and agent. Direct owner wallets
-can issue grants, pause, resume and revoke. For a council-owned account, submit
-owner actions through the council's vote and execute workflow. The spending
+can issue grants, pause, resume and revoke. For a council-owned account, select a council action, enter the same proposal number and operation fields on each member's wallet, then click the desired grant, pause, resume or revoke button. Members can inspect progress or withdraw a vote using those same fields. After quorum and delay, select execute. Use a fresh proposal number to repeat an already executed operation. The spending
 history groups matching Paid events by account and agent in 500-block windows.
 
 ### Authorize recurring native purchases
