@@ -16,6 +16,7 @@ button{font:inherit;padding:.4rem .8rem;margin:.4rem .3rem .4rem 0}output{white-
 <output id="grant"></output></section>
 <section><h2>设置采购权限</h2>
 <label>服务收款地址<input id="target" placeholder="0x…"></label>
+<label>合约调用数据（普通付款留空）<input id="callData" placeholder="0x…"></label>
 <label>原生币预算（wei）<input id="budget" inputmode="numeric"></label>
 <label>到期时间（本地时间）<input id="expiry" type="datetime-local"></label>
 <button id="authorize">钱包确认授权</button><button id="pause">暂停采购</button><button id="resume">恢复采购</button><button id="revoke">撤销授权</button></section>
@@ -82,10 +83,15 @@ async function invoke(action) {
   if (action === 'pause' || action === 'resume') data = '0x89eba0d2' + word(agent) + word(action === 'pause' ? 1 : 0);
   if (action === 'authorize') {
     const n = el('budget').value.trim(), expiry = Date.parse(el('expiry').value);
-    if (!/^[1-9][0-9]*$/.test(n) || BigInt(n) >= 2n**256n) throw Error('预算须为有效的 wei 整数');
+    const payload = el('callData').value.trim() || '0x';
+    if (!/^0x(?:[0-9a-f]{2})*$/i.test(payload)) throw Error('请填写完整的十六进制调用数据');
+    if (n === '0' && payload === '0x') throw Error('普通付款的预算应大于零');
+    if (!/^(0|[1-9][0-9]*)$/.test(n) || BigInt(n) >= 2n**256n) throw Error('预算须为有效的 wei 整数');
     if (!(expiry > Date.now())) throw Error('到期时间须晚于当前时间');
     const emptyDataHash = 'c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470';
-    data = '0x5d9bde97' + word(agent) + word(address('target')) + emptyDataHash + word(n) + word(Math.floor(expiry/1000));
+    const operationHash = payload === '0x' ? emptyDataHash : (await rpc('web3_sha3', [payload])).slice(2);
+    if (!/^[0-9a-f]{64}$/i.test(operationHash)) throw Error('节点未返回有效的调用数据哈希');
+    data = '0x5d9bde97' + word(agent) + word(address('target')) + operationHash + word(n) + word(Math.floor(expiry/1000));
   }
   el('hash').value = await rpc('eth_sendTransaction', [{from, to, data, chainId:chain}]);
   return '已提交，点击查询回执查看执行结果';

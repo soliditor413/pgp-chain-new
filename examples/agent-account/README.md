@@ -2,8 +2,9 @@
 
 A service-buying agent can request native-currency payments against a grant from
 the wallet owner. The account stores a target, exact calldata hash, native wei
-budget, expiry (Unix seconds), and generation for each session key. The tools
-here use empty calldata. ERC-20 amounts require a token-specific policy.
+budget, expiry (Unix seconds), and generation for each session key. Omitting data selects an ordinary payment. Supply optional hex data to call
+an approved contract, including a zero-wei call. The grant must bind the exact
+calldata hash and the signer policy must approve those same bytes. ERC-20 amounts require a token-specific policy.
 
 ## Connect an agent
 

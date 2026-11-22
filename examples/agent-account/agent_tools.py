@@ -14,7 +14,7 @@ TOOL = {
     "inputSchema": {
         "type": "object", "additionalProperties": False,
         "properties": {key: {"type": "string", "pattern": pattern} for key, pattern in {
-            "recipient": "^0x[0-9a-fA-F]{40}$", "amountWei": "^[1-9][0-9]*$",
+            "recipient": "^0x[0-9a-fA-F]{40}$", "amountWei": "^(0|[1-9][0-9]{0,77})$", "data": "^0x(?:[0-9a-fA-F]{2})*$",
             "taskId": "^0x[0-9a-fA-F]{64}$"}.items()},
         "required": ["recipient", "amountWei", "taskId"]}}
 
@@ -41,11 +41,14 @@ def rpc(method, params):
 
 def check_purchase(args, block=None):
     schema = TOOL["inputSchema"]
-    if set(args) != set(schema["required"]) or any(
+    if not set(schema["required"]) <= args.keys() <= schema["properties"].keys() or any(
         not isinstance(args[k], str) or not re.fullmatch(v["pattern"], args[k])
-        for k, v in schema["properties"].items()
+        for k, v in schema["properties"].items() if k in args
     ):
         raise ValueError("invalid purchase arguments")
+    data = args.get("data", "0x")
+    if int(args["amountWei"]) >= 2**256 or (args["amountWei"] == "0" and data == "0x"):
+        raise ValueError("invalid native amount")
     account, agent = (os.environ[k] for k in ("PGP_ACCOUNT", "PGP_AGENT"))
     if not all(re.fullmatch(r"0x[0-9a-fA-F]{40}", addr) for addr in (agent, account)):
         raise ValueError("invalid configured account or agent")
@@ -63,7 +66,8 @@ def check_purchase(args, block=None):
         return {"status": "already_paid"}
     target, call_hash, budget, expiry, generation = read("0xb869cea3" + agent[2:].zfill(64), 5)
     reasons = []
-    if target[-40:] != args["recipient"][2:].lower() or call_hash != EMPTY_CALL_HASH:
+    expected_hash = EMPTY_CALL_HASH if data == "0x" else rpc("web3_sha3", [data])[2:].lower()
+    if target[-40:] != args["recipient"][2:].lower() or call_hash != expected_hash:
         reasons.append("target_or_operation")
     if int(expiry, 16) <= int(block["timestamp"], 16):
         reasons.append("grant_expired_or_missing")
@@ -123,6 +127,11 @@ def split_signature(signature):
     return recovery, signature[2:66], signature[66:130]
 
 
+def encode_call_bytes(args):
+    raw = args.get("data", "0x")[2:]
+    return format(len(raw) // 2, "064x") + raw.ljust((len(raw) + 63) // 64 * 64, "0")
+
+
 def simulate_purchase(args):
     recovery, r, s = split_signature(args.get("signature"))
     result = check_purchase({k: v for k, v in args.items() if k != "signature"})
@@ -130,8 +139,8 @@ def simulate_purchase(args):
         return result
     words = [os.environ["PGP_AGENT"][2:], args["taskId"][2:],
              format(int(args["amountWei"]), "x"), format(7 * 32, "x"),
-             format(recovery, "x"), r, s, "0"]
-    tx = {"to": os.environ["PGP_ACCOUNT"], "data": "0xf959dd1b" + "".join(w.zfill(64) for w in words)}
+             format(recovery, "x"), r, s]
+    tx = {"to": os.environ["PGP_ACCOUNT"], "data": "0xf959dd1b" + "".join(w.zfill(64) for w in words) + encode_call_bytes(args)}
     rpc("eth_call", [tx, {"blockHash": result["blockHash"], "requireCanonical": True}])
     return {"status": "simulated", "transaction": tx, "blockHash": result["blockHash"]}
 
@@ -246,9 +255,9 @@ def submit_batch(args):
     offset = len(items) * 32
     for p in items:
         recovery, r, s = split_signature(p["signature"])
-        # Payment tuple: six head words, followed by the empty bytes length.
+        # Payment tuple: six head words, followed by ABI-encoded call bytes.
         encoded = (p["taskId"][2:] + word(int(p["amountWei"])) + word(192)
-                   + word(recovery) + r + s + word(0))
+                   + word(recovery) + r + s + encode_call_bytes(p))
         offsets.append(word(offset))
         tuples.append(encoded)
         offset += len(encoded) // 2

@@ -29,7 +29,8 @@ def sign_purchase(intent, policy, sign):
     # Use only amounts and destinations supplied independently by the operator.
     task = intent["taskId"].lower()
     approved = policy["tasks"].get(task)
-    if (not approved or set(intent) != {"taskId", "amountWei", "recipient"}
+    if (not approved or not {"taskId", "amountWei", "recipient"} <= intent.keys() <= {"taskId", "amountWei", "recipient", "data"}
+            or intent.get("data", "0x").lower() != approved.get("data", "0x").lower()
             or intent["recipient"].lower() != approved["recipient"].lower()
             or intent["amountWei"] != approved["amountWei"]):
         return {"status": "task_not_approved"}
@@ -51,7 +52,7 @@ def serve(socket_path, policy_path):
         def handle(self):
             self.request.settimeout(10)
             try:
-                intent = json.loads(self.rfile.readline(4096))
+                intent = json.loads(self.rfile.readline(1024 * 1024))
                 policy = json.loads(Path(policy_path).read_text())
                 result = sign_purchase(intent, policy, clef_sign)
             except (OSError, ValueError, KeyError, TypeError, AttributeError):

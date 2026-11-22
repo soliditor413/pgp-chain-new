@@ -16,7 +16,7 @@ class SignerTests(unittest.TestCase):
 
     def test_changed_intent_refused_before_rpc(self):
         with patch.object(session_signer, "prepare_purchase") as prepare:
-            for change in [dict(recipient=self.policy["account"]), dict(amountWei="81"),
+            for change in [dict(recipient=self.policy["account"]), dict(amountWei="81"), dict(data="0x12345678"),
                            dict(taskId="0x" + "bb"*32)]:
                 result = session_signer.sign_purchase({**self.intent, **change}, self.policy, self.sign)
                 self.assertEqual(result["status"], "task_not_approved")
