@@ -7,6 +7,7 @@ import sys
 from urllib.parse import urlsplit
 from urllib.request import ProxyHandler, Request, build_opener, urlopen
 
+PAID_EVENT = "0x37db9851b6c9a32f8ddcf4734e6526de7c85268ef735f7883ea70dc8a39c9c85"
 EMPTY_CALL_HASH = "c5d2460186f7233c927e7db2dcc703c0e500b653ca82273b7bfad8045d85a470"
 TOOL = {
     "name": "check_purchase",
@@ -189,7 +190,7 @@ def purchase_receipt(args):
         topics = [t.lower() for t in event["topics"]]
         if (event["address"].lower() == os.environ["PGP_ACCOUNT"].lower()
                 and len(topics) == 4 and not event.get("removed", False)
-                and topics[0] == "0x37db9851b6c9a32f8ddcf4734e6526de7c85268ef735f7883ea70dc8a39c9c85"
+                and topics[0] == PAID_EVENT
                 and topics[1] == args["taskId"].lower()
                 and topics[2][-40:] == os.environ["PGP_AGENT"][2:].lower()):
             return {"status": "payment_included", **details,
@@ -315,7 +316,59 @@ def request_signature(args):
             return json.loads(stream.readline(65536))
 
 
+ACTIVITY = {
+    "name": "review_purchase_activity",
+    "description": "Inspect recent settled payments and flag transfers above an optional review threshold.",
+    "inputSchema": {"type": "object", "additionalProperties": False, "properties": {
+        "endBlock": {"type": "integer", "minimum": 0},
+        "reviewAboveWei": {"type": "string", "pattern": "^[0-9]+$"}}}}
+
+
+def review_activity(args):
+    if set(args) - {"endBlock", "reviewAboveWei"}:
+        raise ValueError("unexpected activity argument")
+    end = args.get("endBlock")
+    threshold = args.get("reviewAboveWei")
+    if end is not None and (type(end) is not int or end < 0):
+        raise ValueError("invalid end block")
+    if threshold is not None and not re.fullmatch("[0-9]+", threshold):
+        raise ValueError("invalid review threshold")
+    account, agent = (os.environ[key] for key in ("PGP_ACCOUNT", "PGP_AGENT"))
+    if not all(re.fullmatch("0x[0-9a-fA-F]{40}", addr) for addr in (account, agent)):
+        raise ValueError("invalid configured account or agent")
+    anchor = rpc("eth_getBlockByNumber", ["latest" if end is None else hex(end), False])
+    if not anchor:
+        return {"status": "block_unavailable"}
+    end = int(anchor["number"], 16)
+    start = max(0, end - 499)
+    topic = "0x" + agent[2:].lower().zfill(64)
+    logs = rpc("eth_getLogs", [{"address": account, "fromBlock": hex(start), "toBlock": hex(end),
+                                "topics": [PAID_EVENT, None, topic]}])
+    entries = []
+    total = 0
+    for log in logs:
+        if log.get("removed"):
+            continue
+        topics = log["topics"]
+        if (log["address"].lower() != account.lower() or len(topics) != 4
+                or topics[0].lower() != PAID_EVENT or topics[2].lower() != topic):
+            raise ValueError("unexpected payment log")
+        value = int(log["data"], 16)
+        total += value
+        entries.append({"taskId": topics[1], "recipient": "0x" + topics[3][-40:],
+                        "amountWei": str(value), "txHash": log["transactionHash"],
+                        "blockNumber": int(log["blockNumber"], 16),
+                        "aboveReviewThreshold": threshold is not None and value > int(threshold)})
+    current = rpc("eth_getBlockByNumber", [hex(end), False])
+    if not current or current["hash"] != anchor["hash"]:
+        return {"status": "chain_changed", "action": "Repeat the activity query."}
+    return {"status": "reviewed", "fromBlock": start, "toBlock": end,
+            "endBlockHash": anchor["hash"], "previousEndBlock": start - 1 if start else None,
+            "count": len(entries), "nativeValueForwardedWei": str(total), "payments": entries}
+
+
 HANDLERS = {
+    "review_purchase_activity": review_activity,
     "check_purchase": check_purchase,
     "prepare_purchase": prepare_purchase,
     "sign_purchase": request_signature,
@@ -334,8 +387,8 @@ def dispatch(message):
         return {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
                 "serverInfo": {"name": "pgp-agent", "version": "0.1"}}
     if method == "tools/list":
-        specs = [TOOL, PREPARE, SIMULATE, SUBMIT, RECEIPT, PREPARE_BATCH, SIMULATE_BATCH, SUBMIT_BATCH, SIGN]
-        read_only = {"check_purchase", "prepare_purchase", "simulate_purchase",
+        specs = [TOOL, PREPARE, SIMULATE, SUBMIT, RECEIPT, PREPARE_BATCH, SIMULATE_BATCH, SUBMIT_BATCH, SIGN, ACTIVITY]
+        read_only = {"review_purchase_activity", "check_purchase", "prepare_purchase", "simulate_purchase",
                      "purchase_receipt", "prepare_purchase_batch", "simulate_purchase_batch"}
         return {"tools": [{**spec, "annotations": {"readOnlyHint": spec["name"] in read_only}}
                           for spec in specs]}

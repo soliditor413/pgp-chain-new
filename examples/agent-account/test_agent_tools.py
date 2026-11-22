@@ -84,6 +84,20 @@ class PurchaseTests(unittest.TestCase):
         with patch.object(agent, "rpc", return_value=receipt):
             self.assertNotIn("transactionExecutionFeeWei", agent.purchase_receipt(args))
 
+    def test_review_reports_evidence_only_on_a_stable_chain(self):
+        block = {"number": "0x200", "hash": self.at}
+        event = {"address": self.account, "topics": [agent.PAID_EVENT, self.task,
+                 "0x" + self.key[2:].zfill(64), "0x" + self.target[2:].zfill(64)],
+                 "data": "0x15", "blockNumber": "0x200", "transactionHash": self.task}
+        with patch.object(agent, "rpc", side_effect=[block, [event], block]) as node:
+            report = agent.review_activity({"reviewAboveWei": "20"})
+        self.assertTrue(report["payments"][0]["aboveReviewThreshold"])
+        self.assertEqual(report["nativeValueForwardedWei"], "21")
+        self.assertEqual(report["previousEndBlock"], 12)
+        self.assertEqual(node.call_args_list[1].args[1][0]["address"], self.account)
+        with patch.object(agent, "rpc", side_effect=[block, [event], dict(block, hash="changed")]):
+            self.assertEqual(agent.review_activity({})["status"], "chain_changed")
+
     def test_signed_intent(self):
         typed = self.prepare()["typedData"]
         self.assertEqual(typed["domain"], dict(chainId="860621", verifyingContract=self.account))
