@@ -69,9 +69,17 @@ def check_purchase(args, block=None):
         reasons.append("grant_expired_or_missing")
     if int(budget, 16) < int(args["amountWei"]):
         reasons.append("budget")
-    return {"status": "needs_authorization" if reasons else "within_grant",
+    result = {"status": "needs_authorization" if reasons else "within_grant",
             "reasons": reasons, "remainingWei": str(int(budget, 16)),
             "generation": str(int(generation, 16)), "blockHash": block["hash"]}
+
+    if reasons:
+        result["policy"] = {"recipient": "0x" + target[-40:], "callDataHash": "0x" + call_hash,
+                            "expiresAt": int(expiry, 16), "blockTimestamp": int(block["timestamp"], 16),
+                            "requestedWei": args["amountWei"],
+                            "budgetShortfallWei": str(max(0, int(args["amountWei"]) - int(budget, 16)))}
+        result["action"] = "Stop this purchase and ask the owner to review the grant."
+    return result
 
 
 PREPARE = {**TOOL, "name": "prepare_purchase",
@@ -284,7 +292,11 @@ def dispatch(message):
         return {"protocolVersion": "2024-11-05", "capabilities": {"tools": {}},
                 "serverInfo": {"name": "pgp-agent", "version": "0.1"}}
     if method == "tools/list":
-        return {"tools": [TOOL, PREPARE, SIMULATE, SUBMIT, RECEIPT, PREPARE_BATCH, SUBMIT_BATCH, SIGN]}
+        specs = [TOOL, PREPARE, SIMULATE, SUBMIT, RECEIPT, PREPARE_BATCH, SUBMIT_BATCH, SIGN]
+        read_only = {"check_purchase", "prepare_purchase", "simulate_purchase",
+                     "purchase_receipt", "prepare_purchase_batch"}
+        return {"tools": [{**spec, "annotations": {"readOnlyHint": spec["name"] in read_only}}
+                          for spec in specs]}
     if method == "ping":
         return {}
     if method == "tools/call" and message["params"]["name"] in HANDLERS:
