@@ -1,3 +1,12 @@
+## PGP Agent 支付
+
+PGP 的智能账户和 MCP 工具让 Agent 在用户授权的收款方、调用数据、预算和期限内采购服务。
+钱包可以暂停或撤销授权，服务可以按任务 ID 核对链上付款回执。
+
+- [部署账户、连接 Agent 和独立签名器](examples/agent-account/README.md)
+- [钱包授权和支出控制台](examples/agent-account/console.html)
+- [多方审批、密钥恢复和版本化证明验证](examples/proof-verification/README.md)
+
 ## BNB Smart Chain
 
 The goal of BNB Smart Chain is to bring programmability and interoperability to BNB Beacon Chain. In order to embrace the existing popular community and advanced technology, it will bring huge benefits by staying compatible with all the existing smart contracts on Ethereum and Ethereum tooling. And to achieve that, the easiest solution is to develop based on go-ethereum fork, as we respect the great work of Ethereum very much.

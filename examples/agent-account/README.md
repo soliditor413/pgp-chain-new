@@ -104,3 +104,22 @@ The agent calls sign_purchase with the original purchase arguments. On each
 request the signer rereads the owner's policy, queries the chain and reconstructs
 the typed payment before asking Clef to sign. The generation must match the
 grant created by the owner. Return the signature to submit_purchase.
+
+## Review a signed operation
+
+Call simulate_purchase or simulate_purchase_batch before submission. The
+preview lists the target, exact calldata, task ID and native wei forwarded for
+each call. feeEstimate gives estimated gas units, gas price and the sponsor's
+estimated fee in wei. The forwarded native value excludes token transfers or
+other internal effects of arbitrary contracts. Fees and chain state may change
+between simulation and inclusion. Submission rechecks the grant and fee caps.
+
+## Open the owner console
+
+Serve this directory locally with
+`python3 -m http.server 8080 --bind 127.0.0.1` and open
+`http://127.0.0.1:8080/console.html` in a browser with an EVM wallet.
+Enter the expected chain ID, account contract and agent. Direct owner wallets
+can issue grants, pause, resume and revoke. For a council-owned account, submit
+owner actions through the council's vote and execute workflow. The spending
+history groups matching Paid events by account and agent in 500-block windows.
