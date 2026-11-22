@@ -59,3 +59,13 @@ and measurements with a representative validator set. The account contract's
 migration changes none of those consensus formats. Council governance currently
 uses EVM sender identities; upgrading its authentication needs its own deployed
 controllers and a recovery quorum. No post-quantum algorithm has been selected.
+
+PgpResultInbox demonstrates the application side for an off-chain computation.
+The requester records a salted input commitment for a unique task. The service
+submits an output commitment and proof to that task's inbox; the signed or proven
+statement binds the chain, inbox, scheme, version, task, input and output. Query
+the Verified event by task ID to find accepted results. Store the witness and
+any encrypted payload in the application's chosen off-chain storage. The scheme
+must implement the service-specific validity rules. The regression fixture uses
+a signature attestation to test routing and replay; it provides no zero-knowledge
+or confidentiality guarantee.
