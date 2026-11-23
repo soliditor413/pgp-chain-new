@@ -3,6 +3,8 @@
 PGP 的智能账户和 MCP 工具让 Agent 在用户授权的收款方、调用数据、预算和期限内采购服务。
 钱包可以暂停或撤销授权，服务可以按任务 ID 核对链上付款回执。
 
+- [中文产品能力、设计对照与开发接口](examples/PGP-AI.md)
+- [链外商户服务与 HTTP 接口](examples/offchain-service/README.md)
 - [部署账户、连接 Agent 和独立签名器](examples/agent-account/README.md)
 - [钱包授权和支出控制台](examples/agent-account/console.html)
 - [多方审批、密钥恢复和版本化证明验证](examples/proof-verification/README.md)
