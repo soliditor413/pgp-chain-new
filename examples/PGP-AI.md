@@ -47,6 +47,21 @@
 
 **重试规则**　submission_unconfirmed 表示节点可能已收到提交。保留原任务号，先核对链上支出和代付账户交易。awaiting_receipt 可轮询；reverted 表示交易执行失败；no_matching_payment 表示没有找到该账户、会话和任务的付款事件。chain_changed 需要重查规范链。finality 为 unknown 或 awaiting_finality 时延迟不可逆交付。链上付款成功与服务输出通过验证是两个独立条件。
 
+## 联调时如何定位问题
+
+先看是哪一步返回了错误。MCP 返回的 result.isError 为 true 时，请从 content[0].text 解码 status；业务拒绝通常在 isError 为 false 时返回。
+
+| 出现位置 | 状态或现象 | 处理办法 |
+| --- | --- | --- |
+| 查授权 | inspect_grant 返回 active，但购买仍被拒绝 | active 表示授权在有效期内。逐项核对剩余额度、报价收款方及 calldata 哈希 |
+| 请求签名 | task_not_approved | 对照签名器策略中的任务号、金额、收款方和 data；精确任务条目优先于连续采购策略 |
+| 请求签名 | signer_policy_mismatch | 核对签名器固定的 chainId、account、agent 和 generation；暂停后恢复或重新授权会改变代次 |
+| 节点调用 | node_rejected_request 或 service_unreachable | 查看返回的 method 和 code（如有），检查 RPC 或签名器套接字的地址、权限和连通性 |
+| 代付 | sponsor_budget_exceeded | 查看预演返回的 gas、gasPriceWei 和 feeWei，核对代付者设置的 gas 与费用上限 |
+| 业务验收 | 支付已确认，service_result 仍是 unrequested | 两条交付路径独立。文本服务凭商户 HTTP 接口领取；使用 PgpResultInbox 的应用需先登记任务，再提交应用认可的证明 |
+
+预演中的 nativeValueForwardedWei 是发送给服务的原生币总额。feeEstimate 是代付者按节点估值预计承担的费用。最终回执的 transactionExecutionFeeWei 以实际 gasUsed 和 effectiveGasPrice 计算；一笔批量交易的每个任务回执引用同一笔费用，汇总费用时按交易哈希去重。
+
 ## 合约与维护入口
 
 | 组件 | 如何实现与使用 |
