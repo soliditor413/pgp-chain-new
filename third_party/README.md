@@ -163,10 +163,15 @@ LC_ALL=C find . -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 \
 
 **三个必须保留的细节，缺一个就会静默丢文件**：
 
-> 本节只覆盖「清单 ← 目录」这一跳。更上一跳「h1 ← 归档 zip」的复算方法见
-> `audit/pr-1-ci-dependency-fix.md` §4.2（用 `golang.org/x/mod/sumdb/dirhash.HashZip`
-> 的 `Hash1` 从 zip 直接重算，与 `go.sum` 比对）。那一跳通过后，本目录才可宣称
-> provenance 闭合——`h1` 无法从目录内容重算，归档 zip 是链的根。
+> 本节只覆盖「清单 ← 目录」这一跳。更上一跳「h1 ← 归档 zip」用仓库自带脚本复算：
+>
+> ```bash
+> go run build/verify-h1.go <归档目录>/elastos-ela.zip      # 输出应与上表 ELA 的 h1 一致
+> go run build/verify-h1.go <归档目录>/elastos-ela-spv.zip  # 输出应与上表 SPV 的 h1 一致
+> ```
+>
+> 两跳都通过，本目录才可宣称 provenance 闭合——`h1` 无法从目录内容重算，归档 zip
+> 是整条链的根。
 
 | 细节 | 少了会怎样 |
 |---|---|
