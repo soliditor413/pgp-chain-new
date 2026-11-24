@@ -72,8 +72,14 @@ jobs:
         shell: bash
         run: |
           set -uo pipefail
-          govulncheck ./... > govulncheck-symbol.txt 2>&1
-          rc=$?
+          # ⚠️ 本 step 实际以 `bash --noprofile --norc -e -o pipefail {0}` 运行（Actions 对
+          # shell: bash 默认注入 -e，见 CI 日志头部 shell: 行）。脚本首行的 set -uo 关不掉
+          # 外层 -e：若写成「govulncheck …; rc=$?」，govulncheck 以 3 退出时会在本行直接
+          # 中止整个脚本，rc 捕获与下面的报告分支永远不执行，退出码 3 原样穿透成 job 失败
+          # （2026-11-24 CI 实测）。必须用 `|| rc=$?` 捕获——|| 右侧求值不触发 errexit。
+          # 本地复跑本段逻辑时，必须用 `bash -e -o pipefail` 而不是裸 bash，否则复现不了。
+          rc=0
+          govulncheck ./... > govulncheck-symbol.txt 2>&1 || rc=$?
           cat govulncheck-symbol.txt
           total=$(grep -cE '^Vulnerability #' govulncheck-symbol.txt || true)
 
