@@ -163,21 +163,23 @@ LC_ALL=C find . -type f -print0 | LC_ALL=C sort -z | xargs -0 shasum -a 256 \
 
 **三个必须保留的细节，缺一个就会静默丢文件**：
 
-> 本节只覆盖「清单 ← 目录」这一跳。更上一跳「h1 ← 归档 zip」用仓库自带脚本复算：
->
-> ```bash
-> go run build/verify-h1.go <归档目录>/elastos-ela.zip      # 输出应与上表 ELA 的 h1 一致
-> go run build/verify-h1.go <归档目录>/elastos-ela-spv.zip  # 输出应与上表 SPV 的 h1 一致
-> ```
->
-> 两跳都通过，本目录才可宣称 provenance 闭合——`h1` 无法从目录内容重算，归档 zip
-> 是整条链的根。
-
 | 细节 | 少了会怎样 |
 |---|---|
 | `-print0` + `sort -z` + `xargs -0` | 上游含一个带空格的文件 `./.idea/fileTemplates/internal/Go File.go`，朴素写法 `find \| sort \| xargs shasum` 会把它切成两段：**输出只有 728 行**（实测），stderr 报 `No such file or directory`，**退出码非 0**（macOS 为 `1`，GNU `xargs` 为 `123`）。它**会**报警——危险的是脚本吞掉 stderr 或忽略退出码（`\|\| true`、未开 `set -e`、未开 `pipefail`） |
 | `LC_ALL=C` | 排序受 locale 影响，`diff` 会假报差异 |
 | `-a 256` 与 `shasum` 的路径前缀 | 本清单是 `shasum` 生成的 `hash␣␣./path` 格式（macOS 与多数 Linux 自带；CI 的 `sha256sum` 输出同格式，可互换）。**不要**加 `--binary`：它写出的是 `hash␣*./path`，`shasum -c` 其实能解析（实测 6.02 通过，含带空格文件名），但与清单格式不一致，`diff` 必然报差异，"逐字节一致"这个判据随之失效 |
+
+> 本节只覆盖「清单 ← 目录」这一跳。更上一跳「h1 ← 归档 zip」用仓库自带脚本复算。
+> **归档 zip 不在本仓库内**——它无法从目录内容重建，是整条信任链唯一的根，须从制品库或
+> 备份取得。拿到后运行：
+>
+> ```bash
+> go run build/verify-h1.go <归档路径>/elastos-ela.zip      # 输出应与上表 ELA 的 h1 一致
+> go run build/verify-h1.go <归档路径>/elastos-ela-spv.zip  # 输出应与上表 SPV 的 h1 一致
+> ```
+>
+> 两跳都通过，本目录才可宣称 provenance 闭合。
+
 
 ### 绝对禁止：为了消红而重新生成清单
 
