@@ -42,7 +42,7 @@ profile.tmp
 profile.cov
 
 # IdeaIDE
-.idea
+/.idea
 *.iml
 
 # VS Code
@@ -101,3 +101,7 @@ cmd/keeper/keeper
 /.tmp-gate-run/
 /tmp-keyscan/
 __pycache__/
+
+# third_party 下的嵌套 module 不应有自己的 go.sum；
+# 源码完整性由 third_party/*.SHA256SUMS 保证。
+third_party/*/go.sum

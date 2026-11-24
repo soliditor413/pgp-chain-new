@@ -339,6 +339,8 @@ require (
 
 replace (
 	github.com/cometbft/cometbft => github.com/bnb-chain/greenfield-cometbft v1.3.2
+	github.com/elastos/Elastos.ELA => ./third_party/elastos-ela
+	github.com/elastos/Elastos.ELA.SPV => ./third_party/elastos-ela-spv
 	github.com/tendermint/tendermint => github.com/bnb-chain/tendermint v0.31.17
 )
 

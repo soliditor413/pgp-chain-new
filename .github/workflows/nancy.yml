@@ -1,47 +1,145 @@
-name: Go Nancy
+name: Go Vulnerability Scan
 
 on:
-    # Scan changed files in PRs from same repository only:
-    pull_request:
-      types: [opened, synchronize, reopened]
-    # Scan on-demand through GitHub Actions interface:
-    workflow_dispatch: {}
-    # Scan mainline branches and report all findings:
-    push:
-      branches: ["master", "develop"]
+  # 同仓 PR（fork PR 见 job 的 if 说明）
+  pull_request:
+    types: [opened, synchronize, reopened]
+  # 手动触发
+  workflow_dispatch: {}
+  # 主干分支：合并后全量扫描
+  push:
+    branches: ["master", "develop"]
+  # 依赖没变，但漏洞库每天都在变。只在合并那一刻扫一次，等于漏掉绝大部分时间窗口。
+  schedule:
+    - cron: "0 3 * * 1"
+
+# 最小权限：这个 job 只需要读代码
+permissions:
+  contents: read
+
+concurrency:
+  group: vuln-scan-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
+  # job id / matrix 值都不要改：GitHub 的 check 名是 `build (1.25.x, ubuntu-latest)`，
+  # 分支保护里若写死了这个名字，改名会让 PR 永远卡在 "Expected — waiting"。
   build:
-    if: github.event.pull_request.head.repo.full_name == github.repository
+    # 原写法 `github.event.pull_request.head.repo.full_name == github.repository`
+    # 在 push / workflow_dispatch 下 github.event.pull_request 为 null，比较结果恒为 false，
+    # 整个 job 被跳过 —— 文件注释里承诺的 "Scan mainline branches" 从未执行过。
+    # 现在：非 PR 事件直接放行；PR 事件只放行同仓 PR，fork PR 仍然跳过。
+    if: ${{ github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository }}
     strategy:
-        matrix:
-          go-version: [1.25.x]
-          os: [ubuntu-latest]
+      matrix:
+        go-version: [1.25.x]
+        os: [ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    # 扫描卡死时不要把 runner 烧满 6 小时
+    timeout-minutes: 20
+    env:
+      # 门禁开关（单一来源：要翻转只改这一行，不去翻脚本逻辑）
+      #   "false" = 有漏洞只报告、不拦路（当前：存量漏洞未清理）
+      #   "true"  = 发现可触达漏洞就让 job 变红
+      # 翻转前置条件：先落地抑制名单机制（本仓仓库根 .nancy-ignore 里的 4 条抑制仍然有效，
+      # 但本 workflow 当前不读取它 —— 见下方 Vulnerability scan 步骤的说明）。
+      VULN_SCAN_HARD_FAIL: "false"
     steps:
-    - name: Check out code into the Go module directory
-      uses: actions/checkout@v4
+      - name: Check out code into the Go module directory
+        uses: actions/checkout@v4
 
-    - name: Set up Go 1.x in order to write go.list file
-      uses: actions/setup-go@v5
-      with:
-        go-version: ${{ matrix.go-version }}
-    
-    - name: Install Nancy
-      run: |
-        curl -sSL -o nancy https://github.com/sonatype-nexus-community/nancy/releases/download/v1.0.52/nancy-v1.0.52-linux-amd64
-        chmod +x nancy
-        sudo mv nancy /usr/local/bin/
-        file /usr/local/bin/nancy
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: ${{ matrix.go-version }}
+          cache: true
+          cache-dependency-path: go.sum
 
-    - name: Nancy Security Scan
-      shell: bash
-      env:
-        OSSINDEX_USERNAME: ${{ secrets.OSSINDEX_USERNAME }}
-        OSSINDEX_TOKEN: ${{ secrets.OSSINDEX_TOKEN }}
-      run: |
-        if [[ -z "${OSSINDEX_USERNAME:-}" || -z "${OSSINDEX_TOKEN:-}" ]]; then
-          echo "::error::Missing OSS Index credentials"
-        fi
-        
-        go list -json -deps ./... | nancy sleuth --username "${OSSINDEX_USERNAME}" --token "${OSSINDEX_TOKEN}"
+      - name: Install govulncheck
+        shell: bash
+        run: |
+          set -euo pipefail
+          # 固定版本。v1.5.0 要求 go >= 1.25，与 CI 的 1.25.x 对齐，不会触发
+          # GOTOOLCHAIN 自动下载额外工具链。
+          # 想升到 v1.10.0：先把上面 matrix 的 go-version 抬到 1.26.x，再改这里的版本号。
+          go install golang.org/x/vuln/cmd/govulncheck@v1.5.0
+          echo "$(go env GOPATH)/bin" >> "$GITHUB_PATH"
+          "$(go env GOPATH)/bin/govulncheck" -version
+
+      # 覆盖边界：Elastos.ELA / Elastos.ELA.SPV 是目录 replace 进来的本地模块，SBOM 里
+      # 只有本地路径、没有 module path + version → 不进漏洞库，本扫描（以及任何 SCA）都覆盖不到，只能人工读码。
+      - name: Vulnerability scan (reachable code)
+        shell: bash
+        run: |
+          set -uo pipefail
+          # ⚠️ 本 step 实际以 `bash --noprofile --norc -e -o pipefail {0}` 运行（Actions 对
+          # shell: bash 默认注入 -e，见 CI 日志头部 shell: 行）。脚本首行的 set -uo 关不掉
+          # 外层 -e：若写成「govulncheck …; rc=$?」，govulncheck 以 3 退出时会在本行直接
+          # 中止整个脚本，rc 捕获与下面的报告分支永远不执行，退出码 3 原样穿透成 job 失败
+          # （2026-11-24 CI 实测）。必须用 `|| rc=$?` 捕获——|| 右侧求值不触发 errexit。
+          # 本地复跑本段逻辑时，必须用 `bash -e -o pipefail` 而不是裸 bash，否则复现不了。
+          rc=0
+          govulncheck ./... > govulncheck-symbol.txt 2>&1 || rc=$?
+          cat govulncheck-symbol.txt
+          total=$(grep -cE '^Vulnerability #' govulncheck-symbol.txt || true)
+
+          {
+            echo "### govulncheck（可达代码，symbol 级）"
+            echo ""
+            echo "- 退出码：${rc}（0 = 未发现，3 = 有发现，1/2 = 扫描器自身故障）"
+            echo "- 漏洞条目数：${total}"
+            echo "- 门禁模式：VULN_SCAN_HARD_FAIL=${VULN_SCAN_HARD_FAIL}"
+            echo ""
+            echo "完整输出见本步骤日志。"
+            echo ""
+            echo "注：仓库根的 .nancy-ignore 是给已下线的 nancy 用的抑制名单，"
+            echo "本 workflow 当前**不读取**它。抑制机制待定，因此现在不是硬门禁。"
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
+
+          # govulncheck 退出码语义（实测确认，不要凭猜）：
+          #   0 = 未发现漏洞
+          #   3 = 发现漏洞
+          #   1 = 扫描器自身执行失败（例如漏洞库不可达）
+          #   2 = 用法错误（例如给 -scan=module 传了包路径）
+          # 「有漏洞」和「扫描器坏了」必须走不同分支：前者可以降级为报告，
+          # 后者绝对不能放过 —— 否则就变成「扫描器坏了，PR 依然全绿」的静默失效，
+          # 那和旧版那句不 exit 的 ::error:: 是同一类错误。
+          if [ "$rc" -eq 0 ]; then
+            echo "::notice::govulncheck 未发现可触达漏洞"
+            exit 0
+          fi
+
+          if [ "$rc" -eq 3 ]; then
+            if [ "${VULN_SCAN_HARD_FAIL}" = "true" ]; then
+              echo "::error::govulncheck 发现可触达漏洞（退出码 3），门禁拦下"
+              exit 3
+            fi
+            # 用 warning 而不是 error：这是报告模式，不是失败。
+            # 也别再造一条误导性的 Error 行 —— 旧版 nancy 步骤就栽在
+            # 「先 echo ::error::、再继续跑」上面，让人以为是它导致了失败。
+            echo "::warning::govulncheck 发现 ${total} 处可触达漏洞；当前为报告模式，未阻断 PR。存量清理后把 env.VULN_SCAN_HARD_FAIL 改成 true"
+            exit 0
+          fi
+
+          echo "::error::govulncheck 自身执行失败（退出码 ${rc}）：这不是漏洞发现，是扫描器/漏洞库/用法的问题，必须修"
+          exit "$rc"
+
+      - name: Vulnerability inventory (module level, informational)
+        # 这一层保留 nancy 原有的「广度」：所有依赖模块的已知漏洞，不做到达分析，
+        # 用于发现「现在没调用、但以后可能被调用」的风险。永远不拦路。
+        continue-on-error: true
+        shell: bash
+        run: |
+          set -uo pipefail
+          # -scan=module 不接受包路径参数：传 ./... 会报
+          # "patterns are not accepted for module only scanning" 并以退出码 2 结束，
+          # 必须在模块根目录无参数运行。
+          govulncheck -scan=module > govulncheck-module.txt 2>&1 || true
+          tail -5 govulncheck-module.txt
+          {
+            echo "### govulncheck（模块级清单，仅信息、不拦路）"
+            echo ""
+            echo '```'
+            tail -5 govulncheck-module.txt
+            echo '```'
+          } >> "${GITHUB_STEP_SUMMARY:-/dev/null}"
