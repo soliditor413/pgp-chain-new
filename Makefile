@@ -120,7 +120,7 @@ lint: ## Run linters.
 
 #? fmt: Ensure consistent code formatting.
 fmt:
-	gofmt -s -w $(shell find . -name "*.go")
+	gofmt -s -w $(shell find . -name "*.go" -not -path "./third_party/*")
 
 #? clean: Clean go cache, built executables, and the auto generated folder.
 clean:
