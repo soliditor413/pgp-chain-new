@@ -27,6 +27,17 @@ jobs:
     - name: Checkout code
       uses: actions/checkout@v4
 
+    - name: Verify third_party checksums
+      run: |
+        ( cd third_party/elastos-ela \
+            && sha256sum -c ../elastos-ela.SHA256SUMS \
+            && diff <(sed -e 's/^[0-9a-f]\{64\}  //' -e 's|^\./||' ../elastos-ela.SHA256SUMS | LC_ALL=C sort) \
+                    <(git ls-files --cached --others --exclude-standard . | LC_ALL=C sort) )
+        ( cd third_party/elastos-ela-spv \
+            && sha256sum -c ../elastos-ela-spv.SHA256SUMS \
+            && diff <(sed -e 's/^[0-9a-f]\{64\}  //' -e 's|^\./||' ../elastos-ela-spv.SHA256SUMS | LC_ALL=C sort) \
+                    <(git ls-files --cached --others --exclude-standard . | LC_ALL=C sort) )
+
     - uses: actions/cache@v4
       with:
         # In order:
